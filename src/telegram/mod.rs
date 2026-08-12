@@ -7,12 +7,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::client::{LoginToken, PasswordToken, UpdatesConfiguration};
 use grammers_client::media::Media;
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
-use grammers_client::peer::Peer;
-use grammers_client::tl::enums::Dialog as RawDialog;
+use grammers_client::peer::{Peer, User};
+use grammers_client::sender::SenderPoolHandle;
+use grammers_client::tl::{self, enums::Dialog as RawDialog};
 use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
-use grammers_session::types::{PeerId, PeerKind, PeerRef};
+use grammers_session::types::{PeerId, PeerInfo, PeerKind, PeerRef, UpdateState, UpdatesState};
+use grammers_session::updates::UpdatesLike;
+use grammers_session::Session;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
@@ -31,6 +34,11 @@ const TRANSIENT_SENDER_NAME_LIMIT: usize = 256;
 const MESSAGE_SENDER_CACHE_LIMIT: usize = 512;
 const UNRESOLVED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_TRANSFERS: usize = 3;
+const QR_MIGRATION_LIMIT: usize = 4;
+const MIN_QR_REFRESH_DELAY: Duration = Duration::from_millis(500);
+const DEFAULT_QR_REFRESH_DELAY: Duration = Duration::from_secs(30);
+const MAX_QR_REFRESH_DELAY: Duration = Duration::from_secs(120);
+const QR_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 pub struct TelegramHandle {
     pub commands: mpsc::Sender<TelegramCommand>,
@@ -86,6 +94,18 @@ enum CodeOutcome {
     Authorized,
     Password(Box<PasswordToken>),
     Restart,
+}
+
+enum LoginAttempt {
+    Phone { phone: String, token: LoginToken },
+    Qr,
+    Restart,
+}
+
+enum AuthInterruption {
+    None,
+    Restart,
+    Shutdown,
 }
 
 enum TransferCompletion {
@@ -170,17 +190,44 @@ async fn run(
     let SenderPool {
         runner,
         handle,
-        updates,
-    } = SenderPool::new(session, config.api_id);
+        mut updates,
+    } = SenderPool::new(session.clone(), config.api_id);
     let client = Client::new(handle.clone());
     let pool_task = tokio::spawn(runner.run());
 
     let result: Result<()> = Box::pin(async {
-        if !client.is_authorized().await? {
-            authenticate(&client, &config.api_hash, &mut commands, &events).await?;
-        }
+        let initially_authorized = client.is_authorized().await?;
+        let me = if initially_authorized {
+            client.get_me().await?
+        } else {
+            loop {
+                authenticate(
+                    &client,
+                    config.api_id,
+                    &config.api_hash,
+                    &session,
+                    &handle.thin,
+                    &mut updates,
+                    &mut commands,
+                    &events,
+                )
+                .await?;
 
-        let me = client.get_me().await?;
+                let me = client.get_me().await?;
+                match take_auth_interruption(&mut commands) {
+                    AuthInterruption::None => break me,
+                    AuthInterruption::Restart => {
+                        client
+                            .sign_out()
+                            .await
+                            .context("could not cancel the newly authorized Telegram session")?;
+                    }
+                    // The completed session remains available on the next
+                    // launch, but never show Ready after an explicit shutdown.
+                    AuthInterruption::Shutdown => bail!("login cancelled"),
+                }
+            }
+        };
         let user_name = safe_name(me.first_name(), "You");
         events.send(NetworkEvent::Ready { user_name }).await.ok();
 
@@ -428,25 +475,44 @@ async fn restore_online_status(events: &mpsc::Sender<NetworkEvent>, recovering: 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn authenticate(
     client: &Client,
+    api_id: i32,
     api_hash: &str,
+    session: &SqliteSession,
+    sender: &SenderPoolHandle,
+    updates: &mut mpsc::UnboundedReceiver<UpdatesLike>,
     commands: &mut mpsc::Receiver<TelegramCommand>,
     events: &mpsc::Sender<NetworkEvent>,
 ) -> Result<()> {
     'login: loop {
-        let (phone, token) = request_login_token(client, api_hash, commands, events).await?;
-        events
-            .send(NetworkEvent::Auth(AuthPrompt::Code {
-                phone: phone.trim().to_owned(),
-            }))
-            .await?;
+        let outcome = match request_login_attempt(client, api_hash, commands, events).await? {
+            LoginAttempt::Phone { phone, token } => {
+                events
+                    .send(NetworkEvent::Auth(AuthPrompt::Code {
+                        phone: phone.trim().to_owned(),
+                    }))
+                    .await?;
+                sign_in_with_code(client, token, commands, events).await?
+            }
+            LoginAttempt::Qr => {
+                sign_in_with_qr(
+                    client, api_id, api_hash, session, sender, updates, commands, events,
+                )
+                .await?
+            }
+            LoginAttempt::Restart => continue,
+        };
 
-        let mut password_token = match sign_in_with_code(client, token, commands, events).await? {
+        let mut password_token = match outcome {
             CodeOutcome::Authorized => return Ok(()),
             CodeOutcome::Restart => continue,
             CodeOutcome::Password(token) => *token,
         };
+        if restart_auth_requested(commands)? {
+            continue;
+        }
         events
             .send(NetworkEvent::Auth(AuthPrompt::Password {
                 hint: password_token.hint().map(ToOwned::to_owned),
@@ -463,47 +529,391 @@ async fn authenticate(
                 .check_password(password_token, password.as_bytes())
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => match authorized_outcome(client, commands).await? {
+                    CodeOutcome::Authorized => return Ok(()),
+                    CodeOutcome::Restart => continue 'login,
+                    CodeOutcome::Password(_) => unreachable!("authorized login cannot need 2FA"),
+                },
                 Err(SignInError::InvalidPassword(token)) => {
                     password_token = token;
+                    if restart_auth_requested(commands)? {
+                        continue 'login;
+                    }
                     events
                         .send(NetworkEvent::Error("Incorrect 2FA password".to_owned()))
                         .await?;
                 }
-                Err(error) => return Err(anyhow!(error).context("Telegram 2FA failed")),
+                Err(error) => {
+                    if restart_auth_requested(commands)? {
+                        continue 'login;
+                    }
+                    return Err(anyhow!(error).context("Telegram 2FA failed"));
+                }
             }
         }
     }
 }
 
-async fn request_login_token(
+async fn request_login_attempt(
     client: &Client,
     api_hash: &str,
     commands: &mut mpsc::Receiver<TelegramCommand>,
     events: &mpsc::Sender<NetworkEvent>,
-) -> Result<(String, LoginToken)> {
+) -> Result<LoginAttempt> {
     events.send(NetworkEvent::Auth(AuthPrompt::Phone)).await?;
     loop {
-        let phone = loop {
-            match commands.recv().await {
-                Some(TelegramCommand::SubmitPhone(phone)) if !phone.trim().is_empty() => {
-                    break phone;
+        match commands.recv().await {
+            Some(TelegramCommand::StartQrAuth) => return Ok(LoginAttempt::Qr),
+            Some(TelegramCommand::SubmitPhone(phone)) if !phone.trim().is_empty() => {
+                match Box::pin(client.request_login_code(phone.trim(), api_hash)).await {
+                    Ok(token) => {
+                        if restart_auth_requested(commands)? {
+                            return Ok(LoginAttempt::Restart);
+                        }
+                        return Ok(LoginAttempt::Phone { phone, token });
+                    }
+                    Err(error) => {
+                        if restart_auth_requested(commands)? {
+                            return Ok(LoginAttempt::Restart);
+                        }
+                        events
+                            .send(NetworkEvent::Error(format!(
+                                "Could not request a login code: {error}"
+                            )))
+                            .await?;
+                    }
                 }
-                Some(TelegramCommand::Shutdown) | None => bail!("login cancelled"),
-                _ => {}
             }
-        };
-        match Box::pin(client.request_login_code(phone.trim(), api_hash)).await {
-            Ok(token) => return Ok((phone, token)),
+            Some(TelegramCommand::Shutdown) | None => bail!("login cancelled"),
+            _ => {}
+        }
+    }
+}
+
+// Keep the short-lived token, migration, update, expiry, and cancellation
+// transitions together so secret ownership is visible in one state machine.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn sign_in_with_qr(
+    client: &Client,
+    api_id: i32,
+    api_hash: &str,
+    session: &SqliteSession,
+    sender: &SenderPoolHandle,
+    updates: &mut mpsc::UnboundedReceiver<UpdatesLike>,
+    commands: &mut mpsc::Receiver<TelegramCommand>,
+    events: &mpsc::Sender<NetworkEvent>,
+) -> Result<CodeOutcome> {
+    let mut displayed_token: Option<Vec<u8>> = None;
+    loop {
+        if restart_auth_requested(commands)? {
+            return Ok(CodeOutcome::Restart);
+        }
+        let response = match client
+            .invoke(&tl::functions::auth::ExportLoginToken {
+                api_id,
+                api_hash: api_hash.to_owned(),
+                except_ids: Vec::new(),
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is("SESSION_PASSWORD_NEEDED") => {
+                return Ok(CodeOutcome::Password(Box::new(
+                    get_password_token(client).await?,
+                )));
+            }
+            Err(error) if error.is("AUTH_RESTART") => {
+                tokio::time::sleep(QR_RESTART_DELAY).await;
+                continue;
+            }
             Err(error) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
                 events
                     .send(NetworkEvent::Error(format!(
-                        "Could not request a login code: {error}"
+                        "Could not start QR login: {error}. Press Tab to try again"
                     )))
                     .await?;
+                return Ok(CodeOutcome::Restart);
+            }
+        };
+
+        let migrated = match follow_qr_migration(client, session, sender, response).await {
+            Ok(response) => response,
+            Err(error) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
+                events
+                    .send(NetworkEvent::Error(format!(
+                        "Could not continue QR login: {error:#}. Press Tab to try again"
+                    )))
+                    .await?;
+                return Ok(CodeOutcome::Restart);
+            }
+        };
+        match migrated {
+            QrLoginResponse::Token(token) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
+                if displayed_token.as_deref() != Some(token.token.as_slice()) {
+                    let url = qr_login_url(&token.token);
+                    events
+                        .send(NetworkEvent::Auth(AuthPrompt::Qr { url }))
+                        .await?;
+                    displayed_token = Some(token.token.clone());
+                }
+
+                let refresh = tokio::time::sleep(qr_refresh_delay(token.expires));
+                tokio::pin!(refresh);
+                loop {
+                    tokio::select! {
+                        command = commands.recv() => match command {
+                            Some(TelegramCommand::RestartAuth) => {
+                                return Ok(CodeOutcome::Restart);
+                            }
+                            Some(TelegramCommand::Shutdown) | None => bail!("login cancelled"),
+                            _ => {}
+                        },
+                        update = updates.recv() => match update {
+                            Some(update) if contains_login_token_update(&update) => break,
+                            Some(_) => {}
+                            None => bail!("Telegram update channel closed during QR login"),
+                        },
+                        () = &mut refresh => break,
+                    }
+                }
+            }
+            QrLoginResponse::Authorized(authorization) => {
+                match take_auth_interruption(commands) {
+                    AuthInterruption::Restart => return cancel_authorized_login(client).await,
+                    AuthInterruption::Shutdown => {
+                        complete_qr_login(client, session, *authorization).await?;
+                        bail!("login cancelled");
+                    }
+                    AuthInterruption::None => {}
+                }
+                complete_qr_login(client, session, *authorization).await?;
+                return authorized_outcome(client, commands).await;
+            }
+            QrLoginResponse::Password => {
+                return Ok(CodeOutcome::Password(Box::new(
+                    get_password_token(client).await?,
+                )));
+            }
+            QrLoginResponse::Refresh => {}
+        }
+    }
+}
+
+enum QrLoginResponse {
+    Token(tl::types::auth::LoginToken),
+    Authorized(Box<tl::enums::auth::Authorization>),
+    Password,
+    Refresh,
+}
+
+async fn follow_qr_migration(
+    client: &Client,
+    session: &SqliteSession,
+    sender: &SenderPoolHandle,
+    mut response: tl::enums::auth::LoginToken,
+) -> Result<QrLoginResponse> {
+    let mut imported_dc = None;
+    for _ in 0..QR_MIGRATION_LIMIT {
+        match response {
+            tl::enums::auth::LoginToken::Token(token) => {
+                if let Some(dc_id) = imported_dc {
+                    switch_home_dc(session, sender, dc_id).await?;
+                }
+                return Ok(QrLoginResponse::Token(token));
+            }
+            tl::enums::auth::LoginToken::Success(success) => {
+                if let Some(dc_id) = imported_dc {
+                    switch_home_dc(session, sender, dc_id).await?;
+                }
+                return Ok(QrLoginResponse::Authorized(Box::new(success.authorization)));
+            }
+            tl::enums::auth::LoginToken::MigrateTo(migration) => {
+                imported_dc = Some(migration.dc_id);
+                response = match client
+                    .invoke_in_dc(
+                        migration.dc_id,
+                        &tl::functions::auth::ImportLoginToken {
+                            token: migration.token,
+                        },
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) if error.is("SESSION_PASSWORD_NEEDED") => {
+                        switch_home_dc(session, sender, migration.dc_id).await?;
+                        return Ok(QrLoginResponse::Password);
+                    }
+                    Err(error)
+                        if error.is("AUTH_TOKEN_EXPIRED")
+                            || error.is("AUTH_TOKEN_ALREADY_ACCEPTED")
+                            || error.is("AUTH_RESTART") =>
+                    {
+                        return Ok(QrLoginResponse::Refresh);
+                    }
+                    Err(error) => {
+                        return Err(anyhow!(error).context("QR login data-center migration failed"));
+                    }
+                };
             }
         }
     }
+    bail!("Telegram returned too many QR login data-center migrations")
+}
+
+async fn switch_home_dc(
+    session: &SqliteSession,
+    sender: &SenderPoolHandle,
+    new_dc_id: i32,
+) -> Result<()> {
+    let old_dc_id = session.home_dc_id()?;
+    if old_dc_id != new_dc_id {
+        session.set_home_dc_id(new_dc_id).await?;
+        sender.disconnect_from_dc(old_dc_id);
+        // `invoke_in_dc` may have opened the target while it was still a
+        // secondary connection. Recreate it after changing home so updates
+        // from the newly-authorized account are forwarded normally.
+        sender.disconnect_from_dc(new_dc_id);
+    }
+    Ok(())
+}
+
+async fn complete_qr_login(
+    client: &Client,
+    session: &SqliteSession,
+    authorization: tl::enums::auth::Authorization,
+) -> Result<()> {
+    let tl::enums::auth::Authorization::Authorization(authorization) = authorization else {
+        bail!("this account must first register with an official Telegram client")
+    };
+
+    // Keep this in lockstep with grammers' private `complete_login`: initialize
+    // update state and persist the current user's peer before normal requests.
+    let update_state = client
+        .invoke(&tl::functions::updates::GetState {})
+        .await
+        .ok();
+    let user = User::from_raw(client, authorization.user);
+    let auth = user
+        .to_ref()
+        .await
+        .map_err(|error| anyhow!("QR login returned an unusable user: {error}"))?
+        .context("QR login returned no user reference")?
+        .auth;
+    session
+        .cache_peer(&PeerInfo::User {
+            id: user.id().bare_id_unchecked(),
+            auth: Some(auth),
+            bot: Some(user.is_bot()),
+            is_self: Some(true),
+        })
+        .await?;
+    if let Some(tl::enums::updates::State::State(state)) = update_state {
+        session
+            .set_update_state(UpdateState::All(UpdatesState {
+                pts: state.pts,
+                qts: state.qts,
+                date: state.date,
+                seq: state.seq,
+                channels: Vec::new(),
+            }))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn get_password_token(client: &Client) -> Result<PasswordToken> {
+    let password = client
+        .invoke(&tl::functions::account::GetPassword {})
+        .await
+        .context("could not load Telegram 2FA parameters")?;
+    Ok(PasswordToken::new(password.into()))
+}
+
+fn contains_login_token_update(update: &UpdatesLike) -> bool {
+    let UpdatesLike::Updates(updates) = update else {
+        return false;
+    };
+    match updates {
+        tl::enums::Updates::UpdateShort(update) => {
+            matches!(update.update, tl::enums::Update::LoginToken)
+        }
+        tl::enums::Updates::Combined(updates) => updates
+            .updates
+            .iter()
+            .any(|update| matches!(update, tl::enums::Update::LoginToken)),
+        tl::enums::Updates::Updates(updates) => updates
+            .updates
+            .iter()
+            .any(|update| matches!(update, tl::enums::Update::LoginToken)),
+        _ => false,
+    }
+}
+
+fn qr_refresh_delay(expires: i32) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires = u64::try_from(expires).unwrap_or_default();
+    if expires >= now {
+        let delay = Duration::from_secs(expires - now);
+        if delay > MAX_QR_REFRESH_DELAY {
+            DEFAULT_QR_REFRESH_DELAY
+        } else {
+            delay.max(MIN_QR_REFRESH_DELAY)
+        }
+    } else if now - expires <= MAX_QR_REFRESH_DELAY.as_secs() {
+        // A token that expired while this prompt was being delivered should be
+        // rotated promptly, without turning a badly skewed clock into a flood.
+        MIN_QR_REFRESH_DELAY
+    } else {
+        DEFAULT_QR_REFRESH_DELAY
+    }
+}
+
+fn qr_login_url(token: &[u8]) -> String {
+    format!("tg://login?token={}", base64_url_no_pad(token))
+}
+
+fn base64_url_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
+        ));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((chunk[1] & 0x0f) << 2) | (chunk[2] >> 6))],
+        ));
+        encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
+    }
+    match chunks.remainder() {
+        [first] => {
+            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+            encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4)]));
+        }
+        [first, second] => {
+            encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+            encoded.push(char::from(
+                ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+            ));
+            encoded.push(char::from(ALPHABET[usize::from((second & 0x0f) << 2)]));
+        }
+        [] => {}
+        _ => unreachable!(),
+    }
+    encoded
 }
 
 async fn sign_in_with_code(
@@ -522,11 +932,17 @@ async fn sign_in_with_code(
             }
         };
         match client.sign_in(&token, code.trim()).await {
-            Ok(_) => return Ok(CodeOutcome::Authorized),
+            Ok(_) => return authorized_outcome(client, commands).await,
             Err(SignInError::PasswordRequired(password)) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
                 return Ok(CodeOutcome::Password(Box::new(password)));
             }
             Err(SignInError::InvalidCode) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
                 events
                     .send(NetworkEvent::Error(
                         "Incorrect or expired login code".to_owned(),
@@ -536,9 +952,60 @@ async fn sign_in_with_code(
             Err(SignInError::SignUpRequired) => {
                 bail!("this phone number must first register with an official Telegram client")
             }
-            Err(error) => return Err(anyhow!(error).context("Telegram sign-in failed")),
+            Err(error) => {
+                if restart_auth_requested(commands)? {
+                    return Ok(CodeOutcome::Restart);
+                }
+                return Err(anyhow!(error).context("Telegram sign-in failed"));
+            }
         }
     }
+}
+
+fn take_auth_interruption(commands: &mut mpsc::Receiver<TelegramCommand>) -> AuthInterruption {
+    loop {
+        match commands.try_recv() {
+            Ok(TelegramCommand::RestartAuth) => return AuthInterruption::Restart,
+            Ok(TelegramCommand::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                return AuthInterruption::Shutdown;
+            }
+            // The application suppresses all commands except cancellation while
+            // an authentication RPC is in flight. Discard any programmatic
+            // stale input rather than applying it to the next phase.
+            Ok(_) => {}
+            Err(mpsc::error::TryRecvError::Empty) => return AuthInterruption::None,
+        }
+    }
+}
+
+fn restart_auth_requested(commands: &mut mpsc::Receiver<TelegramCommand>) -> Result<bool> {
+    match take_auth_interruption(commands) {
+        AuthInterruption::None => Ok(false),
+        AuthInterruption::Restart => Ok(true),
+        AuthInterruption::Shutdown => bail!("login cancelled"),
+    }
+}
+
+async fn authorized_outcome(
+    client: &Client,
+    commands: &mut mpsc::Receiver<TelegramCommand>,
+) -> Result<CodeOutcome> {
+    match take_auth_interruption(commands) {
+        AuthInterruption::None => Ok(CodeOutcome::Authorized),
+        AuthInterruption::Restart => cancel_authorized_login(client).await,
+        // Do not sign out on process shutdown. The completed session remains
+        // valid locally and will be reused on the next launch, but Ready is not
+        // emitted after the user has asked Termgram to exit.
+        AuthInterruption::Shutdown => bail!("login cancelled"),
+    }
+}
+
+async fn cancel_authorized_login(client: &Client) -> Result<CodeOutcome> {
+    client
+        .sign_out()
+        .await
+        .context("could not cancel the newly authorized Telegram session")?;
+    Ok(CodeOutcome::Restart)
 }
 
 async fn load_dialogs(
@@ -936,7 +1403,8 @@ async fn handle_command(
             }
         }
         TelegramCommand::Shutdown => return Ok(true),
-        TelegramCommand::SubmitPhone(_)
+        TelegramCommand::StartQrAuth
+        | TelegramCommand::SubmitPhone(_)
         | TelegramCommand::SubmitCode(_)
         | TelegramCommand::SubmitPassword(_)
         | TelegramCommand::RestartAuth => {}
@@ -1790,18 +2258,91 @@ fn safe_name(value: Option<&str>, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use grammers_client::tl;
     use grammers_session::types::PeerId;
+    use grammers_session::updates::UpdatesLike;
+    use tokio::sync::mpsc;
 
+    use crate::event::TelegramCommand;
     use crate::model::{Delivery, Message, ReplyInfo};
 
     use super::{
-        advance_dialog_watermark, begin_unresolved_refresh, cache_message_sender,
-        cache_sender_name, hydrate_reply_sender, parse_telegram_link, reconcile_dialog_snapshot,
-        sanitize_download_name, username_or_sender, TelegramLink, WorkerCache,
-        MESSAGE_SENDER_CACHE_LIMIT, TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
+        advance_dialog_watermark, base64_url_no_pad, begin_unresolved_refresh,
+        cache_message_sender, cache_sender_name, contains_login_token_update, hydrate_reply_sender,
+        parse_telegram_link, qr_login_url, qr_refresh_delay, reconcile_dialog_snapshot,
+        sanitize_download_name, take_auth_interruption, username_or_sender, AuthInterruption,
+        TelegramLink, WorkerCache, DEFAULT_QR_REFRESH_DELAY, MESSAGE_SENDER_CACHE_LIMIT,
+        MIN_QR_REFRESH_DELAY, TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
     };
+
+    #[test]
+    fn qr_login_url_uses_unpadded_url_safe_base64() {
+        assert_eq!(base64_url_no_pad(b""), "");
+        assert_eq!(base64_url_no_pad(b"f"), "Zg");
+        assert_eq!(base64_url_no_pad(b"fo"), "Zm8");
+        assert_eq!(base64_url_no_pad(b"foo"), "Zm9v");
+        assert_eq!(base64_url_no_pad(&[0xfb, 0xff, 0xff]), "-___");
+        assert_eq!(qr_login_url(&[0xfb, 0xff, 0xff]), "tg://login?token=-___");
+    }
+
+    #[test]
+    fn qr_expiry_handles_recent_expiry_and_implausible_clock_skew() {
+        assert_eq!(qr_refresh_delay(0), DEFAULT_QR_REFRESH_DELAY);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let just_expired = i32::try_from(now.saturating_sub(1)).unwrap_or_default();
+        assert_eq!(qr_refresh_delay(just_expired), MIN_QR_REFRESH_DELAY);
+        let far_future = i32::try_from(now.saturating_add(600)).unwrap_or(i32::MAX);
+        assert_eq!(qr_refresh_delay(far_future), DEFAULT_QR_REFRESH_DELAY);
+    }
+
+    #[test]
+    fn recognizes_login_token_updates_in_short_and_batched_envelopes() {
+        let short = UpdatesLike::Updates(tl::enums::Updates::UpdateShort(tl::types::UpdateShort {
+            update: tl::enums::Update::LoginToken,
+            date: 0,
+        }));
+        assert!(contains_login_token_update(&short));
+
+        let batch = UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+            updates: vec![tl::enums::Update::LoginToken],
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: 0,
+            seq: 0,
+        }));
+        assert!(contains_login_token_update(&batch));
+        assert!(!contains_login_token_update(&UpdatesLike::Updates(
+            tl::enums::Updates::TooLong,
+        )));
+    }
+
+    #[test]
+    fn cancellation_wins_over_stale_auth_input_before_a_new_prompt() {
+        let (commands, mut receiver) = mpsc::channel(4);
+        commands.try_send(TelegramCommand::StartQrAuth).unwrap();
+        commands.try_send(TelegramCommand::RestartAuth).unwrap();
+
+        assert!(matches!(
+            take_auth_interruption(&mut receiver),
+            AuthInterruption::Restart
+        ));
+    }
+
+    #[test]
+    fn shutdown_is_distinct_from_restart_at_authorization_boundary() {
+        let (commands, mut receiver) = mpsc::channel(2);
+        commands.try_send(TelegramCommand::Shutdown).unwrap();
+
+        assert!(matches!(
+            take_auth_interruption(&mut receiver),
+            AuthInterruption::Shutdown
+        ));
+    }
 
     #[test]
     fn dialog_watermark_distinguishes_replay_live_and_duplicate_updates() {

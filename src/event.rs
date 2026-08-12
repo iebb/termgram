@@ -3,17 +3,49 @@
 //! This module intentionally contains no Telegram SDK types. The network task
 //! translates SDK updates into these small, testable domain events.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::model::{Chat, ChatId, Message};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum AuthPrompt {
     Phone,
-    Code { phone: String },
-    Password { hint: Option<String> },
+    /// A short-lived Telegram login URL to render locally as a QR code.
+    ///
+    /// The URL embeds a login token and must never be written to logs or
+    /// persisted. A later prompt replaces it when Telegram rotates the token.
+    Qr {
+        url: String,
+    },
+    Code {
+        phone: String,
+    },
+    Password {
+        hint: Option<String>,
+    },
+}
+
+impl fmt::Debug for AuthPrompt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Phone => formatter.write_str("Phone"),
+            Self::Qr { .. } => formatter
+                .debug_struct("Qr")
+                .field("url", &"<redacted>")
+                .finish(),
+            Self::Code { .. } => formatter
+                .debug_struct("Code")
+                .field("phone", &"<redacted>")
+                .finish(),
+            Self::Password { hint } => formatter
+                .debug_struct("Password")
+                .field("hint", hint)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -26,8 +58,10 @@ pub enum ConnectionStatus {
 }
 
 /// Commands sent from the application to the Telegram worker.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum TelegramCommand {
+    /// Start a short-lived QR-code login flow from the phone prompt.
+    StartQrAuth,
     SubmitPhone(String),
     SubmitCode(String),
     SubmitPassword(String),
@@ -75,6 +109,89 @@ pub enum TelegramCommand {
     },
     RefreshDialogs,
     Shutdown,
+}
+
+impl fmt::Debug for TelegramCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StartQrAuth => formatter.write_str("StartQrAuth"),
+            Self::SubmitPhone(_) => formatter
+                .debug_tuple("SubmitPhone")
+                .field(&"<redacted>")
+                .finish(),
+            Self::SubmitCode(_) => formatter
+                .debug_tuple("SubmitCode")
+                .field(&"<redacted>")
+                .finish(),
+            Self::SubmitPassword(_) => formatter
+                .debug_tuple("SubmitPassword")
+                .field(&"<redacted>")
+                .finish(),
+            Self::RestartAuth => formatter.write_str("RestartAuth"),
+            Self::LoadHistory {
+                chat_id,
+                request_id,
+            } => formatter
+                .debug_struct("LoadHistory")
+                .field("chat_id", chat_id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::LoadMessage {
+                chat_id,
+                source_message_id,
+                message_id,
+                request_id,
+            } => formatter
+                .debug_struct("LoadMessage")
+                .field("chat_id", chat_id)
+                .field("source_message_id", source_message_id)
+                .field("message_id", message_id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::SendMessage {
+                chat_id,
+                local_id,
+                text,
+            } => formatter
+                .debug_struct("SendMessage")
+                .field("chat_id", chat_id)
+                .field("local_id", local_id)
+                .field("text", text)
+                .finish(),
+            Self::SendAttachment {
+                chat_id,
+                local_id,
+                path,
+                caption,
+                as_photo,
+            } => formatter
+                .debug_struct("SendAttachment")
+                .field("chat_id", chat_id)
+                .field("local_id", local_id)
+                .field("path", path)
+                .field("caption", caption)
+                .field("as_photo", as_photo)
+                .finish(),
+            Self::DownloadAttachment {
+                chat_id,
+                message_id,
+            } => formatter
+                .debug_struct("DownloadAttachment")
+                .field("chat_id", chat_id)
+                .field("message_id", message_id)
+                .finish(),
+            Self::ResolveTelegramLink { url } => formatter
+                .debug_struct("ResolveTelegramLink")
+                .field("url", url)
+                .finish(),
+            Self::MarkRead { chat_id } => formatter
+                .debug_struct("MarkRead")
+                .field("chat_id", chat_id)
+                .finish(),
+            Self::RefreshDialogs => formatter.write_str("RefreshDialogs"),
+            Self::Shutdown => formatter.write_str("Shutdown"),
+        }
+    }
 }
 
 /// SDK-independent updates sent from the Telegram worker to the application.
@@ -183,4 +300,48 @@ pub enum AppEvent {
     Paste(String),
     TerminalFocus(bool),
     Tick,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthPrompt, TelegramCommand};
+
+    #[test]
+    fn debug_output_redacts_authentication_credentials() {
+        let qr_secret = "tg://login?token=top-secret";
+        let qr = format!(
+            "{:?}",
+            AuthPrompt::Qr {
+                url: qr_secret.to_owned(),
+            }
+        );
+        assert!(!qr.contains(qr_secret));
+        assert!(qr.contains("redacted"));
+
+        let phone_secret = "+15551234";
+        let code_prompt = format!(
+            "{:?}",
+            AuthPrompt::Code {
+                phone: phone_secret.to_owned(),
+            }
+        );
+        assert!(!code_prompt.contains(phone_secret));
+        assert!(code_prompt.contains("redacted"));
+
+        for (command, secret) in [
+            (
+                TelegramCommand::SubmitPhone("+15551234".to_owned()),
+                "+15551234",
+            ),
+            (TelegramCommand::SubmitCode("12345".to_owned()), "12345"),
+            (
+                TelegramCommand::SubmitPassword("correct horse".to_owned()),
+                "correct horse",
+            ),
+        ] {
+            let debug = format!("{command:?}");
+            assert!(!debug.contains(secret));
+            assert!(debug.contains("redacted"));
+        }
+    }
 }

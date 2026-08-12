@@ -512,7 +512,8 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
         TelegramCommand::RefreshDialogs => {
             NetworkEvent::DialogsFailed("Telegram command queue is busy".to_owned())
         }
-        TelegramCommand::SubmitPhone(_)
+        TelegramCommand::StartQrAuth
+        | TelegramCommand::SubmitPhone(_)
         | TelegramCommand::SubmitCode(_)
         | TelegramCommand::SubmitPassword(_)
         | TelegramCommand::RestartAuth => {

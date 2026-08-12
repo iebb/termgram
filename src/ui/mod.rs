@@ -1,4 +1,5 @@
 use chrono::Local;
+use qrcode::{Color as QrColor, QrCode};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -21,6 +22,7 @@ const SUCCESS: Color = Color::Rgb(126, 211, 166);
 const WARNING: Color = Color::Rgb(245, 194, 107);
 const DANGER: Color = Color::Rgb(242, 139, 130);
 const MESSAGE_ID_COLUMN_WIDTH: usize = 12;
+const QR_QUIET_ZONE: usize = 4;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let area = frame.area();
@@ -55,6 +57,10 @@ fn render_connecting(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 }
 
 fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPhase) {
+    if let AuthPhase::Qr { url } = phase {
+        render_qr_auth(frame, area, app, url);
+        return;
+    }
     let width = area.width.min(72);
     let height = 14_u16.min(area.height.saturating_sub(2));
     let popup = centered(area, width, height);
@@ -85,6 +91,7 @@ fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPh
             "Use international format, for example +81 90 1234 5678.".to_owned(),
             false,
         ),
+        AuthPhase::Qr { .. } => unreachable!("QR authentication has a dedicated view"),
         AuthPhase::Code { phone } => (
             "Login code",
             format!("Telegram sent a code for {phone}."),
@@ -110,16 +117,27 @@ fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPh
         chunks[1],
         app.auth_input(),
         masked,
-        "Enter to continue",
+        if app.auth_is_submitting() {
+            "Submitted"
+        } else {
+            "Enter to continue"
+        },
+        !app.auth_is_submitting(),
     );
     if let Some(message) = &app.status_message {
         frame.render_widget(
             Paragraph::new(message.as_str()).style(Style::default().fg(DANGER)),
             chunks[2],
         );
+    } else if let Some(message) = app.auth_progress_label() {
+        frame.render_widget(
+            Paragraph::new(format!("{}  {message}", spinner(app.tick)))
+                .style(Style::default().fg(WARNING)),
+            chunks[2],
+        );
     }
     let footer = if matches!(phase, AuthPhase::Phone) {
-        "Your session is stored locally · Ctrl+C quits"
+        "Tab QR sign-in · session stored locally · Ctrl+C quits"
     } else {
         "Esc starts over · your session is stored locally · Ctrl+C quits"
     };
@@ -127,6 +145,125 @@ fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPh
         Paragraph::new(footer).style(Style::default().fg(MUTED)),
         chunks[3],
     );
+}
+
+fn render_qr_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, url: &str) {
+    let Ok(code) = QrCode::new(url.as_bytes()) else {
+        render_qr_unavailable(
+            frame,
+            area,
+            "Could not render this QR code. Press Esc to use your phone number.",
+        );
+        return;
+    };
+
+    let modules = code.width().saturating_add(QR_QUIET_ZONE * 2);
+    let qr_width = clamp_u16(modules);
+    let qr_height = clamp_u16(modules.saturating_add(1) / 2);
+    // Pairing two QR module rows into each half-block leaves one terminal row
+    // for instructions, so a real Telegram token fits a standard 80 × 24 PTY.
+    let required_height = qr_height.saturating_add(1);
+    if area.width < qr_width || area.height < required_height {
+        let message = format!(
+            "QR sign-in needs at least {qr_width} × {required_height} terminal cells. Resize, or press Esc to use your phone number."
+        );
+        render_qr_unavailable(frame, area, &message);
+        return;
+    }
+
+    let view_y = area
+        .y
+        .saturating_add(area.height.saturating_sub(required_height) / 2);
+    let (guidance, style) = if let Some(message) = &app.status_message {
+        (
+            format!("{message} · Esc phone"),
+            Style::default().fg(DANGER),
+        )
+    } else {
+        (
+            format!(
+                "{} Waiting · Telegram Settings → Devices → Link Desktop Device · Esc phone",
+                spinner(app.tick)
+            ),
+            Style::default().fg(WARNING).bold(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(guidance)
+            .alignment(Alignment::Center)
+            .style(style),
+        Rect::new(area.x, view_y, area.width, 1),
+    );
+    let qr_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(qr_width) / 2);
+    render_qr_code(
+        frame,
+        Rect::new(qr_x, view_y.saturating_add(1), qr_width, qr_height),
+        &code,
+        QR_QUIET_ZONE,
+    );
+}
+
+fn render_qr_unavailable(frame: &mut Frame<'_>, area: Rect, message: &str) {
+    let popup = centered(area, area.width.min(72), area.height.min(10));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Termgram · QR sign in",
+                Style::default().fg(ACCENT).bold(),
+            )),
+            Line::from(""),
+            Line::from(message),
+            Line::from(""),
+            Line::from(Span::styled("Ctrl+C quits", Style::default().fg(MUTED))),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true }),
+        popup,
+    );
+}
+
+fn render_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
+    let modules = code.width().saturating_add(quiet_zone * 2);
+    let mut lines = Vec::with_capacity(modules.saturating_add(1) / 2);
+    for top_y in (0..modules).step_by(2) {
+        let mut spans = Vec::with_capacity(modules);
+        for x in 0..modules {
+            let top = qr_module(code, x, top_y, quiet_zone);
+            let bottom = if top_y + 1 < modules {
+                qr_module(code, x, top_y + 1, quiet_zone)
+            } else {
+                QrColor::Light
+            };
+            let foreground = qr_terminal_color(top);
+            let background = qr_terminal_color(bottom);
+            spans.push(Span::styled(
+                if top == bottom { " " } else { "▀" },
+                Style::default().fg(foreground).bg(background),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn qr_module(code: &QrCode, x: usize, y: usize, quiet_zone: usize) -> QrColor {
+    let data_x = x.checked_sub(quiet_zone);
+    let data_y = y.checked_sub(quiet_zone);
+    match (data_x, data_y) {
+        (Some(data_x), Some(data_y)) if data_x < code.width() && data_y < code.width() => {
+            code[(data_x, data_y)]
+        }
+        _ => QrColor::Light,
+    }
+}
+
+const fn qr_terminal_color(color: QrColor) -> Color {
+    match color {
+        QrColor::Dark => Color::Black,
+        QrColor::Light => Color::White,
+    }
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
@@ -664,7 +801,14 @@ fn render_fatal(frame: &mut Frame<'_>, area: Rect, message: &str) {
     );
 }
 
-fn render_input(frame: &mut Frame<'_>, area: Rect, input: &TextInput, masked: bool, title: &str) {
+fn render_input(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    input: &TextInput,
+    masked: bool,
+    title: &str,
+    enabled: bool,
+) {
     let value = if masked {
         "•".repeat(input.grapheme_count())
     } else {
@@ -673,22 +817,24 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, input: &TextInput, masked: bo
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(if enabled { ACCENT } else { MUTED }))
         .title(format!(" {title} "));
     let inner = block.inner(area);
     frame.render_widget(Paragraph::new(value).block(block), area);
-    let cursor = if masked {
-        clamp_u16(input.cursor_grapheme())
-    } else {
-        clamp_u16(input.cursor_display_width())
-    };
-    frame.set_cursor_position(Position::new(
-        inner
-            .x
-            .saturating_add(cursor)
-            .min(inner.right().saturating_sub(1)),
-        inner.y,
-    ));
+    if enabled {
+        let cursor = if masked {
+            clamp_u16(input.cursor_grapheme())
+        } else {
+            clamp_u16(input.cursor_display_width())
+        };
+        frame.set_cursor_position(Position::new(
+            inner
+                .x
+                .saturating_add(cursor)
+                .min(inner.right().saturating_sub(1)),
+            inner.y,
+        ));
+    }
 }
 
 fn message_lines(
@@ -1033,8 +1179,8 @@ mod tests {
     use crate::{
         app::{AppState, Mode, Screen},
         config::{DownloadBehavior, ReleaseChannel, Settings},
-        event::ConnectionStatus,
-        input::TextInput,
+        event::{AuthPrompt, ConnectionStatus},
+        input::{KeyAction, TextInput},
         model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
     };
 
@@ -1279,6 +1425,61 @@ mod tests {
 
         let output = render_text(&app, 72, 20);
         assert!(output.contains("Esc starts over"));
+    }
+
+    #[test]
+    fn auth_submission_progress_is_visible_for_phone_code_and_password() {
+        let mut app = AppState::new();
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        app.handle_action(KeyAction::Character('1'));
+        app.handle_action(KeyAction::Enter);
+        let phone = render_text(&app, 72, 20);
+        assert!(phone.contains("Requesting a login code…"));
+        assert!(phone.contains("Submitted"));
+
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+1".to_owned(),
+        }));
+        app.handle_action(KeyAction::Character('1'));
+        app.handle_action(KeyAction::Enter);
+        let code = render_text(&app, 72, 20);
+        assert!(code.contains("Checking login code…"));
+        assert!(code.contains("Submitted"));
+
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Password {
+            hint: None,
+        }));
+        for character in "hunter2".chars() {
+            app.handle_action(KeyAction::Character(character));
+        }
+        app.handle_action(KeyAction::Enter);
+        let password = render_text(&app, 72, 20);
+        assert!(password.contains("Checking 2FA password…"));
+        assert!(password.contains("Submitted"));
+        assert!(!password.contains("hunter2"));
+    }
+
+    #[test]
+    fn qr_login_renders_scannable_blocks_without_exposing_its_token() {
+        // 32 bytes encoded without padding, matching Telegram's real token
+        // size and the QR dimensions seen in an end-to-end login smoke test.
+        let secret_url = "tg://login?token=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let mut app = AppState::new();
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Qr {
+            url: secret_url.to_owned(),
+        }));
+
+        let output = render_text(&app, 80, 24);
+        assert!(output.contains("Telegram Settings → Devices → Link Desktop Device"));
+        assert!(output.contains("Waiting"));
+        assert!(output.contains("Esc phone"));
+        assert!(output.contains('▀'));
+        assert!(!output.contains(secret_url));
+
+        let small = render_text(&app, 40, 10);
+        assert!(small.contains("QR sign-in needs at least"));
+        assert!(!small.contains(secret_url));
     }
 
     #[test]

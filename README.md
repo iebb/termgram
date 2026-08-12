@@ -6,7 +6,7 @@ direct messages and groups.
 
 The first release deliberately does less:
 
-- phone, login-code, and optional 2FA authentication;
+- phone/login-code, optional 2FA password, and QR-code authentication;
 - locally persisted Telegram session;
 - direct-message and group conversation list with unread counts;
 - recent history, live incoming messages, and read acknowledgements;
@@ -159,7 +159,7 @@ credentials and Telegram update state survive restarts.
 | Context | Keys |
 | --- | --- |
 | Anywhere | `Ctrl+C` quit, `Ctrl+L` redraw |
-| Sign in | `Enter` submit, `Esc` restart from phone after code/2FA |
+| Sign in | `Enter` submit, `Tab` switch from phone to QR login, `Esc` return to phone |
 | Chats | `↑`/`↓` or `j`/`k` move, `Enter` open, `/` filter |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
 | Message actions | click or use `o`/`O` to select; `Enter` downloads/reveals media, `l` follows its Telegram link |
@@ -173,6 +173,12 @@ credentials and Telegram update state survive restarts.
 message so Telegram bot commands remain usable; chat filtering is only active
 from the chat list. Press `s` to configure the message-ID column and the other
 essential preferences.
+
+During sign-in, Termgram shows a fixed progress message while Telegram checks a
+phone number, login code, or 2FA password. Password entry stays masked. QR login
+rotates its short-lived code automatically; scan it from Telegram on a device
+where the account is already signed in. QR tokens, codes, passwords, and phone
+numbers are never written to settings or logs.
 
 Drag one or more files from the desktop into an open conversation and drop them
 on the terminal. JPG, JPEG, PNG, and WebP files are sent as compressed Telegram

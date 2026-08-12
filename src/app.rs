@@ -37,17 +37,57 @@ pub enum Screen {
     Fatal(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum AuthPhase {
     Phone,
-    Code { phone: String },
-    Password { hint: Option<String> },
+    /// A transient login credential rendered only as a QR code. Never expose
+    /// the underlying URL as text, status, or clipboard content.
+    Qr {
+        url: String,
+    },
+    Code {
+        phone: String,
+    },
+    Password {
+        hint: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthProgress {
+    RequestCode,
+    StartQr,
+    CheckCode,
+    CheckPassword,
+    WaitQr,
+    Restart,
+}
+
+impl std::fmt::Debug for AuthPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Phone => formatter.write_str("Phone"),
+            Self::Qr { .. } => formatter
+                .debug_struct("Qr")
+                .field("url", &"<redacted>")
+                .finish(),
+            Self::Code { .. } => formatter
+                .debug_struct("Code")
+                .field("phone", &"<redacted>")
+                .finish(),
+            Self::Password { hint } => formatter
+                .debug_struct("Password")
+                .field("hint", hint)
+                .finish(),
+        }
+    }
 }
 
 impl From<AuthPrompt> for AuthPhase {
     fn from(prompt: AuthPrompt) -> Self {
         match prompt {
             AuthPrompt::Phone => Self::Phone,
+            AuthPrompt::Qr { url } => Self::Qr { url },
             AuthPrompt::Code { phone } => Self::Code {
                 phone: sanitize_terminal_line(&phone),
             },
@@ -124,6 +164,12 @@ pub struct App {
     settings_path: Option<PathBuf>,
     settings_selection: usize,
     auth_input: TextInput,
+    /// An authentication operation is awaiting a worker response. This keeps
+    /// the form visibly responsive without retaining or echoing secrets.
+    auth_progress: Option<AuthProgress>,
+    /// Ignore late prompts from an authentication attempt after the user has
+    /// explicitly restarted it, until the worker confirms the phone phase.
+    auth_restart_pending: bool,
     drafts: BTreeMap<ChatId, TextInput>,
     retry_message_ids: BTreeMap<ChatId, i32>,
     retry_attachments: BTreeMap<(ChatId, i32), (PathBuf, String, bool)>,
@@ -179,6 +225,8 @@ impl Default for App {
             settings_path: None,
             settings_selection: 0,
             auth_input: TextInput::new(),
+            auth_progress: None,
+            auth_restart_pending: false,
             drafts: BTreeMap::new(),
             retry_message_ids: BTreeMap::new(),
             retry_attachments: BTreeMap::new(),
@@ -340,12 +388,30 @@ impl App {
     pub fn handle_network(&mut self, event: NetworkEvent) -> Vec<TelegramCommand> {
         match event {
             NetworkEvent::Auth(prompt) => {
+                if self.auth_restart_pending && !matches!(&prompt, AuthPrompt::Phone) {
+                    return Vec::new();
+                }
+                if matches!(&prompt, AuthPrompt::Phone) {
+                    self.auth_restart_pending = false;
+                }
+                let preserve_qr_error = matches!(&prompt, AuthPrompt::Phone)
+                    && (matches!(
+                        self.auth_progress,
+                        Some(AuthProgress::StartQr | AuthProgress::WaitQr)
+                    ) || matches!(self.screen, Screen::Auth(AuthPhase::Qr { .. })))
+                    && self.status_message.is_some();
                 self.auth_input.clear();
+                self.auth_progress =
+                    matches!(&prompt, AuthPrompt::Qr { .. }).then_some(AuthProgress::WaitQr);
                 self.screen = Screen::Auth(prompt.into());
-                self.status_message = None;
+                if !preserve_qr_error {
+                    self.status_message = None;
+                }
                 Vec::new()
             }
             NetworkEvent::Ready { user_name } => {
+                self.auth_progress = None;
+                self.auth_restart_pending = false;
                 self.user_name = Some(sanitize_terminal_line(&user_name));
                 self.screen = Screen::Main;
                 self.connection = ConnectionStatus::Online;
@@ -497,6 +563,17 @@ impl App {
                 Vec::new()
             }
             NetworkEvent::Error(message) => {
+                if self.auth_restart_pending && matches!(self.screen, Screen::Auth(_)) {
+                    return Vec::new();
+                }
+                if matches!(self.screen, Screen::Auth(_))
+                    && !matches!(
+                        self.auth_progress,
+                        Some(AuthProgress::StartQr | AuthProgress::WaitQr)
+                    )
+                {
+                    self.auth_progress = None;
+                }
                 self.status_message = Some(sanitize_terminal_line(&message));
                 Vec::new()
             }
@@ -527,6 +604,26 @@ impl App {
             self.auth_input.cursor_grapheme()
         } else {
             self.auth_input.cursor_display_width()
+        }
+    }
+
+    #[must_use]
+    pub const fn auth_is_submitting(&self) -> bool {
+        self.auth_progress.is_some() || matches!(self.screen, Screen::Auth(AuthPhase::Qr { .. }))
+    }
+
+    /// A fixed, non-secret progress label for the current authentication
+    /// request. Values entered by the user are deliberately never included.
+    #[must_use]
+    pub const fn auth_progress_label(&self) -> Option<&'static str> {
+        match self.auth_progress {
+            Some(AuthProgress::RequestCode) => Some("Requesting a login code…"),
+            Some(AuthProgress::StartQr) => Some("Preparing QR sign-in…"),
+            Some(AuthProgress::CheckCode) => Some("Checking login code…"),
+            Some(AuthProgress::CheckPassword) => Some("Checking 2FA password…"),
+            Some(AuthProgress::WaitQr) => Some("Waiting for approval in Telegram…"),
+            Some(AuthProgress::Restart) => Some("Returning to phone sign-in…"),
+            None => None,
         }
     }
 
@@ -629,7 +726,7 @@ impl App {
     #[must_use]
     pub fn needs_animation(&self) -> bool {
         match self.screen {
-            Screen::Connecting => true,
+            Screen::Connecting | Screen::Auth(AuthPhase::Qr { .. }) => true,
             Screen::Main => {
                 self.loading_history
                     || matches!(
@@ -637,7 +734,8 @@ impl App {
                         ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
                     )
             }
-            Screen::Auth(_) | Screen::Fatal(_) => false,
+            Screen::Auth(_) => self.auth_progress.is_some(),
+            Screen::Fatal(_) => false,
         }
     }
 
@@ -654,7 +752,11 @@ impl App {
             }
         }
         match self.screen {
-            Screen::Auth(_) => self.auth_input.insert_str(&normalized.replace('\n', "")),
+            Screen::Auth(
+                AuthPhase::Phone | AuthPhase::Code { .. } | AuthPhase::Password { .. },
+            ) if self.auth_progress.is_none() => {
+                self.auth_input.insert_str(&normalized.replace('\n', ""));
+            }
             Screen::Main if self.mode == Mode::Compose => {
                 if let Some(chat_id) = self.active_chat_id {
                     self.drafts
@@ -675,14 +777,42 @@ impl App {
 
     fn handle_auth(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
         if action == KeyAction::Escape {
+            if self.auth_restart_pending {
+                self.auth_input.clear();
+                self.status_message = None;
+                return Vec::new();
+            }
+            let operation_pending = self.auth_progress.is_some();
             self.auth_input.clear();
+            self.auth_progress = None;
             self.status_message = None;
-            if matches!(
-                self.screen,
-                Screen::Auth(AuthPhase::Code { .. } | AuthPhase::Password { .. })
-            ) {
+            if operation_pending
+                || matches!(
+                    self.screen,
+                    Screen::Auth(
+                        AuthPhase::Qr { .. } | AuthPhase::Code { .. } | AuthPhase::Password { .. }
+                    )
+                )
+            {
                 self.screen = Screen::Auth(AuthPhase::Phone);
+                self.auth_restart_pending = true;
+                self.auth_progress = Some(AuthProgress::Restart);
                 return vec![TelegramCommand::RestartAuth];
+            }
+            return Vec::new();
+        }
+        if action == KeyAction::Tab
+            && self.auth_progress.is_none()
+            && matches!(self.screen, Screen::Auth(AuthPhase::Phone))
+        {
+            self.auth_input.clear();
+            self.auth_progress = Some(AuthProgress::StartQr);
+            self.status_message = None;
+            return vec![TelegramCommand::StartQrAuth];
+        }
+        if self.auth_progress.is_some() {
+            if action == KeyAction::Redraw {
+                self.force_redraw = true;
             }
             return Vec::new();
         }
@@ -725,6 +855,13 @@ impl App {
         if empty {
             Vec::new()
         } else {
+            self.auth_progress = Some(match &command {
+                TelegramCommand::SubmitPhone(_) => AuthProgress::RequestCode,
+                TelegramCommand::SubmitCode(_) => AuthProgress::CheckCode,
+                TelegramCommand::SubmitPassword(_) => AuthProgress::CheckPassword,
+                _ => unreachable!("only authentication submissions reach this point"),
+            });
+            self.status_message = None;
             vec![command]
         }
     }
@@ -2445,6 +2582,101 @@ mod tests {
                 hint: Some("pet".to_owned())
             })
         );
+        assert_eq!(app.auth_progress_label(), Some("Checking 2FA password…"));
+        assert!(app.auth_is_submitting());
+    }
+
+    #[test]
+    fn auth_submissions_show_phase_specific_progress_and_block_duplicate_input() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        app.handle_action(KeyAction::Character('1'));
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::SubmitPhone("+1".to_owned())]
+        );
+        assert_eq!(app.auth_progress_label(), Some("Requesting a login code…"));
+        assert!(app.auth_input().is_empty());
+        app.handle_action(KeyAction::Character('9'));
+        assert!(app.auth_input().is_empty());
+        assert!(app.handle_action(KeyAction::Enter).is_empty());
+
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+1".to_owned(),
+        }));
+        app.handle_action(KeyAction::Character('1'));
+        app.handle_action(KeyAction::Character('2'));
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::SubmitCode("12".to_owned())]
+        );
+        assert_eq!(app.auth_progress_label(), Some("Checking login code…"));
+
+        app.handle_network(NetworkEvent::Error("Incorrect code".to_owned()));
+        assert!(!app.auth_is_submitting());
+        assert_eq!(app.status_message.as_deref(), Some("Incorrect code"));
+        app.handle_action(KeyAction::Character('3'));
+        assert_eq!(app.auth_input().value(), "3");
+    }
+
+    #[test]
+    fn tab_starts_qr_login_and_escape_drops_the_transient_token() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        assert_eq!(
+            app.handle_action(KeyAction::Tab),
+            vec![TelegramCommand::StartQrAuth]
+        );
+        assert!(app.auth_input().is_empty());
+        assert_eq!(app.auth_progress_label(), Some("Preparing QR sign-in…"));
+
+        let secret_url = "tg://login?token=do-not-print";
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Qr {
+            url: secret_url.to_owned(),
+        }));
+        assert_eq!(
+            app.auth_progress_label(),
+            Some("Waiting for approval in Telegram…")
+        );
+        assert!(app.needs_animation());
+        assert!(!format!("{:?}", app.screen).contains(secret_url));
+        assert_eq!(
+            app.handle_action(KeyAction::Escape),
+            vec![TelegramCommand::RestartAuth]
+        );
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert!(app.auth_is_submitting());
+        assert_eq!(
+            app.auth_progress_label(),
+            Some("Returning to phone sign-in…")
+        );
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        assert!(!app.auth_is_submitting());
+    }
+
+    #[test]
+    fn qr_start_error_survives_the_worker_returning_to_phone_login() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Tab);
+        app.handle_network(NetworkEvent::Error(
+            "Could not start QR login: unavailable".to_owned(),
+        ));
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Could not start QR login: unavailable")
+        );
+        assert!(!app.auth_is_submitting());
+        app.handle_action(KeyAction::Character('+'));
+        assert_eq!(app.auth_input().value(), "+");
+
+        app.handle_action(KeyAction::Escape);
+        assert!(app.status_message.is_none());
     }
 
     #[test]
@@ -2472,6 +2704,21 @@ mod tests {
     }
 
     #[test]
+    fn auth_credentials_are_redacted_from_debug_output() {
+        let secret = "tg://login?token=secret-value";
+        let phase = AuthPhase::Qr {
+            url: secret.to_owned(),
+        };
+        assert!(!format!("{phase:?}").contains(secret));
+        assert!(format!("{phase:?}").contains("<redacted>"));
+
+        let phase = AuthPhase::Code {
+            phone: "+1 555 0100".to_owned(),
+        };
+        assert!(!format!("{phase:?}").contains("555"));
+    }
+
+    #[test]
     fn escape_restarts_code_or_password_auth_but_only_clears_phone_input() {
         let mut app = App::new();
         app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
@@ -2487,10 +2734,74 @@ mod tests {
         assert!(app.auth_input().is_empty());
         assert!(app.status_message.is_none());
 
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
         app.handle_action(KeyAction::Character('+'));
         assert!(app.handle_action(KeyAction::Escape).is_empty());
         assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
         assert!(app.auth_input().is_empty());
+    }
+
+    #[test]
+    fn escape_cancels_a_pending_phone_request_before_starting_over() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        app.handle_action(KeyAction::Character('1'));
+        app.handle_action(KeyAction::Enter);
+        assert!(app.auth_is_submitting());
+
+        assert_eq!(
+            app.handle_action(KeyAction::Escape),
+            vec![TelegramCommand::RestartAuth]
+        );
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert!(app.auth_is_submitting());
+        assert!(app.auth_input().is_empty());
+
+        app.handle_action(KeyAction::Character('9'));
+        assert!(app.auth_input().is_empty());
+        assert!(app.handle_action(KeyAction::Tab).is_empty());
+        assert!(app.handle_action(KeyAction::Enter).is_empty());
+        assert_eq!(
+            app.auth_progress_label(),
+            Some("Returning to phone sign-in…")
+        );
+
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        assert!(!app.auth_is_submitting());
+        app.handle_action(KeyAction::Character('9'));
+        assert_eq!(app.auth_input().value(), "9");
+    }
+
+    #[test]
+    fn restart_ignores_late_auth_prompts_until_phone_confirmation() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        app.handle_action(KeyAction::Character('1'));
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Escape);
+
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+1".to_owned(),
+        }));
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Qr {
+            url: "tg://login?token=stale".to_owned(),
+        }));
+        app.handle_network(NetworkEvent::Error("stale failure".to_owned()));
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert!(app.status_message.is_none());
+
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+2".to_owned(),
+        }));
+        assert_eq!(
+            app.screen,
+            Screen::Auth(AuthPhase::Code {
+                phone: "+2".to_owned()
+            })
+        );
     }
 
     #[test]

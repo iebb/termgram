@@ -1,0 +1,2759 @@
+//! Pure, single-owner application state and transitions.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use chrono::Utc;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+
+use crate::{
+    event::{AppEvent, AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand},
+    input::{key_action, KeyAction, TextInput},
+    model::{
+        sanitize_terminal_line, sanitize_terminal_text, Attachment, AttachmentKind, Chat, ChatId,
+        Delivery, Message,
+    },
+};
+
+const PAGE_STEP: usize = 10;
+const MAX_MESSAGES_PER_CHAT: usize = 160;
+const MAX_CACHED_CHATS: usize = 12;
+const MAX_DROPPED_FILES: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentState {
+    Ready,
+    Downloading,
+    Downloaded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Screen {
+    Connecting,
+    Auth(AuthPhase),
+    Main,
+    Fatal(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthPhase {
+    Phone,
+    Code { phone: String },
+    Password { hint: Option<String> },
+}
+
+impl From<AuthPrompt> for AuthPhase {
+    fn from(prompt: AuthPrompt) -> Self {
+        match prompt {
+            AuthPrompt::Phone => Self::Phone,
+            AuthPrompt::Code { phone } => Self::Code {
+                phone: sanitize_terminal_line(&phone),
+            },
+            AuthPrompt::Password { hint } => Self::Password {
+                hint: hint.map(|value| sanitize_terminal_line(&value)),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Mode {
+    #[default]
+    Navigate,
+    Compose,
+    Filter,
+    Help,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Focus {
+    #[default]
+    Chats,
+    Conversation,
+}
+
+/// All mutable UI state. It owns no terminal or network resources.
+#[derive(Clone)]
+// These flags describe independent terminal, network, and viewport state; a
+// single enum would permit invalid combinations instead of preventing them.
+#[allow(clippy::struct_excessive_bools)]
+pub struct App {
+    pub screen: Screen,
+    pub mode: Mode,
+    pub focus: Focus,
+    pub connection: ConnectionStatus,
+    pub user_name: Option<String>,
+    pub chats: Vec<Chat>,
+    /// Position in the filtered chat list, never a persistent model identity.
+    pub selected_chat: usize,
+    pub active_chat_id: Option<ChatId>,
+    pub messages: BTreeMap<ChatId, Vec<Message>>,
+    /// Actionable message selected for Enter activation.
+    pub selected_message: Option<i32>,
+    pub filter: TextInput,
+    pub narrow_conversation: bool,
+    pub should_quit: bool,
+    pub status_message: Option<String>,
+    pub tick: u64,
+    pub loading_history: bool,
+    /// Number of rendered terminal rows between the detached viewport and the latest item.
+    pub message_scroll: usize,
+    /// Timeline entries appended while the viewport is detached.
+    pub new_messages_while_scrolled: usize,
+    /// Newly appended entries whose rendered height has not yet been folded
+    /// into [`Self::message_scroll`]. The renderer consumes this exactly once.
+    pub new_messages_to_anchor: usize,
+    /// Semantic top-of-viewport anchor used to survive wrapping changes.
+    pub viewport_anchor_message: Option<i32>,
+    pub viewport_anchor_row: usize,
+    pub terminal_focused: bool,
+    auth_input: TextInput,
+    drafts: BTreeMap<ChatId, TextInput>,
+    retry_message_ids: BTreeMap<ChatId, i32>,
+    retry_attachments: BTreeMap<(ChatId, i32), (PathBuf, String, bool)>,
+    mode_before_help: Mode,
+    force_redraw: bool,
+    next_pending_id: i32,
+    next_history_request_id: u64,
+    active_history_request: Option<(ChatId, u64)>,
+    history_target_message: Option<i32>,
+    read_ack_pending: BTreeSet<ChatId>,
+    refresh_dialogs_pending: bool,
+    downloading_attachments: BTreeSet<(ChatId, i32)>,
+    downloaded_attachments: BTreeMap<(ChatId, i32), PathBuf>,
+    pending_telegram_link: Option<String>,
+    /// Chats reached through links are kept until a dialog snapshot contains
+    /// them, so a refresh cannot collapse the newly opened conversation.
+    linked_chat_ids: BTreeSet<ChatId>,
+    /// Rendered actionable rows from the last frame: x start/end, y, message id.
+    message_hit_regions: Vec<(u16, u16, u16, i32)>,
+}
+
+pub type AppState = App;
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            screen: Screen::Connecting,
+            mode: Mode::Navigate,
+            focus: Focus::Chats,
+            connection: ConnectionStatus::Connecting,
+            user_name: None,
+            chats: Vec::new(),
+            selected_chat: 0,
+            active_chat_id: None,
+            messages: BTreeMap::new(),
+            selected_message: None,
+            filter: TextInput::new(),
+            narrow_conversation: false,
+            should_quit: false,
+            status_message: None,
+            tick: 0,
+            loading_history: false,
+            message_scroll: 0,
+            new_messages_while_scrolled: 0,
+            new_messages_to_anchor: 0,
+            viewport_anchor_message: None,
+            viewport_anchor_row: 0,
+            terminal_focused: true,
+            auth_input: TextInput::new(),
+            drafts: BTreeMap::new(),
+            retry_message_ids: BTreeMap::new(),
+            retry_attachments: BTreeMap::new(),
+            mode_before_help: Mode::Navigate,
+            force_redraw: false,
+            next_pending_id: -1,
+            next_history_request_id: 1,
+            active_history_request: None,
+            history_target_message: None,
+            read_ack_pending: BTreeSet::new(),
+            refresh_dialogs_pending: false,
+            downloading_attachments: BTreeSet::new(),
+            downloaded_attachments: BTreeMap::new(),
+            pending_telegram_link: None,
+            linked_chat_ids: BTreeSet::new(),
+            message_hit_regions: Vec::new(),
+        }
+    }
+}
+
+impl App {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, event: AppEvent) -> Vec<TelegramCommand> {
+        match event {
+            AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::Network(event) => self.handle_network(event),
+            AppEvent::Paste(text) => self.handle_paste(&text),
+            AppEvent::TerminalFocus(focused) => {
+                self.terminal_focused = focused;
+                if focused && self.focus == Focus::Conversation && self.message_scroll == 0 {
+                    self.reach_bottom()
+                } else {
+                    Vec::new()
+                }
+            }
+            AppEvent::Tick => {
+                self.tick = self.tick.wrapping_add(1);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Frame-local pointer targets must never survive a frame that cannot
+    /// render the conversation (for example a terminal-too-small warning).
+    pub fn clear_message_hit_regions(&mut self) {
+        self.message_hit_regions.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message_hit_region_count(&self) -> usize {
+        self.message_hit_regions.len()
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Vec<TelegramCommand> {
+        key_action(key).map_or_else(Vec::new, |action| self.handle_action(action))
+    }
+
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<TelegramCommand> {
+        if !matches!(self.screen, Screen::Main) || self.mode == Mode::Help {
+            return Vec::new();
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp if self.focus == Focus::Conversation => self.move_up(3),
+            MouseEventKind::ScrollDown if self.focus == Focus::Conversation => self.move_down(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .message_hit_regions
+                    .iter()
+                    .rev()
+                    .find(|&&(start, end, row, _)| {
+                        row == mouse.row && (start..end).contains(&mouse.column)
+                    })
+                    .map(|&(_, _, _, message_id)| message_id);
+                let Some(message_id) = hit else {
+                    return Vec::new();
+                };
+                self.focus = Focus::Conversation;
+                self.narrow_conversation = true;
+                self.selected_message = Some(message_id);
+                self.activate_selected_message()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn handle_action(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        if action == KeyAction::Quit
+            || (action == KeyAction::Character('q')
+                && matches!(self.screen, Screen::Connecting | Screen::Fatal(_)))
+        {
+            return self.quit();
+        }
+        match self.screen {
+            Screen::Connecting | Screen::Fatal(_) => Vec::new(),
+            Screen::Auth(_) => self.handle_auth(action),
+            Screen::Main => self.handle_main(action),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn handle_network(&mut self, event: NetworkEvent) -> Vec<TelegramCommand> {
+        match event {
+            NetworkEvent::Auth(prompt) => {
+                self.auth_input.clear();
+                self.screen = Screen::Auth(prompt.into());
+                self.status_message = None;
+                Vec::new()
+            }
+            NetworkEvent::Ready { user_name } => {
+                self.user_name = Some(sanitize_terminal_line(&user_name));
+                self.screen = Screen::Main;
+                self.connection = ConnectionStatus::Online;
+                self.status_message = None;
+                Vec::new()
+            }
+            NetworkEvent::Dialogs(chats) => {
+                self.refresh_dialogs_pending = false;
+                self.replace_dialogs(chats);
+                Vec::new()
+            }
+            NetworkEvent::DialogsFailed(error) => {
+                self.refresh_dialogs_pending = false;
+                self.status_message = Some(sanitize_terminal_line(&error));
+                Vec::new()
+            }
+            NetworkEvent::History {
+                chat_id,
+                request_id,
+                messages,
+            } => self.finish_history(chat_id, request_id, Ok(messages)),
+            NetworkEvent::HistoryFailed {
+                chat_id,
+                request_id,
+                error,
+            } => self.finish_history(chat_id, request_id, Err(error)),
+            NetworkEvent::NewMessage(message) => self.receive_message(message, true, true),
+            NetworkEvent::MessageUpdated(message) => {
+                self.update_message(message);
+                Vec::new()
+            }
+            NetworkEvent::MessageSent { local_id, message } => {
+                self.confirm_message(local_id, message)
+            }
+            NetworkEvent::MessageAccepted { chat_id, local_id } => {
+                self.accept_message(chat_id, local_id);
+                Vec::new()
+            }
+            NetworkEvent::ReadMarked { chat_id } => {
+                self.read_ack_pending.remove(&chat_id);
+                Vec::new()
+            }
+            NetworkEvent::ReadMarkFailed { chat_id, error } => {
+                self.read_ack_pending.remove(&chat_id);
+                self.status_message = Some(sanitize_terminal_line(&error));
+                Vec::new()
+            }
+            NetworkEvent::MessagesRead { chat_id, max_id } => {
+                if let Some(messages) = self.messages.get_mut(&chat_id) {
+                    for message in messages {
+                        if message.outgoing && message.id > 0 && message.id <= max_id {
+                            message.delivery = Delivery::Read;
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            NetworkEvent::SendFailed {
+                chat_id,
+                local_id,
+                text,
+                error,
+            } => self.fail_message(chat_id, local_id, &text, &error),
+            NetworkEvent::AttachmentSendFailed {
+                chat_id,
+                local_id,
+                path,
+                caption,
+                as_photo,
+                error,
+            } => {
+                if let Some(message) = self
+                    .messages
+                    .get_mut(&chat_id)
+                    .and_then(|messages| messages.iter_mut().find(|message| message.id == local_id))
+                {
+                    message.delivery = Delivery::Failed;
+                    self.retry_attachments
+                        .insert((chat_id, local_id), (path, caption, as_photo));
+                    self.selected_message =
+                        (self.active_chat_id == Some(chat_id)).then_some(local_id);
+                    self.status_message = Some(format!(
+                        "Attachment not sent: {} · Enter retries",
+                        sanitize_terminal_line(&error)
+                    ));
+                }
+                Vec::new()
+            }
+            NetworkEvent::AttachmentDownloaded {
+                chat_id,
+                message_id,
+                path,
+            } => {
+                self.downloading_attachments.remove(&(chat_id, message_id));
+                self.downloaded_attachments
+                    .insert((chat_id, message_id), path.clone());
+                self.status_message = Some(format!(
+                    "Downloaded to {} · activate again to reveal",
+                    sanitize_terminal_line(&path.display().to_string())
+                ));
+                Vec::new()
+            }
+            NetworkEvent::AttachmentDownloadFailed {
+                chat_id,
+                message_id,
+                error,
+            } => {
+                self.downloading_attachments.remove(&(chat_id, message_id));
+                self.status_message = Some(format!(
+                    "Download failed: {}",
+                    sanitize_terminal_line(&error)
+                ));
+                Vec::new()
+            }
+            NetworkEvent::LinkResolved { chat, message } => {
+                self.pending_telegram_link = None;
+                self.open_resolved_link(chat, message)
+            }
+            NetworkEvent::LinkFailed { url, error } => {
+                if self.pending_telegram_link.as_deref() == Some(url.as_str()) {
+                    self.pending_telegram_link = None;
+                }
+                self.status_message = Some(format!(
+                    "Could not open Telegram link: {}",
+                    sanitize_terminal_line(&error)
+                ));
+                Vec::new()
+            }
+            NetworkEvent::Status(status) => {
+                self.connection = status;
+                if status == ConnectionStatus::Online {
+                    self.status_message = None;
+                }
+                Vec::new()
+            }
+            NetworkEvent::Error(message) => {
+                self.status_message = Some(sanitize_terminal_line(&message));
+                Vec::new()
+            }
+            NetworkEvent::Fatal(message) => {
+                self.screen = Screen::Fatal(sanitize_terminal_text(&message));
+                Vec::new()
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn auth_input(&self) -> &TextInput {
+        &self.auth_input
+    }
+
+    #[must_use]
+    pub fn auth_display_value(&self) -> String {
+        if matches!(self.screen, Screen::Auth(AuthPhase::Password { .. })) {
+            "•".repeat(self.auth_input.grapheme_count())
+        } else {
+            self.auth_input.value().to_owned()
+        }
+    }
+
+    #[must_use]
+    pub fn auth_cursor_display_width(&self) -> usize {
+        if matches!(self.screen, Screen::Auth(AuthPhase::Password { .. })) {
+            self.auth_input.cursor_grapheme()
+        } else {
+            self.auth_input.cursor_display_width()
+        }
+    }
+
+    #[must_use]
+    pub fn filtered_chat_indices(&self) -> Vec<usize> {
+        let query = self.filter.value().to_lowercase();
+        self.chats
+            .iter()
+            .enumerate()
+            .filter_map(|(index, chat)| {
+                (query.is_empty()
+                    || chat.title.to_lowercase().contains(&query)
+                    || chat.last_message.to_lowercase().contains(&query))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn visible_chats(&self) -> Vec<&Chat> {
+        self.filtered_chat_indices()
+            .into_iter()
+            .map(|index| &self.chats[index])
+            .collect()
+    }
+
+    #[must_use]
+    pub fn selected_chat_entry(&self) -> Option<&Chat> {
+        let index = *self.filtered_chat_indices().get(self.selected_chat)?;
+        self.chats.get(index)
+    }
+
+    #[must_use]
+    pub fn active_chat(&self) -> Option<&Chat> {
+        let id = self.active_chat_id?;
+        self.chats.iter().find(|chat| chat.id == id)
+    }
+
+    #[must_use]
+    pub fn active_messages(&self) -> &[Message] {
+        self.active_chat_id
+            .and_then(|id| self.messages.get(&id))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    #[must_use]
+    pub fn active_draft(&self) -> Option<&TextInput> {
+        self.active_chat_id.and_then(|id| self.drafts.get(&id))
+    }
+
+    #[must_use]
+    pub fn draft_for(&self, chat_id: ChatId) -> Option<&TextInput> {
+        self.drafts.get(&chat_id)
+    }
+
+    #[must_use]
+    pub fn attachment_state(&self, chat_id: ChatId, message_id: i32) -> AttachmentState {
+        if self
+            .downloaded_attachments
+            .contains_key(&(chat_id, message_id))
+        {
+            AttachmentState::Downloaded
+        } else if self
+            .downloading_attachments
+            .contains(&(chat_id, message_id))
+        {
+            AttachmentState::Downloading
+        } else {
+            AttachmentState::Ready
+        }
+    }
+
+    #[must_use]
+    pub fn message_is_actionable(&self, message: &Message) -> bool {
+        (message.id > 0 && message.attachment.is_some())
+            || self
+                .retry_attachments
+                .contains_key(&(message.chat_id, message.id))
+            || telegram_link(&message.text).is_some()
+    }
+
+    /// Replace row hit regions after rendering the current conversation.
+    pub fn set_message_hit_regions(&mut self, regions: Vec<(u16, u16, u16, i32)>) {
+        self.message_hit_regions = regions;
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+    }
+
+    pub const fn set_narrow_conversation(&mut self, visible: bool) {
+        self.narrow_conversation = visible;
+    }
+
+    pub fn take_force_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.force_redraw)
+    }
+
+    #[must_use]
+    pub fn needs_animation(&self) -> bool {
+        match self.screen {
+            Screen::Connecting => true,
+            Screen::Main => {
+                self.loading_history
+                    || matches!(
+                        self.connection,
+                        ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
+                    )
+            }
+            Screen::Auth(_) | Screen::Fatal(_) => false,
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> Vec<TelegramCommand> {
+        let normalized = sanitize_terminal_text(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        if matches!(self.screen, Screen::Main)
+            && matches!(self.mode, Mode::Navigate | Mode::Compose)
+            && self.focus == Focus::Conversation
+        {
+            if let (Some(chat_id), Some(paths)) =
+                (self.active_chat_id, dropped_file_paths(&normalized))
+            {
+                return self.send_dropped_files(chat_id, paths);
+            }
+        }
+        match self.screen {
+            Screen::Auth(_) => self.auth_input.insert_str(&normalized.replace('\n', "")),
+            Screen::Main if self.mode == Mode::Compose => {
+                if let Some(chat_id) = self.active_chat_id {
+                    self.drafts
+                        .entry(chat_id)
+                        .or_default()
+                        .insert_str(&normalized);
+                }
+            }
+            Screen::Main if self.mode == Mode::Filter => {
+                self.filter
+                    .insert_str(&normalized.split_whitespace().collect::<Vec<_>>().join(" "));
+                self.selected_chat = 0;
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_auth(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        if action == KeyAction::Escape {
+            self.auth_input.clear();
+            self.status_message = None;
+            if matches!(
+                self.screen,
+                Screen::Auth(AuthPhase::Code { .. } | AuthPhase::Password { .. })
+            ) {
+                self.screen = Screen::Auth(AuthPhase::Phone);
+                return vec![TelegramCommand::RestartAuth];
+            }
+            return Vec::new();
+        }
+        match action {
+            KeyAction::Character(character) => self.auth_input.insert(character),
+            KeyAction::Backspace => _ = self.auth_input.backspace(),
+            KeyAction::Delete => _ = self.auth_input.delete(),
+            KeyAction::Left => _ = self.auth_input.move_left(),
+            KeyAction::Right => _ = self.auth_input.move_right(),
+            KeyAction::Home => self.auth_input.move_home(),
+            KeyAction::End => self.auth_input.move_end(),
+            KeyAction::Clear => self.auth_input.clear(),
+            KeyAction::DeleteWord => _ = self.auth_input.delete_word_before(),
+            KeyAction::Redraw => self.force_redraw = true,
+            KeyAction::Enter => return self.submit_auth(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn submit_auth(&mut self) -> Vec<TelegramCommand> {
+        if self.auth_input.is_empty() {
+            return Vec::new();
+        }
+        let value = self.auth_input.take();
+        let command = match self.screen {
+            Screen::Auth(AuthPhase::Phone) => TelegramCommand::SubmitPhone(value.trim().to_owned()),
+            Screen::Auth(AuthPhase::Code { .. }) => {
+                TelegramCommand::SubmitCode(value.trim().to_owned())
+            }
+            Screen::Auth(AuthPhase::Password { .. }) => TelegramCommand::SubmitPassword(value),
+            _ => return Vec::new(),
+        };
+        let empty = match &command {
+            TelegramCommand::SubmitPhone(value) | TelegramCommand::SubmitCode(value) => {
+                value.is_empty()
+            }
+            _ => false,
+        };
+        if empty {
+            Vec::new()
+        } else {
+            vec![command]
+        }
+    }
+
+    fn handle_main(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        match self.mode {
+            Mode::Navigate => self.handle_navigation(action),
+            Mode::Compose => self.handle_compose(action),
+            Mode::Filter => self.handle_filter(action),
+            Mode::Help => self.handle_help(action),
+        }
+    }
+
+    fn handle_navigation(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        match action {
+            KeyAction::Character('q') => self.quit(),
+            KeyAction::Character('?') => {
+                self.mode_before_help = self.mode;
+                self.mode = Mode::Help;
+                Vec::new()
+            }
+            KeyAction::Character('/') if self.focus == Focus::Chats => {
+                self.mode = Mode::Filter;
+                self.clamp_chat_selection();
+                Vec::new()
+            }
+            KeyAction::Character('/') => {
+                self.start_composing();
+                self.insert_active('/');
+                Vec::new()
+            }
+            KeyAction::Character('i') if self.focus == Focus::Conversation => {
+                self.start_composing();
+                Vec::new()
+            }
+            KeyAction::Tab | KeyAction::BackTab => {
+                self.toggle_focus();
+                if self.focus == Focus::Conversation && self.message_scroll == 0 {
+                    self.reach_bottom()
+                } else {
+                    Vec::new()
+                }
+            }
+            KeyAction::Escape | KeyAction::Left => {
+                self.narrow_conversation = false;
+                self.focus = Focus::Chats;
+                self.selected_message = None;
+                Vec::new()
+            }
+            KeyAction::Enter if self.focus == Focus::Chats => self.open_selected_chat(),
+            KeyAction::Enter if self.selected_message.is_some() => self.activate_selected_message(),
+            KeyAction::Enter => {
+                self.start_composing();
+                Vec::new()
+            }
+            KeyAction::Right => {
+                if self.active_chat_id.is_some() {
+                    self.focus = Focus::Conversation;
+                    self.narrow_conversation = true;
+                    if self.message_scroll == 0 {
+                        self.reach_bottom()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    self.open_selected_chat()
+                }
+            }
+            KeyAction::Character('o') if self.focus == Focus::Conversation => {
+                self.select_actionable_message(true)
+            }
+            KeyAction::Character('O') if self.focus == Focus::Conversation => {
+                self.select_actionable_message(false)
+            }
+            KeyAction::Character('l') if self.focus == Focus::Conversation => {
+                self.activate_selected_link()
+            }
+            KeyAction::Up | KeyAction::Character('k') => self.move_up(1),
+            KeyAction::Down | KeyAction::Character('j') => self.move_down(1),
+            KeyAction::PageUp => self.move_up(PAGE_STEP),
+            KeyAction::PageDown => self.move_down(PAGE_STEP),
+            KeyAction::Home | KeyAction::Character('g') => self.move_to_start(),
+            KeyAction::End | KeyAction::Character('G') => self.move_to_end(),
+            KeyAction::Redraw => {
+                self.force_redraw = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_compose(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        let Some(chat_id) = self.active_chat_id else {
+            self.mode = Mode::Navigate;
+            return Vec::new();
+        };
+        if action == KeyAction::Escape {
+            self.mode = Mode::Navigate;
+            return Vec::new();
+        }
+        if action == KeyAction::Enter {
+            return self.send_draft(chat_id);
+        }
+        let draft = self.drafts.entry(chat_id).or_default();
+        match action {
+            KeyAction::Character(character) => draft.insert(character),
+            KeyAction::Newline => draft.insert('\n'),
+            KeyAction::Backspace => _ = draft.backspace(),
+            KeyAction::Delete => _ = draft.delete(),
+            KeyAction::Left => _ = draft.move_left(),
+            KeyAction::Right => _ = draft.move_right(),
+            KeyAction::Home => draft.move_home(),
+            KeyAction::End => draft.move_end(),
+            KeyAction::Clear => draft.clear(),
+            KeyAction::DeleteWord => _ = draft.delete_word_before(),
+            KeyAction::Redraw => self.force_redraw = true,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn handle_filter(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        match action {
+            KeyAction::Escape => {
+                self.filter.clear();
+                self.selected_chat = 0;
+                self.mode = Mode::Navigate;
+                Vec::new()
+            }
+            KeyAction::Enter => {
+                let commands = self.open_selected_chat();
+                if !commands.is_empty() {
+                    let active_id = self.active_chat_id;
+                    self.filter.clear();
+                    self.selected_chat = active_id
+                        .and_then(|id| self.chats.iter().position(|chat| chat.id == id))
+                        .unwrap_or(0);
+                    self.mode = Mode::Navigate;
+                }
+                commands
+            }
+            KeyAction::Character(character) => {
+                self.filter.insert(character);
+                self.selected_chat = 0;
+                Vec::new()
+            }
+            KeyAction::Backspace => {
+                _ = self.filter.backspace();
+                self.clamp_chat_selection();
+                Vec::new()
+            }
+            KeyAction::Delete => {
+                _ = self.filter.delete();
+                self.clamp_chat_selection();
+                Vec::new()
+            }
+            KeyAction::Left => {
+                _ = self.filter.move_left();
+                Vec::new()
+            }
+            KeyAction::Right => {
+                _ = self.filter.move_right();
+                Vec::new()
+            }
+            KeyAction::Up => self.move_chat_up(1),
+            KeyAction::Down => self.move_chat_down(1),
+            KeyAction::PageUp => self.move_chat_up(PAGE_STEP),
+            KeyAction::PageDown => self.move_chat_down(PAGE_STEP),
+            KeyAction::Home => {
+                self.filter.move_home();
+                Vec::new()
+            }
+            KeyAction::End => {
+                self.filter.move_end();
+                Vec::new()
+            }
+            KeyAction::Clear => {
+                self.filter.clear();
+                self.selected_chat = 0;
+                Vec::new()
+            }
+            KeyAction::DeleteWord => {
+                _ = self.filter.delete_word_before();
+                self.clamp_chat_selection();
+                Vec::new()
+            }
+            KeyAction::Redraw => {
+                self.force_redraw = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn handle_help(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        match action {
+            KeyAction::Character('q') => self.quit(),
+            KeyAction::Escape | KeyAction::Character('?') => {
+                self.mode = self.mode_before_help;
+                Vec::new()
+            }
+            KeyAction::Redraw => {
+                self.force_redraw = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn quit(&mut self) -> Vec<TelegramCommand> {
+        if self.should_quit {
+            return Vec::new();
+        }
+        self.should_quit = true;
+        vec![TelegramCommand::Shutdown]
+    }
+
+    fn toggle_focus(&mut self) {
+        self.focus = if self.active_chat_id.is_some() && self.focus == Focus::Chats {
+            Focus::Conversation
+        } else {
+            Focus::Chats
+        };
+        self.narrow_conversation = self.focus == Focus::Conversation;
+    }
+
+    fn start_composing(&mut self) {
+        if let Some(chat_id) = self.active_chat_id {
+            self.drafts.entry(chat_id).or_default();
+            self.mode = Mode::Compose;
+            self.focus = Focus::Conversation;
+            self.selected_message = None;
+        }
+    }
+
+    fn insert_active(&mut self, character: char) {
+        if let Some(chat_id) = self.active_chat_id {
+            self.drafts.entry(chat_id).or_default().insert(character);
+        }
+    }
+
+    fn send_draft(&mut self, chat_id: ChatId) -> Vec<TelegramCommand> {
+        let Some(draft) = self.drafts.get_mut(&chat_id) else {
+            return Vec::new();
+        };
+        if draft.value().trim().is_empty() {
+            return Vec::new();
+        }
+        let text = draft.take();
+        let replacing_failed = self.retry_message_ids.remove(&chat_id);
+        if let Some(failed_id) = replacing_failed {
+            if let Some(messages) = self.messages.get_mut(&chat_id) {
+                messages.retain(|message| message.id != failed_id);
+            }
+        }
+        let local_id = self.next_pending_id;
+        self.next_pending_id = self.next_pending_id.checked_sub(1).unwrap_or(-1);
+        let pending = Message {
+            id: local_id,
+            chat_id,
+            sender: "You".to_owned(),
+            text: text.clone(),
+            timestamp: Utc::now(),
+            outgoing: true,
+            delivery: Delivery::Pending,
+            attachment: None,
+        };
+        let mut commands = self.receive_message(pending, replacing_failed.is_none(), false);
+        self.status_message = None;
+        commands.push(TelegramCommand::SendMessage {
+            chat_id,
+            local_id,
+            text,
+        });
+        commands
+    }
+
+    fn send_dropped_files(&mut self, chat_id: ChatId, paths: Vec<PathBuf>) -> Vec<TelegramCommand> {
+        let total = paths.len();
+        let mut commands = Vec::new();
+        for path in paths.into_iter().take(MAX_DROPPED_FILES) {
+            let local_id = self.next_pending_id;
+            self.next_pending_id = self.next_pending_id.checked_sub(1).unwrap_or(-1);
+            let attachment = attachment_from_path(&path);
+            let as_photo = attachment.kind == AttachmentKind::Photo;
+            let pending = Message {
+                id: local_id,
+                chat_id,
+                sender: "You".to_owned(),
+                text: String::new(),
+                timestamp: Utc::now(),
+                outgoing: true,
+                delivery: Delivery::Pending,
+                attachment: Some(attachment),
+            };
+            commands.extend(self.receive_message(pending, true, false));
+            commands.push(TelegramCommand::SendAttachment {
+                chat_id,
+                local_id,
+                path,
+                caption: String::new(),
+                as_photo,
+            });
+        }
+        let sent = total.min(MAX_DROPPED_FILES);
+        self.status_message = Some(if total > MAX_DROPPED_FILES {
+            format!("Sending {sent} files · drop at most {MAX_DROPPED_FILES} at a time")
+        } else if sent == 1 {
+            "Sending attachment…".to_owned()
+        } else {
+            format!("Sending {sent} attachments…")
+        });
+        commands
+    }
+
+    fn select_actionable_message(&mut self, forward: bool) -> Vec<TelegramCommand> {
+        let actionable = self
+            .active_messages()
+            .iter()
+            .filter(|message| self.message_is_actionable(message))
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        if actionable.is_empty() {
+            self.selected_message = None;
+            self.status_message = Some("No files or Telegram links in loaded messages".to_owned());
+            return Vec::new();
+        }
+        let selected = self
+            .selected_message
+            .and_then(|id| actionable.iter().position(|candidate| *candidate == id));
+        let index = match (selected, forward) {
+            (Some(index), true) => index.saturating_add(1).min(actionable.len() - 1),
+            (Some(index), false) => index.saturating_sub(1),
+            (None, true) => 0,
+            (None, false) => actionable.len() - 1,
+        };
+        self.selected_message = Some(actionable[index]);
+        self.viewport_anchor_message = Some(actionable[index]);
+        self.viewport_anchor_row = 0;
+        self.message_scroll = 1;
+        self.status_message = None;
+        Vec::new()
+    }
+
+    fn activate_selected_message(&mut self) -> Vec<TelegramCommand> {
+        let Some(chat_id) = self.active_chat_id else {
+            return Vec::new();
+        };
+        let Some(message_id) = self.selected_message else {
+            return Vec::new();
+        };
+        let Some(message) = self
+            .messages
+            .get(&chat_id)
+            .and_then(|messages| messages.iter().find(|message| message.id == message_id))
+            .cloned()
+        else {
+            self.selected_message = None;
+            return Vec::new();
+        };
+
+        if let Some((path, caption, as_photo)) =
+            self.retry_attachments.get(&(chat_id, message_id)).cloned()
+        {
+            if !path.is_file() {
+                self.status_message =
+                    Some("Original attachment no longer exists · drop it again".to_owned());
+                return Vec::new();
+            }
+            if let Some(message) = self
+                .messages
+                .get_mut(&chat_id)
+                .and_then(|messages| messages.iter_mut().find(|message| message.id == message_id))
+            {
+                message.delivery = Delivery::Pending;
+            }
+            self.retry_attachments.remove(&(chat_id, message_id));
+            self.status_message = Some("Retrying attachment…".to_owned());
+            return vec![TelegramCommand::SendAttachment {
+                chat_id,
+                local_id: message_id,
+                path,
+                caption,
+                as_photo,
+            }];
+        }
+
+        if message.attachment.is_some() && message.id > 0 {
+            if let Some(path) = self
+                .downloaded_attachments
+                .get(&(chat_id, message_id))
+                .cloned()
+            {
+                if path.is_file() {
+                    if let Err(error) = reveal_path(&path) {
+                        self.status_message = Some(format!(
+                            "Could not reveal attachment: {}",
+                            sanitize_terminal_line(&error.to_string())
+                        ));
+                    }
+                    return Vec::new();
+                }
+                self.downloaded_attachments.remove(&(chat_id, message_id));
+            }
+            if !self.downloading_attachments.insert((chat_id, message_id)) {
+                self.status_message = Some("Attachment is downloading…".to_owned());
+                return Vec::new();
+            }
+            self.status_message = Some("Downloading attachment…".to_owned());
+            return vec![TelegramCommand::DownloadAttachment {
+                chat_id,
+                message_id,
+            }];
+        }
+
+        if let Some(url) = telegram_link(&message.text) {
+            self.pending_telegram_link = Some(url.clone());
+            self.status_message = Some("Opening Telegram link…".to_owned());
+            return vec![TelegramCommand::ResolveTelegramLink { url }];
+        }
+
+        Vec::new()
+    }
+
+    fn activate_selected_link(&mut self) -> Vec<TelegramCommand> {
+        let Some(message) = self
+            .selected_message
+            .and_then(|message_id| {
+                self.active_messages()
+                    .iter()
+                    .find(|message| message.id == message_id)
+            })
+            .cloned()
+        else {
+            self.status_message = Some("Select a Telegram link with o first".to_owned());
+            return Vec::new();
+        };
+        let Some(url) = telegram_link(&message.text) else {
+            self.status_message = Some("Selected message has no Telegram link".to_owned());
+            return Vec::new();
+        };
+        self.pending_telegram_link = Some(url.clone());
+        self.status_message = Some("Opening Telegram link…".to_owned());
+        vec![TelegramCommand::ResolveTelegramLink { url }]
+    }
+
+    fn open_resolved_link(
+        &mut self,
+        mut chat: Chat,
+        message: Option<Message>,
+    ) -> Vec<TelegramCommand> {
+        let chat_id = chat.id;
+        let selected_message = message.as_ref().map(|message| message.id);
+        if let Some(message) = message {
+            self.update_message(message);
+        }
+        let mut known_chat = self.chats.iter().position(|chat| chat.id == chat_id);
+        chat.title = sanitize_terminal_line(&chat.title);
+        chat.last_message = sanitize_terminal_text(&chat.last_message);
+        if let Some(index) = known_chat {
+            self.chats[index] = chat;
+        } else {
+            self.chats.push(chat);
+            known_chat = Some(self.chats.len() - 1);
+            self.linked_chat_ids.insert(chat_id);
+        }
+        if let Some(index) = known_chat {
+            self.filter.clear();
+            self.selected_chat = index;
+        }
+        self.active_chat_id = Some(chat_id);
+        self.selected_message = selected_message;
+        self.focus = Focus::Conversation;
+        self.narrow_conversation = true;
+        self.mode = Mode::Navigate;
+        self.loading_history = true;
+        self.message_scroll = 0;
+        self.new_messages_while_scrolled = 0;
+        self.new_messages_to_anchor = 0;
+        self.viewport_anchor_message = selected_message;
+        self.viewport_anchor_row = 0;
+        if selected_message.is_some() {
+            self.message_scroll = 1;
+        }
+        let request_id = self.next_history_request_id;
+        self.next_history_request_id = self.next_history_request_id.wrapping_add(1).max(1);
+        self.active_history_request = Some((chat_id, request_id));
+        self.history_target_message = selected_message;
+        if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
+            chat.unread = 0;
+        }
+        self.status_message = None;
+        let mut commands = vec![TelegramCommand::LoadHistory {
+            chat_id,
+            request_id,
+        }];
+        commands.extend(self.request_mark_read(chat_id));
+        commands
+    }
+
+    fn open_selected_chat(&mut self) -> Vec<TelegramCommand> {
+        let Some(chat_id) = self.selected_chat_entry().map(|chat| chat.id) else {
+            return Vec::new();
+        };
+        self.active_chat_id = Some(chat_id);
+        self.selected_message = None;
+        self.focus = Focus::Conversation;
+        self.narrow_conversation = true;
+        self.loading_history = true;
+        self.message_scroll = 0;
+        self.new_messages_while_scrolled = 0;
+        self.new_messages_to_anchor = 0;
+        self.clear_viewport_anchor();
+        let request_id = self.next_history_request_id;
+        self.next_history_request_id = self.next_history_request_id.wrapping_add(1).max(1);
+        self.active_history_request = Some((chat_id, request_id));
+        self.history_target_message = None;
+        if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
+            chat.unread = 0;
+        }
+        let mut commands = vec![TelegramCommand::LoadHistory {
+            chat_id,
+            request_id,
+        }];
+        commands.extend(self.request_mark_read(chat_id));
+        commands
+    }
+
+    fn move_up(&mut self, amount: usize) -> Vec<TelegramCommand> {
+        if self.focus == Focus::Chats {
+            self.move_chat_up(amount)
+        } else {
+            self.selected_message = None;
+            self.clear_viewport_anchor();
+            self.message_scroll = self.message_scroll.saturating_add(amount);
+            Vec::new()
+        }
+    }
+
+    fn move_down(&mut self, amount: usize) -> Vec<TelegramCommand> {
+        if self.focus == Focus::Chats {
+            self.move_chat_down(amount)
+        } else {
+            self.selected_message = None;
+            self.clear_viewport_anchor();
+            self.message_scroll = self.message_scroll.saturating_sub(amount);
+            if self.message_scroll == 0 {
+                return self.reach_bottom();
+            }
+            Vec::new()
+        }
+    }
+
+    fn move_chat_up(&mut self, amount: usize) -> Vec<TelegramCommand> {
+        self.selected_chat = self.selected_chat.saturating_sub(amount);
+        Vec::new()
+    }
+
+    fn move_chat_down(&mut self, amount: usize) -> Vec<TelegramCommand> {
+        let length = self.filtered_chat_indices().len();
+        self.selected_chat = self
+            .selected_chat
+            .saturating_add(amount)
+            .min(length.saturating_sub(1));
+        Vec::new()
+    }
+
+    fn move_to_start(&mut self) -> Vec<TelegramCommand> {
+        if self.focus == Focus::Chats {
+            self.selected_chat = 0;
+        } else {
+            self.selected_message = None;
+            self.clear_viewport_anchor();
+            self.message_scroll = usize::MAX;
+        }
+        Vec::new()
+    }
+
+    fn move_to_end(&mut self) -> Vec<TelegramCommand> {
+        if self.focus == Focus::Chats {
+            self.selected_chat = self.filtered_chat_indices().len().saturating_sub(1);
+            Vec::new()
+        } else {
+            self.selected_message = None;
+            self.clear_viewport_anchor();
+            self.message_scroll = 0;
+            self.reach_bottom()
+        }
+    }
+
+    fn reach_bottom(&mut self) -> Vec<TelegramCommand> {
+        let Some(chat_id) = self.active_chat_id else {
+            return Vec::new();
+        };
+        let had_unread = self.new_messages_while_scrolled > 0
+            || self
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .is_some_and(|chat| chat.unread > 0);
+        self.new_messages_while_scrolled = 0;
+        self.new_messages_to_anchor = 0;
+        self.clear_viewport_anchor();
+        if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
+            chat.unread = 0;
+        }
+        if had_unread {
+            self.request_mark_read(chat_id)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn clamp_chat_selection(&mut self) {
+        let length = self.filtered_chat_indices().len();
+        self.selected_chat = self.selected_chat.min(length.saturating_sub(1));
+    }
+
+    fn replace_dialogs(&mut self, mut chats: Vec<Chat>) {
+        let selected_id = self.selected_chat_entry().map(|chat| chat.id);
+        let transient_linked = self
+            .chats
+            .iter()
+            .filter(|chat| {
+                self.linked_chat_ids.contains(&chat.id)
+                    && !chats.iter().any(|replacement| replacement.id == chat.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        chats.extend(transient_linked);
+        self.linked_chat_ids
+            .retain(|chat_id| chats.iter().any(|chat| chat.id == *chat_id));
+        for chat in &mut chats {
+            chat.title = sanitize_terminal_line(&chat.title);
+            chat.last_message = sanitize_terminal_text(&chat.last_message);
+        }
+        self.chats = chats;
+        self.selected_chat = selected_id
+            .and_then(|id| {
+                self.filtered_chat_indices()
+                    .iter()
+                    .position(|&index| self.chats[index].id == id)
+            })
+            .unwrap_or(0);
+        if self
+            .active_chat_id
+            .is_some_and(|id| !self.chats.iter().any(|chat| chat.id == id))
+        {
+            self.active_chat_id = None;
+            self.selected_message = None;
+            self.message_hit_regions.clear();
+            self.focus = Focus::Chats;
+            self.narrow_conversation = false;
+            self.message_scroll = 0;
+            self.new_messages_while_scrolled = 0;
+            self.new_messages_to_anchor = 0;
+            self.clear_viewport_anchor();
+            self.active_history_request = None;
+            self.history_target_message = None;
+            self.loading_history = false;
+            self.mode = Mode::Navigate;
+        }
+        self.prune_message_cache();
+        self.clamp_chat_selection();
+    }
+
+    fn receive_message(
+        &mut self,
+        mut message: Message,
+        count_as_new: bool,
+        reconcile_accepted: bool,
+    ) -> Vec<TelegramCommand> {
+        sanitize_message(&mut message);
+        let chat_id = message.chat_id;
+        let outgoing = message.outgoing;
+        let text = message.text.clone();
+        let timestamp = message.timestamp;
+        let active = self.active_chat_id == Some(chat_id);
+        let viewing = active && self.focus == Focus::Conversation;
+        let detached = active && self.message_scroll > 0;
+        let message_id = message.id;
+        let was_new = self
+            .messages
+            .get(&chat_id)
+            .is_none_or(|messages| !messages.iter().any(|current| current.id == message_id));
+        let reconciled_local_id = (reconcile_accepted && was_new && message_id > 0 && outgoing)
+            .then(|| {
+                self.messages
+                    .get_mut(&chat_id)
+                    .and_then(|messages| remove_matching_optimistic(messages, &message))
+            })
+            .flatten();
+        if let Some(local_id) = reconciled_local_id {
+            self.clear_reconciled_retry(chat_id, local_id, &text);
+        }
+        let retained = {
+            let messages = self.messages.entry(chat_id).or_default();
+            upsert_message(messages, message);
+            messages.iter().any(|current| current.id == message_id)
+        };
+        let genuinely_new = was_new && retained && reconciled_local_id.is_none();
+        self.prune_message_cache();
+        if genuinely_new && count_as_new && detached {
+            self.new_messages_while_scrolled = self.new_messages_while_scrolled.saturating_add(1);
+            self.new_messages_to_anchor = self.new_messages_to_anchor.saturating_add(1);
+        }
+
+        let selected_id = self.selected_chat_entry().map(|chat| chat.id);
+        let Some(chat_index) = self.chats.iter().position(|chat| chat.id == chat_id) else {
+            return self.request_dialog_refresh();
+        };
+        {
+            let chat = &mut self.chats[chat_index];
+            chat.last_message = text;
+            chat.last_activity = Some(timestamp);
+            if genuinely_new
+                && count_as_new
+                && !outgoing
+                && (!viewing || detached || !self.terminal_focused)
+            {
+                chat.unread = chat.unread.saturating_add(1);
+            } else if viewing && !detached && self.terminal_focused {
+                chat.unread = 0;
+            }
+        }
+        let chat = self.chats.remove(chat_index);
+        self.chats.insert(0, chat);
+        self.selected_chat = selected_id
+            .and_then(|id| {
+                self.filtered_chat_indices()
+                    .iter()
+                    .position(|&index| self.chats[index].id == id)
+            })
+            .unwrap_or(0);
+        self.clamp_chat_selection();
+
+        if genuinely_new
+            && count_as_new
+            && !outgoing
+            && viewing
+            && !detached
+            && self.terminal_focused
+        {
+            self.request_mark_read(chat_id)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn confirm_message(&mut self, local_id: i32, message: Message) -> Vec<TelegramCommand> {
+        let chat_id = message.chat_id;
+        let attachment_send = message.attachment.is_some()
+            || self
+                .messages
+                .get(&chat_id)
+                .and_then(|messages| messages.iter().find(|current| current.id == local_id))
+                .is_some_and(|current| current.attachment.is_some())
+            || self.retry_attachments.contains_key(&(chat_id, local_id));
+        self.retry_attachments.remove(&(chat_id, local_id));
+        let replaced_pending = self.messages.get_mut(&chat_id).is_some_and(|messages| {
+            let original_len = messages.len();
+            messages.retain(|current| current.id != local_id);
+            messages.len() != original_len
+        });
+        let commands = self.receive_message(message, !replaced_pending, false);
+        if attachment_send && self.selected_message == Some(local_id) {
+            self.selected_message = None;
+        }
+        if attachment_send && self.active_chat_id == Some(chat_id) {
+            self.status_message = None;
+        }
+        commands
+    }
+
+    fn finish_history(
+        &mut self,
+        chat_id: ChatId,
+        request_id: u64,
+        result: Result<Vec<Message>, String>,
+    ) -> Vec<TelegramCommand> {
+        if self.active_history_request != Some((chat_id, request_id)) {
+            return Vec::new();
+        }
+        match result {
+            Ok(messages) => {
+                self.merge_history(chat_id, messages, self.history_target_message);
+                self.status_message = None;
+            }
+            Err(error) => self.status_message = Some(sanitize_terminal_line(&error)),
+        }
+        self.active_history_request = None;
+        self.history_target_message = None;
+        self.loading_history = false;
+        Vec::new()
+    }
+
+    fn fail_message(
+        &mut self,
+        chat_id: ChatId,
+        local_id: i32,
+        text: &str,
+        error: &str,
+    ) -> Vec<TelegramCommand> {
+        let failed_visible = self
+            .messages
+            .get_mut(&chat_id)
+            .and_then(|messages| messages.iter_mut().find(|message| message.id == local_id))
+            .is_some_and(|pending| {
+                pending.delivery = Delivery::Failed;
+                true
+            });
+        // A matching outgoing update may have arrived before an ambiguous
+        // transport error. Do not restore a stale draft in that case.
+        if !failed_visible {
+            return Vec::new();
+        }
+        let draft = self.drafts.entry(chat_id).or_default();
+        let retry_available = draft.is_empty();
+        if retry_available {
+            draft.set_value(sanitize_terminal_text(text));
+            self.retry_message_ids.insert(chat_id, local_id);
+        }
+        let error = sanitize_terminal_line(error);
+        let active = self.active_chat_id == Some(chat_id);
+        let chat_title = self
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .map_or_else(|| "conversation".to_owned(), |chat| chat.title.clone());
+        self.status_message = Some(if retry_available && active {
+            format!("Message not sent: {error} · Enter retries")
+        } else if active {
+            format!("Message not sent: {error}")
+        } else {
+            format!("Message to {chat_title} not sent: {error}")
+        });
+        Vec::new()
+    }
+
+    fn accept_message(&mut self, chat_id: ChatId, local_id: i32) {
+        let attachment_send = self
+            .messages
+            .get(&chat_id)
+            .and_then(|messages| messages.iter().find(|message| message.id == local_id))
+            .is_some_and(|message| message.attachment.is_some())
+            || self.retry_attachments.contains_key(&(chat_id, local_id));
+        self.retry_attachments.remove(&(chat_id, local_id));
+        if let Some(message) = self
+            .messages
+            .get_mut(&chat_id)
+            .and_then(|messages| messages.iter_mut().find(|message| message.id == local_id))
+        {
+            message.delivery = Delivery::Sent;
+        }
+        if attachment_send && self.selected_message == Some(local_id) {
+            self.selected_message = None;
+        }
+        if attachment_send && self.active_chat_id == Some(chat_id) {
+            self.status_message = None;
+        }
+    }
+
+    fn update_message(&mut self, mut message: Message) {
+        sanitize_message(&mut message);
+        let chat_id = message.chat_id;
+        let message_id = message.id;
+        let attachment_changed = self.messages.get(&chat_id).is_some_and(|messages| {
+            messages
+                .iter()
+                .find(|current| current.id == message_id)
+                .is_some_and(|current| current.attachment != message.attachment)
+        });
+        if attachment_changed {
+            self.downloaded_attachments.remove(&(chat_id, message_id));
+            self.downloading_attachments.remove(&(chat_id, message_id));
+        }
+        let preview = message.text.clone();
+        let reconciled_local_id = {
+            let messages = self.messages.entry(chat_id).or_default();
+            let was_new = !messages.iter().any(|current| current.id == message_id);
+            (was_new && message_id > 0 && message.outgoing)
+                .then(|| remove_matching_optimistic(messages, &message))
+                .flatten()
+        };
+        if let Some(local_id) = reconciled_local_id {
+            self.clear_reconciled_retry(chat_id, local_id, &preview);
+        }
+        let messages = self.messages.entry(chat_id).or_default();
+        upsert_message(messages, message);
+        let is_latest = messages
+            .last()
+            .is_some_and(|latest| latest.id == message_id);
+        if is_latest {
+            if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
+                chat.last_message = preview;
+            }
+        }
+        self.prune_message_cache();
+    }
+
+    fn merge_history(
+        &mut self,
+        chat_id: ChatId,
+        messages: Vec<Message>,
+        preserved_message: Option<i32>,
+    ) {
+        let mut local = self
+            .messages
+            .get(&chat_id)
+            .into_iter()
+            .flatten()
+            .filter(|message| message.id < 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        let preserved = preserved_message.and_then(|message_id| {
+            self.messages
+                .get(&chat_id)
+                .and_then(|messages| messages.iter().find(|message| message.id == message_id))
+                .cloned()
+        });
+        let mut combined = normalized_messages(messages);
+        let mut reconciled = Vec::new();
+        for server_message in combined.iter().filter(|message| message.outgoing) {
+            if let Some(local_id) = remove_matching_optimistic(&mut local, server_message) {
+                reconciled.push((local_id, server_message.text.clone()));
+            }
+        }
+        for pending in local {
+            upsert_message(&mut combined, pending);
+        }
+        if let Some(preserved) = preserved {
+            upsert_message(&mut combined, preserved);
+        }
+        self.messages.insert(chat_id, combined);
+        for (local_id, text) in reconciled {
+            self.clear_reconciled_retry(chat_id, local_id, &text);
+        }
+        self.prune_message_cache();
+    }
+
+    fn clear_reconciled_retry(&mut self, chat_id: ChatId, local_id: i32, text: &str) {
+        let attachment_retry = self
+            .retry_attachments
+            .remove(&(chat_id, local_id))
+            .is_some();
+        if self.selected_message == Some(local_id) {
+            self.selected_message = None;
+        }
+        let attachment_status = self.status_message.as_deref().is_some_and(|status| {
+            status.starts_with("Sending ")
+                || status.starts_with("Retrying attachment")
+                || status.starts_with("Attachment not sent")
+        });
+        if self.active_chat_id == Some(chat_id) && (attachment_retry || attachment_status) {
+            self.status_message = None;
+        }
+        if self.retry_message_ids.get(&chat_id) == Some(&local_id) {
+            self.retry_message_ids.remove(&chat_id);
+            if self
+                .drafts
+                .get(&chat_id)
+                .is_some_and(|draft| draft.value() == text)
+            {
+                self.drafts.entry(chat_id).or_default().clear();
+            }
+            if self.active_chat_id == Some(chat_id) {
+                self.status_message = None;
+            }
+        }
+    }
+
+    fn request_mark_read(&mut self, chat_id: ChatId) -> Vec<TelegramCommand> {
+        self.read_ack_pending
+            .insert(chat_id)
+            .then_some(TelegramCommand::MarkRead { chat_id })
+            .into_iter()
+            .collect()
+    }
+
+    fn request_dialog_refresh(&mut self) -> Vec<TelegramCommand> {
+        if self.refresh_dialogs_pending {
+            Vec::new()
+        } else {
+            self.refresh_dialogs_pending = true;
+            vec![TelegramCommand::RefreshDialogs]
+        }
+    }
+
+    fn clear_viewport_anchor(&mut self) {
+        self.viewport_anchor_message = None;
+        self.viewport_anchor_row = 0;
+    }
+
+    fn prune_message_cache(&mut self) {
+        self.downloaded_attachments
+            .retain(|&(chat_id, message_id), _| {
+                self.messages
+                    .get(&chat_id)
+                    .is_some_and(|messages| messages.iter().any(|message| message.id == message_id))
+            });
+        self.downloading_attachments
+            .retain(|&(chat_id, message_id)| {
+                self.messages
+                    .get(&chat_id)
+                    .is_some_and(|messages| messages.iter().any(|message| message.id == message_id))
+            });
+        if self.messages.len() <= MAX_CACHED_CHATS {
+            return;
+        }
+        let active = self.active_chat_id;
+        let mut keep = self
+            .chats
+            .iter()
+            .take(MAX_CACHED_CHATS)
+            .map(|chat| chat.id)
+            .collect::<BTreeSet<_>>();
+        if let Some(chat_id) = active {
+            keep.insert(chat_id);
+        }
+        keep.extend(self.retry_message_ids.keys().copied());
+        keep.extend(self.retry_attachments.keys().map(|(chat_id, _)| *chat_id));
+        keep.extend(self.messages.iter().filter_map(|(&chat_id, messages)| {
+            messages
+                .iter()
+                .any(|message| message.id < 0)
+                .then_some(chat_id)
+        }));
+        self.messages.retain(|chat_id, _| keep.contains(chat_id));
+        self.drafts.retain(|chat_id, draft| {
+            !draft.is_empty() || keep.contains(chat_id) || Some(*chat_id) == active
+        });
+    }
+}
+
+fn sanitize_message(message: &mut Message) {
+    message.sender = sanitize_terminal_line(&message.sender);
+    message.text = sanitize_terminal_text(&message.text);
+    if let Some(attachment) = &mut message.attachment {
+        attachment.file_name = attachment
+            .file_name
+            .take()
+            .map(|name| sanitize_terminal_line(&name));
+        attachment.mime_type = attachment
+            .mime_type
+            .take()
+            .map(|mime| sanitize_terminal_line(&mime));
+        attachment.fallback_emoji = attachment
+            .fallback_emoji
+            .take()
+            .map(|emoji| sanitize_terminal_line(&emoji));
+    }
+}
+
+/// Extract the first internal Telegram chat/message link without treating
+/// arbitrary URLs as commands or shell input.
+#[must_use]
+pub fn telegram_link(text: &str) -> Option<String> {
+    text.split_whitespace().find_map(|word| {
+        let candidate = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | '.'
+                    | '!'
+                    | '?'
+                    | ';'
+                    | ':'
+                    | '\''
+                    | '"'
+            )
+        });
+        let lower = candidate.to_ascii_lowercase();
+        let normalized = if lower.starts_with("https://t.me/")
+            || lower.starts_with("http://t.me/")
+            || lower.starts_with("https://telegram.me/")
+            || lower.starts_with("http://telegram.me/")
+            || lower.starts_with("tg://resolve?")
+            || lower.starts_with("tg://privatepost?")
+        {
+            candidate.to_owned()
+        } else if lower.starts_with("t.me/")
+            || lower.starts_with("www.t.me/")
+            || lower.starts_with("telegram.me/")
+            || lower.starts_with("www.telegram.me/")
+        {
+            format!("https://{candidate}")
+        } else {
+            return None;
+        };
+        let lower = normalized.to_ascii_lowercase();
+        let has_target = if lower.starts_with("tg://") {
+            lower.split_once('?').is_some_and(|(_, query)| {
+                query
+                    .split('&')
+                    .any(|field| field.starts_with("domain=") || field.starts_with("channel="))
+            })
+        } else {
+            lower
+                .find(".me/")
+                .is_some_and(|start| !lower[start + 4..].trim_matches('/').is_empty())
+        };
+        has_target.then_some(normalized)
+    })
+}
+
+fn dropped_file_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let direct = Path::new(trimmed);
+    if direct.is_file() {
+        return std::fs::canonicalize(direct).ok().map(|path| vec![path]);
+    }
+
+    let tokens = shellish_paths(trimmed)?;
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens
+        .into_iter()
+        .map(PathBuf::from)
+        .map(|path| {
+            path.is_file()
+                .then(|| std::fs::canonicalize(path).ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+fn shellish_paths(value: &str) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (None, '\\') => escaped = true,
+            (Some(_), _) => current.push(character),
+            (None, '\'' | '"') => quote = Some(character),
+            (None, character) if character.is_whitespace() => {
+                if !current.is_empty() {
+                    paths.push(std::mem::take(&mut current));
+                }
+            }
+            (None, character) => current.push(character),
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        paths.push(current);
+    }
+    Some(paths)
+}
+
+fn attachment_from_path(path: &Path) -> Attachment {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (kind, mime_type) = match extension.as_str() {
+        "jpg" | "jpeg" => (AttachmentKind::Photo, Some("image/jpeg")),
+        "png" => (AttachmentKind::Photo, Some("image/png")),
+        "webp" => (AttachmentKind::Photo, Some("image/webp")),
+        "heic" | "heif" => (AttachmentKind::Photo, Some("image/heic")),
+        "mp4" => (AttachmentKind::Video, Some("video/mp4")),
+        "mp3" => (AttachmentKind::Audio, Some("audio/mpeg")),
+        "ogg" | "oga" => (AttachmentKind::Audio, Some("audio/ogg")),
+        "pdf" => (AttachmentKind::File, Some("application/pdf")),
+        "txt" => (AttachmentKind::File, Some("text/plain")),
+        "zip" => (AttachmentKind::File, Some("application/zip")),
+        _ => (AttachmentKind::File, None),
+    };
+    Attachment {
+        kind,
+        file_name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(sanitize_terminal_line),
+        mime_type: mime_type.map(str::to_owned),
+        size: path.metadata().ok().map(|metadata| metadata.len()),
+        fallback_emoji: None,
+    }
+}
+
+fn reveal_path(path: &Path) -> std::io::Result<()> {
+    if !path.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "downloaded file no longer exists",
+        ));
+    }
+    reveal_path_platform(path).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_path_platform(path: &Path) -> std::io::Result<std::process::Child> {
+    Command::new("open").arg("-R").arg("--").arg(path).spawn()
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_path_platform(path: &Path) -> std::io::Result<std::process::Child> {
+    let parent = path.parent().unwrap_or(path);
+    Command::new("xdg-open").arg(parent).spawn()
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path_platform(path: &Path) -> std::io::Result<std::process::Child> {
+    let selection = format!("/select,{}", path.display());
+    Command::new("explorer.exe").arg(selection).spawn()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn reveal_path_platform(_path: &Path) -> std::io::Result<std::process::Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "revealing files is unsupported on this platform",
+    ))
+}
+
+fn normalized_messages(mut messages: Vec<Message>) -> Vec<Message> {
+    for message in &mut messages {
+        sanitize_message(message);
+    }
+    let mut by_id = BTreeMap::new();
+    for message in messages {
+        by_id.insert(message.id, message);
+    }
+    let mut messages = by_id.into_values().collect::<Vec<_>>();
+    sort_and_cap_messages(&mut messages);
+    messages
+}
+
+fn upsert_message(messages: &mut Vec<Message>, message: Message) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.id == message.id)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+    sort_and_cap_messages(messages);
+}
+
+fn sort_and_cap_messages(messages: &mut Vec<Message>) {
+    messages.sort_by_key(|message| (message.timestamp, message.id));
+    let overflow = messages.len().saturating_sub(MAX_MESSAGES_PER_CHAT);
+    if overflow > 0 {
+        messages.drain(..overflow);
+    }
+}
+
+fn remove_matching_optimistic(messages: &mut Vec<Message>, server: &Message) -> Option<i32> {
+    let matching = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, current)| {
+            current.id < 0
+                && current.outgoing
+                && current.text == server.text
+                && attachments_match(current.attachment.as_ref(), server.attachment.as_ref())
+                && server
+                    .timestamp
+                    .signed_duration_since(current.timestamp)
+                    .num_seconds()
+                    .unsigned_abs()
+                    <= 300
+        })
+        .min_by_key(|(_, current)| (current.timestamp, std::cmp::Reverse(current.id)))
+        .map(|(index, _)| index);
+    matching.map(|index| messages.remove(index).id)
+}
+
+fn attachments_match(left: Option<&Attachment>, right: Option<&Attachment>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) if left.kind != right.kind => false,
+        (Some(left), Some(_)) if left.kind == AttachmentKind::Photo => true,
+        (Some(left), Some(right)) => {
+            left.file_name.is_none()
+                || right.file_name.is_none()
+                || left.file_name == right.file_name
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use chrono::{TimeZone, Utc};
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    use super::{
+        App, AttachmentState, AuthPhase, Focus, Mode, Screen, MAX_CACHED_CHATS,
+        MAX_MESSAGES_PER_CHAT,
+    };
+    use crate::{
+        event::{AppEvent, AuthPrompt, NetworkEvent, TelegramCommand},
+        input::KeyAction,
+        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message},
+    };
+
+    fn chat(id: i64, title: &str) -> Chat {
+        Chat {
+            id,
+            title: title.to_owned(),
+            kind: ChatKind::Direct,
+            unread: 3,
+            last_message: format!("from {title}"),
+            last_activity: None,
+        }
+    }
+
+    fn message(id: i32, chat_id: i64, text: &str, outgoing: bool) -> Message {
+        Message {
+            id,
+            chat_id,
+            sender: if outgoing { "Me" } else { "Them" }.to_owned(),
+            text: text.to_owned(),
+            timestamp: Utc.timestamp_opt(i64::from(id.max(0)), 0).unwrap(),
+            outgoing,
+            delivery: Delivery::Sent,
+            attachment: None,
+        }
+    }
+
+    fn ready_app() -> App {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Ready {
+            user_name: "Ada".to_owned(),
+        });
+        app.handle_network(NetworkEvent::Dialogs(vec![
+            chat(1, "Alpha"),
+            chat(2, "Beta"),
+            chat(3, "Gamma"),
+        ]));
+        app
+    }
+
+    fn open_first(app: &mut App) {
+        app.handle_action(KeyAction::Enter);
+        app.handle_network(NetworkEvent::History {
+            chat_id: 1,
+            request_id: 1,
+            messages: (1..=20)
+                .map(|id| message(id, 1, &format!("message {id}"), false))
+                .collect(),
+        });
+    }
+
+    #[test]
+    fn password_is_masked_and_submitted_without_trimming() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Password {
+            hint: Some("pet".to_owned()),
+        }));
+        app.handle_action(KeyAction::Character('界'));
+        app.handle_action(KeyAction::Character('x'));
+        assert_eq!(app.auth_display_value(), "••");
+        assert_eq!(app.auth_cursor_display_width(), 2);
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::SubmitPassword("界x".to_owned())]
+        );
+        assert_eq!(
+            app.screen,
+            Screen::Auth(AuthPhase::Password {
+                hint: Some("pet".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn auth_prompt_metadata_cannot_inject_terminal_content() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+81\u{1b}[2J\n90".to_owned(),
+        }));
+        assert_eq!(
+            app.screen,
+            Screen::Auth(AuthPhase::Code {
+                phone: "+81 90".to_owned()
+            })
+        );
+
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Password {
+            hint: Some("first\u{1b}[31m\nsecond".to_owned()),
+        }));
+        assert_eq!(
+            app.screen,
+            Screen::Auth(AuthPhase::Password {
+                hint: Some("first second".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn escape_restarts_code_or_password_auth_but_only_clears_phone_input() {
+        let mut app = App::new();
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Code {
+            phone: "+81 90".to_owned(),
+        }));
+        app.handle_action(KeyAction::Character('1'));
+        app.status_message = Some("bad code".to_owned());
+        assert_eq!(
+            app.handle_action(KeyAction::Escape),
+            vec![TelegramCommand::RestartAuth]
+        );
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert!(app.auth_input().is_empty());
+        assert!(app.status_message.is_none());
+
+        app.handle_action(KeyAction::Character('+'));
+        assert!(app.handle_action(KeyAction::Escape).is_empty());
+        assert_eq!(app.screen, Screen::Auth(AuthPhase::Phone));
+        assert!(app.auth_input().is_empty());
+    }
+
+    #[test]
+    fn ready_does_not_duplicate_the_workers_dialog_load() {
+        let mut app = App::new();
+        assert!(app
+            .handle_network(NetworkEvent::Ready {
+                user_name: "Ada".to_owned()
+            })
+            .is_empty());
+        assert_eq!(app.screen, Screen::Main);
+    }
+
+    #[test]
+    fn chat_selection_survives_reordering_by_identity() {
+        let mut app = ready_app();
+        app.selected_chat = 1;
+        app.handle_network(NetworkEvent::Dialogs(vec![
+            chat(3, "Gamma"),
+            chat(1, "Alpha"),
+            chat(2, "Beta"),
+        ]));
+        assert_eq!(app.selected_chat_entry().map(|chat| chat.id), Some(2));
+    }
+
+    #[test]
+    fn composer_is_multiline_unicode_aware_and_optimistic() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('界'));
+        app.handle_action(KeyAction::Newline);
+        app.handle_action(KeyAction::Character('🙂'));
+        let commands = app.handle_action(KeyAction::Enter);
+        assert!(matches!(
+            commands.as_slice(),
+            [TelegramCommand::SendMessage { chat_id: 1, local_id: -1, text }] if text == "界\n🙂"
+        ));
+        let pending = app.active_messages().last().unwrap();
+        assert_eq!(pending.delivery, Delivery::Pending);
+        assert_eq!(app.mode, Mode::Compose);
+    }
+
+    #[test]
+    fn failed_send_is_visible_and_restored_without_overwriting_newer_draft() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Character('n'));
+        app.handle_network(NetworkEvent::SendFailed {
+            chat_id: 1,
+            local_id: -1,
+            text: "x".to_owned(),
+            error: "offline".to_owned(),
+        });
+        assert_eq!(
+            app.active_messages().last().unwrap().delivery,
+            Delivery::Failed
+        );
+        assert_eq!(app.active_draft().map(TextInput::value), Some("n"));
+        assert!(app.status_message.as_deref().unwrap().contains("offline"));
+    }
+
+    #[test]
+    fn retry_replaces_the_failed_timeline_entry() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+        app.handle_network(NetworkEvent::SendFailed {
+            chat_id: 1,
+            local_id: -1,
+            text: "x".to_owned(),
+            error: "offline".to_owned(),
+        });
+        assert_eq!(app.active_draft().map(TextInput::value), Some("x"));
+
+        let commands = app.handle_action(KeyAction::Enter);
+        assert!(matches!(
+            commands.last(),
+            Some(TelegramCommand::SendMessage { local_id: -2, .. })
+        ));
+        assert!(!app.active_messages().iter().any(|message| message.id == -1));
+        assert_eq!(app.active_messages().last().unwrap().id, -2);
+    }
+
+    #[test]
+    fn history_refresh_preserves_pending_messages() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+        let request_id = 2;
+        app.active_history_request = Some((1, request_id));
+        app.handle_network(NetworkEvent::History {
+            chat_id: 1,
+            request_id,
+            messages: vec![message(1, 1, "server", false)],
+        });
+        assert!(app.active_messages().iter().any(|message| message.id == -1));
+    }
+
+    #[test]
+    fn histories_and_live_updates_keep_only_the_lightweight_history_window() {
+        let mut app = ready_app();
+        app.handle_action(KeyAction::Enter);
+        app.handle_network(NetworkEvent::History {
+            chat_id: 1,
+            request_id: 1,
+            messages: (1..=600)
+                .map(|id| message(id, 1, &format!("message {id}"), false))
+                .collect(),
+        });
+        let history = app.messages.get(&1).expect("bounded history");
+        assert_eq!(history.len(), MAX_MESSAGES_PER_CHAT);
+        assert_eq!(history.first().map(|message| message.id), Some(441));
+        assert_eq!(history.last().map(|message| message.id), Some(600));
+
+        app.handle_network(NetworkEvent::NewMessage(message(601, 1, "latest", false)));
+        let history = app.messages.get(&1).expect("bounded history");
+        assert_eq!(history.len(), MAX_MESSAGES_PER_CHAT);
+        assert_eq!(history.first().map(|message| message.id), Some(442));
+        assert_eq!(history.last().map(|message| message.id), Some(601));
+    }
+
+    #[test]
+    fn message_cache_evicts_inactive_chats_but_keeps_the_active_one() {
+        let mut app = ready_app();
+        app.chats = (1_i64..=14)
+            .map(|id| chat(id, &format!("Chat {id}")))
+            .collect();
+        app.active_chat_id = Some(14);
+        for chat_id in 1_i64..=14 {
+            app.handle_network(NetworkEvent::MessageUpdated(message(
+                i32::try_from(chat_id).expect("small chat id"),
+                chat_id,
+                "cached",
+                false,
+            )));
+        }
+
+        assert_eq!(app.messages.len(), MAX_CACHED_CHATS + 1);
+        assert!(app.messages.contains_key(&14));
+        assert!(!app.messages.contains_key(&13));
+    }
+
+    #[test]
+    fn detached_history_never_jumps_and_defers_read_ack() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_network(NetworkEvent::ReadMarked { chat_id: 1 });
+        app.handle_action(KeyAction::PageUp);
+        assert_eq!(app.message_scroll, 10);
+        assert!(app
+            .handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
+            .is_empty());
+        assert_eq!(app.message_scroll, 10);
+        assert_eq!(app.new_messages_while_scrolled, 1);
+        assert_eq!(app.new_messages_to_anchor, 1);
+        assert!(app.active_chat().unwrap().unread > 0);
+        assert_eq!(
+            app.handle_action(KeyAction::End),
+            vec![TelegramCommand::MarkRead { chat_id: 1 }]
+        );
+        assert_eq!(app.new_messages_while_scrolled, 0);
+        assert_eq!(app.new_messages_to_anchor, 0);
+    }
+
+    #[test]
+    fn accepted_then_echoed_outgoing_message_reconciles_without_a_new_badge() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+        app.handle_network(NetworkEvent::MessageAccepted {
+            chat_id: 1,
+            local_id: -1,
+        });
+        assert_eq!(
+            app.active_messages()
+                .iter()
+                .find(|message| message.id == -1)
+                .map(|message| message.delivery),
+            Some(Delivery::Sent)
+        );
+
+        app.message_scroll = 5;
+        let mut echoed = message(21, 1, "x", true);
+        echoed.timestamp = Utc::now();
+        app.handle_network(NetworkEvent::NewMessage(echoed));
+        assert!(!app.active_messages().iter().any(|message| message.id < 0));
+        assert!(app.active_messages().iter().any(|message| message.id == 21));
+        assert_eq!(app.new_messages_while_scrolled, 0);
+        assert_eq!(app.new_messages_to_anchor, 0);
+    }
+
+    #[test]
+    fn confirming_one_of_two_identical_sends_keeps_the_other_optimistic_entry() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Enter);
+
+        app.handle_network(NetworkEvent::MessageSent {
+            local_id: -1,
+            message: message(21, 1, "x", true),
+        });
+        assert!(app.active_messages().iter().any(|message| message.id == 21));
+        assert!(app.active_messages().iter().any(|message| message.id == -2));
+        assert!(!app.active_messages().iter().any(|message| message.id == -1));
+    }
+
+    #[test]
+    fn background_focus_defers_read_acknowledgement() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.update(AppEvent::TerminalFocus(false));
+        assert!(app
+            .handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
+            .is_empty());
+        assert!(app.active_chat().unwrap().unread > 0);
+    }
+
+    #[test]
+    fn slash_in_conversation_is_a_bot_command_not_a_filter() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('/'));
+        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.active_draft().map(TextInput::value), Some("/"));
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_and_strips_terminal_controls() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        app.update(AppEvent::Paste("a\r\nb\u{1b}[31m!".to_owned()));
+        assert_eq!(app.active_draft().map(TextInput::value), Some("a\nb!"));
+    }
+
+    #[test]
+    fn filtering_and_help_are_contextual() {
+        let mut app = ready_app();
+        app.handle_action(KeyAction::Character('/'));
+        app.handle_action(KeyAction::Character('g'));
+        assert_eq!(app.visible_chats()[0].title, "Gamma");
+        app.handle_action(KeyAction::Escape);
+        app.handle_action(KeyAction::Character('?'));
+        assert_eq!(app.mode, Mode::Help);
+        app.handle_action(KeyAction::Character('?'));
+        assert_eq!(app.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn q_is_text_in_an_editor_but_quits_in_navigation() {
+        let mut app = ready_app();
+        app.handle_action(KeyAction::Character('/'));
+        app.handle_action(KeyAction::Character('q'));
+        assert_eq!(app.filter.value(), "q");
+        app.handle_action(KeyAction::Escape);
+        assert_eq!(
+            app.handle_action(KeyAction::Character('q')),
+            vec![TelegramCommand::Shutdown]
+        );
+    }
+
+    #[test]
+    fn control_l_requests_a_complete_redraw() {
+        let mut app = ready_app();
+        app.handle_action(KeyAction::Redraw);
+        assert!(app.take_force_redraw());
+        assert!(!app.take_force_redraw());
+    }
+
+    #[test]
+    fn fatal_strings_cannot_inject_terminal_sequences() {
+        let mut app = ready_app();
+        app.handle_network(NetworkEvent::Fatal("bad\u{1b}[2Jnews".to_owned()));
+        assert_eq!(app.screen, Screen::Fatal("badnews".to_owned()));
+        assert_eq!(
+            app.handle_action(KeyAction::Character('q')),
+            vec![TelegramCommand::Shutdown]
+        );
+    }
+
+    #[test]
+    fn navigation_opens_chat_and_controls_narrow_view() {
+        let mut app = ready_app();
+        app.handle_action(KeyAction::Down);
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![
+                TelegramCommand::LoadHistory {
+                    chat_id: 2,
+                    request_id: 1,
+                },
+                TelegramCommand::MarkRead { chat_id: 2 }
+            ]
+        );
+        assert_eq!(app.focus, Focus::Conversation);
+        assert!(app.narrow_conversation);
+        app.handle_action(KeyAction::Escape);
+        assert_eq!(app.focus, Focus::Chats);
+        assert!(!app.narrow_conversation);
+    }
+
+    #[test]
+    fn tab_keeps_narrow_pane_visibility_in_sync_with_focus() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        assert_eq!(app.focus, Focus::Conversation);
+        assert!(app.narrow_conversation);
+
+        app.message_scroll = 3;
+        app.handle_action(KeyAction::Tab);
+        assert_eq!(app.focus, Focus::Chats);
+        assert!(!app.narrow_conversation);
+        app.handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)));
+        assert_eq!(app.new_messages_to_anchor, 1);
+
+        app.handle_action(KeyAction::Tab);
+        assert_eq!(app.focus, Focus::Conversation);
+        assert!(app.narrow_conversation);
+    }
+
+    #[test]
+    fn dropped_existing_path_sends_attachment_outside_compose_mode() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.mode = Mode::Navigate;
+        let path = std::env::temp_dir().join(format!(
+            "termgram-drag-{}-{}.txt",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::write(&path, b"hello").expect("create dragged fixture");
+        let commands = app.update(AppEvent::Paste(format!("'{}'", path.display())));
+        assert!(matches!(
+            commands.as_slice(),
+            [TelegramCommand::SendAttachment { chat_id: 1, local_id: -1, path: sent, as_photo: false, .. }]
+                if sent == &fs::canonicalize(&path).expect("canonical fixture")
+        ));
+        assert!(app.active_messages().last().unwrap().attachment.is_some());
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn dropped_path_never_sends_from_chat_focus_filter_or_help() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let path =
+            std::env::temp_dir().join(format!("termgram-no-send-{}.txt", std::process::id()));
+        fs::write(&path, b"private").expect("create fixture");
+        let paste = AppEvent::Paste(path.display().to_string());
+
+        app.focus = Focus::Chats;
+        assert!(app.update(paste.clone()).is_empty());
+        app.focus = Focus::Conversation;
+        app.mode = Mode::Filter;
+        assert!(app.update(paste.clone()).is_empty());
+        app.mode = Mode::Help;
+        assert!(app.update(paste).is_empty());
+        assert!(!app.active_messages().iter().any(|message| message.id < 0));
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn quoted_windows_paths_preserve_separator_backslashes() {
+        assert_eq!(
+            super::shellish_paths(r#""C:\Users\A B\image.jpg" "D:\two.txt""#),
+            Some(vec![
+                r"C:\Users\A B\image.jpg".to_owned(),
+                r"D:\two.txt".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn telegram_links_are_resolved_but_ordinary_urls_are_not() {
+        assert_eq!(
+            super::telegram_link("see https://t.me/rustlang/42."),
+            Some("https://t.me/rustlang/42".to_owned())
+        );
+        assert_eq!(
+            super::telegram_link("<tg://resolve?domain=rustlang&post=42>"),
+            Some("tg://resolve?domain=rustlang&post=42".to_owned())
+        );
+        assert_eq!(
+            super::telegram_link("telegram.me/rustlang"),
+            Some("https://telegram.me/rustlang".to_owned())
+        );
+        assert_eq!(super::telegram_link("https://example.com/file"), None);
+    }
+
+    #[test]
+    fn caption_link_has_explicit_activation_separate_from_media() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let mut photo = message(21, 1, "see https://t.me/rustlang/42", false);
+        photo.attachment = Some(Attachment {
+            kind: AttachmentKind::Photo,
+            file_name: Some("photo.jpg".to_owned()),
+            mime_type: Some("image/jpeg".to_owned()),
+            size: Some(10),
+            fallback_emoji: None,
+        });
+        app.handle_network(NetworkEvent::NewMessage(photo));
+        app.selected_message = Some(21);
+
+        assert_eq!(
+            app.handle_action(KeyAction::Character('l')),
+            vec![TelegramCommand::ResolveTelegramLink {
+                url: "https://t.me/rustlang/42".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn linked_target_survives_history_and_dialog_refresh_with_anchor() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let linked = message(5, 99, "linked target", false);
+        let linked_chat = Chat {
+            id: 99,
+            title: "Linked group".to_owned(),
+            kind: ChatKind::Group,
+            unread: 0,
+            last_message: "linked target".to_owned(),
+            last_activity: None,
+        };
+        let commands = app.handle_network(NetworkEvent::LinkResolved {
+            chat: linked_chat,
+            message: Some(linked),
+        });
+        let request_id = commands
+            .iter()
+            .find_map(|command| match command {
+                TelegramCommand::LoadHistory { request_id, .. } => Some(*request_id),
+                _ => None,
+            })
+            .expect("linked history request");
+        assert_eq!(app.viewport_anchor_message, Some(5));
+        assert_eq!(app.selected_message, Some(5));
+        app.handle_action(KeyAction::Character('i'));
+        assert_eq!(app.selected_message, None);
+
+        app.handle_network(NetworkEvent::History {
+            chat_id: 99,
+            request_id,
+            messages: (100..180)
+                .map(|id| message(id, 99, &format!("recent {id}"), false))
+                .collect(),
+        });
+        assert!(app.active_messages().iter().any(|message| message.id == 5));
+        assert_eq!(app.viewport_anchor_message, Some(5));
+
+        app.handle_network(NetworkEvent::Dialogs(vec![chat(1, "Alpha")]));
+        assert_eq!(app.active_chat_id, Some(99));
+        assert!(app.chats.iter().any(|chat| chat.id == 99));
+    }
+
+    #[test]
+    fn selecting_actionable_message_sets_a_visible_semantic_anchor() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.messages.insert(
+            1,
+            (1..=30)
+                .map(|id| {
+                    message(
+                        id,
+                        1,
+                        if id == 2 {
+                            "https://t.me/rustlang/2"
+                        } else {
+                            "ordinary"
+                        },
+                        false,
+                    )
+                })
+                .collect(),
+        );
+        app.handle_action(KeyAction::Character('o'));
+        assert_eq!(app.selected_message, Some(2));
+        assert_eq!(app.viewport_anchor_message, Some(2));
+        assert!(app.message_scroll > 0);
+
+        app.handle_action(KeyAction::PageDown);
+        assert_eq!(app.selected_message, None);
+        assert_eq!(app.viewport_anchor_message, None);
+    }
+
+    #[test]
+    fn failed_attachment_remains_selectable_and_retries_exact_path() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let path = std::env::temp_dir().join(format!("termgram-retry-{}.png", std::process::id()));
+        fs::write(&path, b"png").expect("create retry fixture");
+        let command = app.update(AppEvent::Paste(path.display().to_string()));
+        let TelegramCommand::SendAttachment {
+            local_id,
+            path: sent_path,
+            ..
+        } = command.into_iter().next().expect("send command")
+        else {
+            panic!("expected attachment send");
+        };
+        app.handle_network(NetworkEvent::AttachmentSendFailed {
+            chat_id: 1,
+            local_id,
+            path: sent_path.clone(),
+            caption: String::new(),
+            as_photo: true,
+            error: "offline".to_owned(),
+        });
+        assert_eq!(app.selected_message, Some(local_id));
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::SendAttachment {
+                chat_id: 1,
+                local_id,
+                path: sent_path,
+                caption: String::new(),
+                as_photo: true,
+            }]
+        );
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn optimistic_attachments_reconcile_by_identity_not_empty_caption() {
+        let first = Message {
+            id: -1,
+            chat_id: 1,
+            sender: "You".to_owned(),
+            text: String::new(),
+            timestamp: Utc::now(),
+            outgoing: true,
+            delivery: Delivery::Pending,
+            attachment: Some(Attachment {
+                kind: AttachmentKind::File,
+                file_name: Some("first.txt".to_owned()),
+                mime_type: Some("text/plain".to_owned()),
+                size: Some(1),
+                fallback_emoji: None,
+            }),
+        };
+        let second = Message {
+            id: -2,
+            attachment: Some(Attachment {
+                file_name: Some("second.txt".to_owned()),
+                ..first.attachment.clone().unwrap()
+            }),
+            ..first.clone()
+        };
+        let server = Message {
+            id: 42,
+            attachment: second.attachment.clone(),
+            delivery: Delivery::Sent,
+            ..second.clone()
+        };
+        let mut pending = vec![first, second];
+        assert_eq!(
+            super::remove_matching_optimistic(&mut pending, &server),
+            Some(-2)
+        );
+        assert_eq!(pending[0].id, -1);
+    }
+
+    #[test]
+    fn optimistic_photo_reconciles_when_telegram_renames_it() {
+        let mut local = message(-1, 1, "", true);
+        local.timestamp = Utc::now();
+        local.delivery = Delivery::Pending;
+        local.attachment = Some(Attachment {
+            kind: AttachmentKind::Photo,
+            file_name: Some("holiday.png".to_owned()),
+            mime_type: Some("image/png".to_owned()),
+            size: Some(10),
+            fallback_emoji: None,
+        });
+        let mut server = local.clone();
+        server.id = 42;
+        server.delivery = Delivery::Sent;
+        server.attachment.as_mut().unwrap().file_name = Some("photo.jpg".to_owned());
+        let mut pending = vec![local];
+
+        assert_eq!(
+            super::remove_matching_optimistic(&mut pending, &server),
+            Some(-1)
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn attachment_success_clears_status_and_stale_selection() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let mut local = message(-1, 1, "", true);
+        local.delivery = Delivery::Pending;
+        local.attachment = Some(Attachment {
+            kind: AttachmentKind::File,
+            file_name: Some("notes.txt".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            size: Some(10),
+            fallback_emoji: None,
+        });
+        app.messages.get_mut(&1).unwrap().push(local);
+        app.selected_message = Some(-1);
+        app.status_message = Some("Sending attachment…".to_owned());
+
+        app.handle_network(NetworkEvent::MessageAccepted {
+            chat_id: 1,
+            local_id: -1,
+        });
+        assert_eq!(app.selected_message, None);
+        assert_eq!(app.status_message, None);
+    }
+
+    #[test]
+    fn edited_attachment_invalidates_downloaded_state() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let mut original = message(21, 1, "", false);
+        original.attachment = Some(Attachment {
+            kind: AttachmentKind::File,
+            file_name: Some("before.txt".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            size: Some(1),
+            fallback_emoji: None,
+        });
+        app.handle_network(NetworkEvent::NewMessage(original.clone()));
+        app.handle_network(NetworkEvent::AttachmentDownloaded {
+            chat_id: 1,
+            message_id: 21,
+            path: std::env::temp_dir().join("termgram-edited-fixture"),
+        });
+        assert_eq!(app.attachment_state(1, 21), AttachmentState::Downloaded);
+
+        original.attachment.as_mut().unwrap().file_name = Some("after.txt".to_owned());
+        app.handle_network(NetworkEvent::MessageUpdated(original));
+        assert_eq!(app.attachment_state(1, 21), AttachmentState::Ready);
+    }
+
+    #[test]
+    fn clicking_an_attachment_row_requests_lazy_download() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let mut photo = message(21, 1, "", false);
+        photo.attachment = Some(Attachment {
+            kind: AttachmentKind::Photo,
+            file_name: Some("photo.jpg".to_owned()),
+            mime_type: Some("image/jpeg".to_owned()),
+            size: Some(42),
+            fallback_emoji: None,
+        });
+        app.handle_network(NetworkEvent::NewMessage(photo));
+        app.set_message_hit_regions(vec![(10, 70, 8, 21)]);
+
+        let commands = app.update(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(
+            commands,
+            vec![TelegramCommand::DownloadAttachment {
+                chat_id: 1,
+                message_id: 21
+            }]
+        );
+        assert_eq!(app.selected_message, Some(21));
+        assert_eq!(app.attachment_state(1, 21), AttachmentState::Downloading);
+    }
+
+    use crate::input::TextInput;
+}

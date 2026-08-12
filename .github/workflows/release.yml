@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Package (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            package: termgram-linux.tar.gz
+          - platform: macos
+            os: macos-latest
+            package: termgram-macos.tar.gz
+          - platform: windows
+            os: windows-latest
+            package: termgram-windows.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.platform }}
+      - run: cargo test --locked --all-targets --all-features
+      - name: Build release binary
+        run: cargo build --locked --release
+        env:
+          TERMGRAM_EMBEDDED_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TERMGRAM_EMBEDDED_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+      - name: Package binary
+        if: runner.os != 'Windows'
+        run: tar -C target/release -czf "${{ matrix.package }}" tg
+      - name: Package binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/tg.exe -DestinationPath "${{ matrix.package }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termgram-${{ matrix.platform }}
+          path: ${{ matrix.package }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*/*
+          --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag

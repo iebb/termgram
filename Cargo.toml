@@ -1,0 +1,40 @@
+[package]
+name = "termgram"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A focused, keyboard-first Telegram client for the terminal"
+license = "MIT"
+repository = "https://github.com/iebb/termgram"
+
+[[bin]]
+name = "tg"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+directories = "6.0"
+dotenvy = "0.15"
+futures-util = { version = "0.3.32", default-features = false }
+grammers-client = { version = "=0.10.0", default-features = false, features = ["fs"] }
+grammers-session = { version = "=0.10.0", default-features = false, features = ["sqlite-storage"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = { version = "=0.29.0", default-features = false, features = ["bracketed-paste", "event-stream"] }
+tokio = { version = "1.52", default-features = false, features = ["macros", "rt", "signal", "sync", "time"] }
+unicode-segmentation = "=1.12.0"
+unicode-width = "=0.2.2"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,73 +1,193 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
+      - master
 
 permissions:
+  actions: read
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: termgram-release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Package (${{ matrix.platform }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux
-            os: ubuntu-latest
-            package: termgram-linux.tar.gz
-          - platform: macos
-            os: macos-latest
-            package: termgram-macos.tar.gz
-          - platform: windows
-            os: windows-latest
-            package: termgram-windows.zip
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.platform }}
-      - run: cargo test --locked --all-targets --all-features
-      - name: Build release binary
-        run: cargo build --locked --release
-        env:
-          TERMGRAM_EMBEDDED_API_ID: ${{ secrets.TELEGRAM_API_ID }}
-          TERMGRAM_EMBEDDED_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-      - name: Package binary
-        if: runner.os != 'Windows'
-        run: tar -C target/release -czf "${{ matrix.package }}" tg
-      - name: Package binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/release/tg.exe -DestinationPath "${{ matrix.package }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: termgram-${{ matrix.platform }}
-          path: ${{ matrix.package }}
-          if-no-files-found: error
-
   publish:
-    name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    name: Publish tested commits
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release plan from successful CI run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: release-plan
+          path: metadata
+
+      - name: Download binaries from successful CI run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: tg-*
+          merge-multiple: true
           path: dist
-      - name: Create release
+
+      - name: Validate release plan and prepare checksums
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$SOURCE_SHA" "origin/$DEFAULT_BRANCH"
+          test -f metadata/release-plan.tsv
+          test ! -L metadata/release-plan.tsv
+
+          previous=
+          final=
+          declare -A seen_sha=()
+          declare -A seen_version=()
+          : > expected-assets.txt
+          while IFS=$'\t' read -r sha height version extra; do
+            [[ -z "${extra:-}" ]]
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$height" =~ ^[1-9][0-9]*$ ]]
+            [[ "$version" == "0.1.$height" ]]
+            [[ -z "${seen_sha[$sha]:-}" ]]
+            [[ -z "${seen_version[$version]:-}" ]]
+            test "$(git rev-list --first-parent --count "$sha")" = "$height"
+            git merge-base --is-ancestor "$sha" "$SOURCE_SHA"
+            if [[ -n "$previous" ]]; then
+              test "$(git rev-parse "$sha^1")" = "$previous"
+            fi
+            seen_sha[$sha]=1
+            seen_version[$version]=1
+            previous="$sha"
+            final="$sha"
+            {
+              printf 'termgram-%s-linux.tar.gz\n' "$version"
+              printf 'termgram-%s-macos.tar.gz\n' "$version"
+              printf 'termgram-%s-windows.zip\n' "$version"
+            } >> expected-assets.txt
+          done < metadata/release-plan.tsv
+          test -n "$final"
+          test "$final" = "$SOURCE_SHA"
+
+          actual="$(find dist -maxdepth 1 -type f -printf '%f\n' | sort)"
+          wanted="$(sort expected-assets.txt)"
+          test "$actual" = "$wanted"
+
+          while IFS=$'\t' read -r sha height version; do
+            asset_dir="prepared/$version"
+            mkdir -p "$asset_dir"
+            cp "dist/termgram-$version-linux.tar.gz" "$asset_dir/"
+            cp "dist/termgram-$version-macos.tar.gz" "$asset_dir/"
+            cp "dist/termgram-$version-windows.zip" "$asset_dir/"
+            (
+              cd "$asset_dir"
+              sha256sum termgram-* > SHA256SUMS
+            )
+          done < metadata/release-plan.tsv
+
+      - name: Publish GitHub releases idempotently
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*/*
-          --repo "$GITHUB_REPOSITORY" --generate-notes --verify-tag
+        run: |
+          set -euo pipefail
+
+          while IFS=$'\t' read -r source_sha _height version; do
+            tag="v$version"
+            subject="$(git show -s --format=%s "$source_sha")"
+            prerelease=true
+            title="Termgram $version (prerelease)"
+            latest=false
+            if [[ "$subject" == release:* ]]; then
+              prerelease=false
+              title="Termgram $version"
+              latest=legacy
+            fi
+            asset_dir="prepared/$version"
+
+            if tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null)"; then
+              if [[ "$tag_sha" != "$source_sha" ]]; then
+                echo "Refusing to move conflicting tag $tag from $tag_sha to $source_sha" >&2
+                exit 1
+              fi
+              tag_exists=true
+            else
+              tag_exists=false
+            fi
+
+            if release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                --json assets,databaseId,isDraft,isPrerelease,url 2>/dev/null)"; then
+              is_draft="$(jq -r .isDraft <<<"$release_json")"
+              if [[ "$is_draft" == false ]]; then
+                existing_prerelease="$(jq -r .isPrerelease <<<"$release_json")"
+                if [[ "$existing_prerelease" != "$prerelease" ]]; then
+                  echo "Existing $tag release has the wrong release type" >&2
+                  exit 1
+                fi
+                local_assets="$(
+                  find "$asset_dir" -maxdepth 1 -type f -exec sh -c '
+                    for file do
+                      digest="$(sha256sum "$file")"
+                      printf "sha256:%s\t%s\n" \
+                        "${digest%% *}" "$(basename "$file")"
+                    done
+                  ' sh {} + | sort
+                )"
+                remote_assets="$(jq -r '.assets[] | [.digest, .name] | @tsv' \
+                  <<<"$release_json" | sort)"
+                if [[ "$remote_assets" != "$local_assets" ]]; then
+                  echo "Existing $tag release assets do not match tested bytes" >&2
+                  exit 1
+                fi
+                echo "Verified existing release $(jq -r .url <<<"$release_json")"
+                continue
+              fi
+              release_id="$(jq -r .databaseId <<<"$release_json")"
+            else
+              create_args=(--repo "$GITHUB_REPOSITORY" --draft --title "$title" --generate-notes)
+              if [[ "$tag_exists" == true ]]; then
+                create_args+=(--verify-tag)
+              else
+                create_args+=(--target "$source_sha")
+              fi
+              gh release create "$tag" "${create_args[@]}"
+              release_id="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+                --json databaseId --jq .databaseId)"
+            fi
+
+            gh release upload "$tag" "$asset_dir"/* \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false -F prerelease="$prerelease" \
+              -f make_latest="$latest" -f name="$title" >/dev/null
+          done < metadata/release-plan.tsv

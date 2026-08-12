@@ -56,11 +56,15 @@ After the first build, launch the optimized client directly with:
 ```
 
 On Windows, run `target\release\tg.exe`. GitHub Actions tests and packages the
-client on Linux, macOS, and Windows; tagged builds publish `termgram-linux`,
-`termgram-macos`, and `termgram-windows` archives on the GitHub release. The
-public repository stores only the `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`
-secret names; GitHub encrypts their values and injects them only into trusted
-push and release builds, never pull-request builds.
+client on Linux, macOS, and Windows. Every successful default-branch commit is
+published as a prerelease with version `0.1.Z`, where `Z` is its first-parent
+commit height. A commit whose subject starts with `release:` is published as a
+normal release instead. Archives include both version and platform, for example
+`termgram-0.1.42-linux.tar.gz`. Run `tg --version` to inspect a binary's version.
+
+The public repository stores only the `TELEGRAM_API_ID` and
+`TELEGRAM_API_HASH` secret names. GitHub encrypts their values and injects them
+only into trusted default-branch builds, never pull-request builds.
 
 ## Lightweight by design
 
@@ -133,3 +137,22 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 cargo build --release
 ```
+
+## Publishing
+
+Pushing an ordinary commit to the default branch creates a GitHub prerelease
+after every check and all three native builds pass. Release publication reuses
+those exact tested artifacts and adds `SHA256SUMS`; a failed CI run never
+publishes anything.
+
+To promote the current tree as a stable release, create a release commit and
+push it:
+
+```sh
+git commit --allow-empty -m "release: stable"
+git push
+```
+
+Versions stay on the `0.1` line for now. `Z` advances once per first-parent
+default-branch commit, so merge internals do not unexpectedly consume several
+versions. Existing tags are never moved; a height collision fails closed.

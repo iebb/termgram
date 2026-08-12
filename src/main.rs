@@ -27,6 +27,11 @@ const MAX_PENDING_COMMANDS: usize = 64;
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("tg {}", termgram::VERSION);
+        return Ok(());
+    }
+
     install_panic_restore_hook();
     let mut terminal = TerminalGuard::enter().context("failed to initialize the terminal")?;
     let mut app = AppState::new();

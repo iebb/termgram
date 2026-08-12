@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
+      - master
   pull_request:
 
 permissions:
@@ -11,58 +14,148 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    name: Plan commit versions
+    runs-on: ubuntu-latest
+    outputs:
+      plan: ${{ steps.version.outputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Derive versions from mainline commit heights
+        id: version
+        shell: bash
+        env:
+          AFTER_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = "false"
+
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            if [[ ! "$BEFORE_SHA" =~ ^0+$ ]]; then
+              git merge-base --is-ancestor "$BEFORE_SHA" "$AFTER_SHA"
+              git rev-list --first-parent --reverse "$BEFORE_SHA..$AFTER_SHA" > commits.txt
+            else
+              printf '%s\n' "$AFTER_SHA" > commits.txt
+            fi
+          else
+            printf '%s\n' "$AFTER_SHA" > commits.txt
+          fi
+          test -s commits.txt
+
+          : > release-plan.tsv
+          while IFS= read -r sha; do
+            height="$(git rev-list --first-parent --count "$sha")"
+            test "$height" -gt 0
+            printf '%s\t%s\t0.1.%s\n' "$sha" "$height" "$height" >> release-plan.tsv
+          done < commits.txt
+
+          plan="$(jq -Rsc '
+            split("\n")
+            | map(select(length > 0) | split("\t")
+                | {sha: .[0], height: .[1], version: .[2]})
+          ' release-plan.tsv)"
+          echo "plan=$plan" >> "$GITHUB_OUTPUT"
+          cat release-plan.tsv
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-plan
+          path: release-plan.tsv
+          if-no-files-found: error
+          retention-days: 14
+
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b
+        with:
+          toolchain: 1.88.0
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
 
   build:
     name: Build (${{ matrix.platform }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux
             os: ubuntu-latest
-            package: termgram-linux.tar.gz
+            extension: tar.gz
           - platform: macos
             os: macos-latest
-            package: termgram-macos.tar.gz
+            extension: tar.gz
           - platform: windows
             os: windows-latest
-            package: termgram-windows.zip
+            extension: zip
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_PLAN: ${{ needs.version.outputs.plan }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ matrix.platform }}
-      - run: cargo test --locked --all-targets --all-features
-      - name: Build release binary
-        run: cargo build --locked --release
+      - name: Verify release credentials
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+        shell: bash
         env:
-          # Pull-request builds deliberately receive empty fallbacks. GitHub
-          # does not expose repository secrets to untrusted fork workflows.
-          TERMGRAM_EMBEDDED_API_ID: ${{ github.event_name == 'push' && secrets.TELEGRAM_API_ID || '' }}
-          TERMGRAM_EMBEDDED_API_HASH: ${{ github.event_name == 'push' && secrets.TELEGRAM_API_HASH || '' }}
-      - name: Package binary
-        if: runner.os != 'Windows'
-        run: tar -C target/release -czf "${{ matrix.package }}" tg
-      - name: Package binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path target/release/tg.exe -DestinationPath "${{ matrix.package }}"
-      - uses: actions/upload-artifact@v4
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euo pipefail
+          [[ "$TELEGRAM_API_ID" =~ ^[0-9]+$ ]]
+          [[ "$TELEGRAM_API_HASH" =~ ^[0-9a-fA-F]{32}$ ]]
+      - name: Build and package every pushed commit
+        shell: bash
+        env:
+          TERMGRAM_EMBEDDED_API_ID: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && secrets.TELEGRAM_API_ID || '' }}
+          TERMGRAM_EMBEDDED_API_HASH: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && secrets.TELEGRAM_API_HASH || '' }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          while IFS=$'\t' read -r sha version; do
+            git checkout --detach "$sha"
+            export TERMGRAM_BUILD_VERSION="$version"
+            cargo test --locked --all-targets --all-features
+            cargo build --locked --release
+            binary="target/release/tg"
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              binary+=".exe"
+            fi
+            test "$("$binary" --version)" = "tg $version"
+
+            if [[ "$RUNNER_OS" == Windows ]]; then
+              (
+                cd target/release
+                7z a -tzip \
+                  "../../dist/termgram-$version-${{ matrix.platform }}.zip" tg.exe
+              )
+            else
+              tar -C target/release -czf \
+                "dist/termgram-$version-${{ matrix.platform }}.tar.gz" tg
+            fi
+          done < <(jq -r '.[] | [.sha, .version] | @tsv' <<<"$RELEASE_PLAN")
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tg-${{ matrix.platform }}
-          path: ${{ matrix.package }}
+          path: dist/termgram-*-${{ matrix.platform }}.${{ matrix.extension }}
           if-no-files-found: error
           retention-days: 14

@@ -15,7 +15,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: termgram-release-${{ github.event.workflow_run.head_sha }}
+  # A later run contains every still-unpublished first-parent commit, so one
+  # global publisher avoids cross-run tag and asset races without skipping a
+  # commit when GitHub replaces an older pending run.
+  group: termgram-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -68,6 +71,12 @@ jobs:
           test -f metadata/release-plan.tsv
           test ! -L metadata/release-plan.tsv
 
+          if [[ ! -s metadata/release-plan.tsv ]]; then
+            touch no-releases
+            echo "The successful CI run has no unpublished commits."
+            exit 0
+          fi
+
           previous=
           final=
           declare -A seen_sha=()
@@ -115,11 +124,30 @@ jobs:
           done < metadata/release-plan.tsv
 
       - name: Publish GitHub releases idempotently
+        if: hashFiles('no-releases') == ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          TERMGRAM_RELEASE_SSH_KEY: ${{ secrets.TERMGRAM_RELEASE_SSH_KEY }}
         run: |
           set -euo pipefail
+
+          key_path=
+          known_hosts=
+          cleanup() {
+            [[ -z "$key_path" ]] || rm -f -- "$key_path"
+            [[ -z "$known_hosts" ]] || rm -f -- "$known_hosts"
+          }
+          trap cleanup EXIT
+
+          setup_release_ssh() {
+            [[ -n "$TERMGRAM_RELEASE_SSH_KEY" ]]
+            umask 077
+            key_path="$(mktemp)"
+            known_hosts="$(mktemp)"
+            printf '%s\n' "$TERMGRAM_RELEASE_SSH_KEY" > "$key_path"
+            gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$known_hosts"
+          }
 
           while IFS=$'\t' read -r source_sha _height version; do
             tag="v$version"
@@ -139,9 +167,12 @@ jobs:
                 echo "Refusing to move conflicting tag $tag from $tag_sha to $source_sha" >&2
                 exit 1
               fi
-              tag_exists=true
             else
-              tag_exists=false
+              [[ -n "$key_path" ]] || setup_release_ssh
+              git tag "$tag" "$source_sha"
+              GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
+                git push "git@github.com:$GITHUB_REPOSITORY.git" "refs/tags/$tag"
+              test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)" = "$source_sha"
             fi
 
             if release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
@@ -174,11 +205,7 @@ jobs:
               release_id="$(jq -r .databaseId <<<"$release_json")"
             else
               create_args=(--repo "$GITHUB_REPOSITORY" --draft --title "$title" --generate-notes)
-              if [[ "$tag_exists" == true ]]; then
-                create_args+=(--verify-tag)
-              else
-                create_args+=(--target "$source_sha")
-              fi
+              create_args+=(--verify-tag)
               gh release create "$tag" "${create_args[@]}"
               release_id="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
                 --json databaseId --jq .databaseId)"

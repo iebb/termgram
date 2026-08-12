@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       plan: ${{ steps.version.outputs.plan }}
+      has_releases: ${{ steps.version.outputs.has_releases }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -60,14 +61,17 @@ jobs:
             printf '%s\t%s\t0.1.%s\n' "$AFTER_SHA" "$height" "$height" \
               >> release-plan.tsv
           fi
-          test -s release-plan.tsv
-
           plan="$(jq -Rsc '
             split("\n")
             | map(select(length > 0) | split("\t")
                 | {sha: .[0], height: .[1], version: .[2]})
           ' release-plan.tsv)"
           echo "plan=$plan" >> "$GITHUB_OUTPUT"
+          if [[ "$plan" == '[]' ]]; then
+            echo "has_releases=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_releases=true" >> "$GITHUB_OUTPUT"
+          fi
           cat release-plan.tsv
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -85,7 +89,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b
         with:
-          toolchain: 1.88.0
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
@@ -94,7 +97,10 @@ jobs:
 
   build:
     name: Build (${{ matrix.platform }})
-    needs: version
+    needs:
+      - version
+      - check
+    if: needs.version.outputs.has_releases == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -117,8 +123,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b
-        with:
-          toolchain: 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ matrix.platform }}

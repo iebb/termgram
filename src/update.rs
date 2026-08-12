@@ -4,7 +4,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+use std::ffi::OsString;
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -21,6 +25,11 @@ const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(windows)]
+const FAILED_REPLACEMENT_WARNING: &str =
+    "A previous Termgram update could not replace tg; close other tg processes, then run `tg update` again";
+
+static AUTOMATIC_CHECKS: Mutex<AutomaticCheckThrottle> = Mutex::new(AutomaticCheckThrottle::new());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateStatus {
@@ -58,6 +67,42 @@ struct Platform {
     compressed_tar: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomaticCheckState {
+    Idle,
+    InFlight,
+    Failed,
+}
+
+struct AutomaticCheckThrottle {
+    states: [AutomaticCheckState; 2],
+}
+
+impl AutomaticCheckThrottle {
+    const fn new() -> Self {
+        Self {
+            states: [AutomaticCheckState::Idle; 2],
+        }
+    }
+
+    fn begin(&mut self, channel: ReleaseChannel) -> bool {
+        let state = &mut self.states[channel_index(channel)];
+        if *state != AutomaticCheckState::Idle {
+            return false;
+        }
+        *state = AutomaticCheckState::InFlight;
+        true
+    }
+
+    fn finish(&mut self, channel: ReleaseChannel, succeeded: bool) {
+        self.states[channel_index(channel)] = if succeeded {
+            AutomaticCheckState::Idle
+        } else {
+            AutomaticCheckState::Failed
+        };
+    }
+}
+
 /// Check GitHub for a newer release in the selected channel.
 ///
 /// # Errors
@@ -78,9 +123,10 @@ pub fn check(channel: ReleaseChannel) -> Result<UpdateStatus> {
 
 /// Perform an automatic availability check at most once per 24 hours.
 ///
-/// The attempt timestamp is recorded before accessing the network so an
-/// offline machine does not retry on every launch. Changing release channel
-/// makes the next check immediately due.
+/// A completed GitHub response is recorded for 24 hours. Failed checks are
+/// suppressed only for the rest of this process, so an offline launch cannot
+/// create a persistent blind spot. Changing release channel makes the next
+/// check immediately due.
 ///
 /// # Errors
 ///
@@ -91,8 +137,72 @@ pub fn check_if_due(channel: ReleaseChannel) -> Result<Option<UpdateStatus>> {
     if !check_is_due(&marker, channel, now)? {
         return Ok(None);
     }
-    record_check_attempt(&marker, channel, now)?;
-    check(channel).map(Some)
+    if !begin_automatic_check(channel) {
+        return Ok(None);
+    }
+    let result = check(channel).and_then(|status| {
+        record_check_success(&marker, channel, now)?;
+        Ok(Some(status))
+    });
+    finish_automatic_check(channel, result.is_ok());
+    result
+}
+
+fn channel_index(channel: ReleaseChannel) -> usize {
+    match channel {
+        ReleaseChannel::Stable => 0,
+        ReleaseChannel::Prerelease => 1,
+    }
+}
+
+fn begin_automatic_check(channel: ReleaseChannel) -> bool {
+    AUTOMATIC_CHECKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .begin(channel)
+}
+
+fn finish_automatic_check(channel: ReleaseChannel, succeeded: bool) {
+    AUTOMATIC_CHECKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(channel, succeeded);
+}
+
+/// Return a fixed, terminal-safe warning when a Windows replacement failed.
+///
+/// # Errors
+///
+/// Returns an error if the state marker is malformed or unsafe to inspect.
+#[cfg(windows)]
+pub fn pending_replacement_warning() -> Result<Option<&'static str>> {
+    let target = std::env::current_exe().context("could not locate the running tg executable")?;
+    let marker = replacement_failure_marker_path(&target)?;
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata)
+            if metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 64 =>
+        {
+            Ok(Some(FAILED_REPLACEMENT_WARNING))
+        }
+        Ok(_) => bail!("refusing to trust an unsafe update failure marker"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("failed to inspect the update failure marker"),
+    }
+}
+
+/// Non-Windows executables are replaced synchronously and never need a
+/// handoff marker.
+///
+/// # Errors
+///
+/// This platform implementation does not return an error.
+#[cfg(not(windows))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Windows implementation validates a persisted marker"
+)]
+pub const fn pending_replacement_warning() -> Result<Option<&'static str>> {
+    Ok(None)
 }
 
 /// Download, verify, and install the newest release in the selected channel.
@@ -107,6 +217,8 @@ pub fn check_if_due(channel: ReleaseChannel) -> Result<Option<UpdateStatus>> {
 /// fails. The existing executable is left untouched on failure.
 pub fn run(channel: ReleaseChannel) -> Result<UpdateOutcome> {
     let UpdateStatus::Available { version, .. } = check(channel)? else {
+        #[cfg(windows)]
+        clear_current_replacement_marker()?;
         return Ok(UpdateOutcome::UpToDate);
     };
     let platform = current_platform()?;
@@ -671,6 +783,8 @@ fn sync_parent(_path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn spawn_windows_replacer(staged: &Path, target: &Path) -> Result<()> {
+    let failure_marker = replacement_failure_marker_path(target)?;
+    remove_safe_failure_marker(&failure_marker)?;
     let backup = unique_child(
         target
             .parent()
@@ -692,7 +806,29 @@ for ($attempt = 0; $attempt -lt 60; $attempt++) {
     Start-Sleep -Milliseconds 500
   }
 }
-Set-Content -LiteralPath ($env:TERMGRAM_UPDATE_STAGE + '.error.txt') -Value 'Close all tg processes, then run tg update again.'
+try {
+  if (-not [IO.File]::Exists($env:TERMGRAM_UPDATE_TARGET) -and [IO.File]::Exists($env:TERMGRAM_UPDATE_BACKUP)) {
+    [IO.File]::Move($env:TERMGRAM_UPDATE_BACKUP, $env:TERMGRAM_UPDATE_TARGET)
+  }
+} catch {}
+try {
+  if ([IO.File]::Exists($env:TERMGRAM_UPDATE_TARGET) -and [IO.File]::Exists($env:TERMGRAM_UPDATE_BACKUP)) {
+    [IO.File]::Delete($env:TERMGRAM_UPDATE_BACKUP)
+  }
+} catch {}
+try {
+  $stream = [IO.File]::Open($env:TERMGRAM_UPDATE_FAILURE, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  try {
+    $bytes = [Text.Encoding]::UTF8.GetBytes("failed`n")
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    $stream.Dispose()
+  }
+} catch {}
+try {
+  if ([IO.File]::Exists($env:TERMGRAM_UPDATE_STAGE)) { [IO.File]::Delete($env:TERMGRAM_UPDATE_STAGE) }
+} catch {}
 exit 1
 "#;
     let system_root = std::env::var_os("SystemRoot").context("SystemRoot is not set")?;
@@ -722,6 +858,7 @@ exit 1
         .env("TERMGRAM_UPDATE_STAGE", staged)
         .env("TERMGRAM_UPDATE_TARGET", target)
         .env("TERMGRAM_UPDATE_BACKUP", backup)
+        .env("TERMGRAM_UPDATE_FAILURE", failure_marker)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -731,6 +868,34 @@ exit 1
         return Err(error).context("failed to start the Windows update helper");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn replacement_failure_marker_path(target: &Path) -> Result<PathBuf> {
+    let file_name = target
+        .file_name()
+        .context("running executable has no file name")?;
+    let mut marker_name = OsString::from(file_name);
+    marker_name.push(".update-failed");
+    Ok(target.with_file_name(marker_name))
+}
+
+#[cfg(windows)]
+fn clear_current_replacement_marker() -> Result<()> {
+    let target = std::env::current_exe().context("could not locate the running tg executable")?;
+    remove_safe_failure_marker(&replacement_failure_marker_path(&target)?)
+}
+
+#[cfg(windows)]
+fn remove_safe_failure_marker(marker: &Path) -> Result<()> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(marker).context("failed to clear the old update failure marker")
+        }
+        Ok(_) => bail!("refusing to remove an unsafe update failure marker"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to inspect the update failure marker"),
+    }
 }
 
 fn update_marker_path() -> Result<PathBuf> {
@@ -760,7 +925,7 @@ fn check_is_due(path: &Path, channel: ReleaseChannel, now: u64) -> Result<bool> 
     Ok(stored_time > now || now - stored_time >= CHECK_INTERVAL.as_secs())
 }
 
-fn record_check_attempt(path: &Path, channel: ReleaseChannel, now: u64) -> Result<()> {
+fn record_check_success(path: &Path, channel: ReleaseChannel, now: u64) -> Result<()> {
     let parent = path.parent().context("update-check marker has no parent")?;
     let created = !parent.exists();
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1125,8 +1290,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        check_is_due, checksum_for_asset, parse_version, select_update, JsonCursor, Release,
-        UpdateStatus, CHECK_INTERVAL,
+        check_is_due, checksum_for_asset, parse_version, select_update, AutomaticCheckThrottle,
+        JsonCursor, Release, UpdateStatus, CHECK_INTERVAL,
     };
     use crate::config::ReleaseChannel;
 
@@ -1240,5 +1405,19 @@ mod tests {
         assert!(check_is_due(Path::new(&path), ReleaseChannel::Stable, 999)
             .expect("clock moved backwards"));
         std::fs::remove_file(path).expect("remove marker");
+    }
+
+    #[test]
+    fn failed_automatic_checks_are_throttled_only_in_the_current_process() {
+        let mut throttle = AutomaticCheckThrottle::new();
+        assert!(throttle.begin(ReleaseChannel::Stable));
+        assert!(!throttle.begin(ReleaseChannel::Stable));
+        assert!(throttle.begin(ReleaseChannel::Prerelease));
+
+        throttle.finish(ReleaseChannel::Stable, false);
+        assert!(!throttle.begin(ReleaseChannel::Stable));
+
+        throttle.finish(ReleaseChannel::Prerelease, true);
+        assert!(throttle.begin(ReleaseChannel::Prerelease));
     }
 }

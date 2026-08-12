@@ -8,7 +8,7 @@ use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use termgram::app::{AppState, Screen};
 use termgram::config::{Config, ReleaseChannel, Settings};
-use termgram::event::{AppEvent, NetworkEvent, TelegramCommand};
+use termgram::event::{AppEvent, ConnectionStatus, NetworkEvent, TelegramCommand};
 use termgram::telegram::{self, TelegramHandle};
 use termgram::terminal::{install_panic_restore_hook, TerminalGuard};
 use termgram::ui;
@@ -48,7 +48,16 @@ const MAX_PENDING_COMMANDS: usize = 64;
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
-    match parse_arguments(std::env::args().skip(1))? {
+    let command_line = parse_arguments(std::env::args().skip(1))?;
+    let replacement_warning = update::pending_replacement_warning().map_or_else(
+        |error| {
+            Some(format!(
+                "Could not inspect the previous update result: {error:#}"
+            ))
+        },
+        |warning| warning.map(str::to_owned),
+    );
+    match command_line {
         CommandLine::Version => {
             println!("tg {}", termgram::VERSION);
             return Ok(());
@@ -58,6 +67,9 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         CommandLine::Update(channel) => {
+            if let Some(warning) = &replacement_warning {
+                eprintln!("Warning: {warning}");
+            }
             run_update_command(channel)?;
             return Ok(());
         }
@@ -67,6 +79,10 @@ async fn main() -> Result<()> {
     install_panic_restore_hook();
     let mut terminal = TerminalGuard::enter().context("failed to initialize the terminal")?;
     let (mut app, settings) = load_app_settings();
+    let mut startup_warning = replacement_warning;
+    if let Some(warning) = &startup_warning {
+        app.handle_network(NetworkEvent::Error(warning.clone()));
+    }
     let mut update_check = spawn_update_check(settings);
     let mut update_preferences = settings;
 
@@ -158,7 +174,21 @@ async fn main() -> Result<()> {
             RuntimeEvent::Terminal(None) => app.handle_action(termgram::input::KeyAction::Quit),
             RuntimeEvent::Network(event) => {
                 if let Some(event) = *event {
-                    app.update(AppEvent::Network(event))
+                    let refreshes_startup_warning =
+                        matches!(&event, NetworkEvent::Auth(_) | NetworkEvent::Ready { .. });
+                    let completes_startup =
+                        matches!(&event, NetworkEvent::Status(ConnectionStatus::Online));
+                    let outgoing = app.update(AppEvent::Network(event));
+                    if completes_startup {
+                        if let Some(warning) = startup_warning.take() {
+                            app.handle_network(NetworkEvent::Error(warning));
+                        }
+                    } else if refreshes_startup_warning {
+                        if let Some(warning) = &startup_warning {
+                            app.handle_network(NetworkEvent::Error(warning.clone()));
+                        }
+                    }
+                    outgoing
                 } else {
                     events = None;
                     commands = None;

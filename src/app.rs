@@ -75,6 +75,15 @@ pub enum Focus {
     Conversation,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplyRequest {
+    source_chat: ChatId,
+    source_message: i32,
+    target_chat: ChatId,
+    target_message: i32,
+    request_id: u64,
+}
+
 /// All mutable UI state. It owns no terminal or network resources.
 #[derive(Clone)]
 // These flags describe independent terminal, network, and viewport state; a
@@ -124,7 +133,7 @@ pub struct App {
     next_pending_id: i32,
     next_history_request_id: u64,
     active_history_request: Option<(ChatId, u64)>,
-    active_reply_request: Option<(ChatId, i32, u64)>,
+    active_reply_request: Option<ReplyRequest>,
     history_target_message: Option<i32>,
     read_ack_pending: BTreeSet<ChatId>,
     refresh_dialogs_pending: bool,
@@ -1299,16 +1308,24 @@ impl App {
                 return self.open_resolved_link(chat, Some(target));
             }
         }
-        if self
-            .active_reply_request
-            .is_some_and(|request| request.0 == chat_id && request.1 == reply.message_id)
-        {
+        if self.active_reply_request.is_some_and(|request| {
+            request.source_chat == chat_id
+                && request.source_message == message.id
+                && request.target_chat == reply.chat_id
+                && request.target_message == reply.message_id
+        }) {
             self.status_message = Some(format!("Loading reply #{}…", reply.message_id));
             return Vec::new();
         }
         let request_id = self.next_history_request_id;
         self.next_history_request_id = self.next_history_request_id.wrapping_add(1).max(1);
-        self.active_reply_request = Some((chat_id, reply.message_id, request_id));
+        self.active_reply_request = Some(ReplyRequest {
+            source_chat: chat_id,
+            source_message: message.id,
+            target_chat: reply.chat_id,
+            target_message: reply.message_id,
+            request_id,
+        });
         self.status_message = Some(format!("Loading reply #{}…", reply.message_id));
         vec![TelegramCommand::LoadMessage {
             chat_id,
@@ -1335,9 +1352,6 @@ impl App {
     ) -> Vec<TelegramCommand> {
         let chat_id = chat.id;
         let selected_message = message.as_ref().map(|message| message.id);
-        if let Some(message) = message {
-            self.update_message(message);
-        }
         let mut known_chat = self.chats.iter().position(|chat| chat.id == chat_id);
         chat.title = sanitize_terminal_line(&chat.title);
         chat.last_message = sanitize_terminal_text(&chat.last_message);
@@ -1352,8 +1366,13 @@ impl App {
             self.filter.clear();
             self.selected_chat = index;
         }
+        // Pin the destination before insertion so the bounded global cache
+        // cannot evict an older exact link/reply target during navigation.
         self.active_chat_id = Some(chat_id);
         self.selected_message = selected_message;
+        if let Some(message) = message {
+            self.update_message(message);
+        }
         self.focus = Focus::Conversation;
         self.narrow_conversation = true;
         self.mode = Mode::Navigate;
@@ -1690,28 +1709,67 @@ impl App {
         request_id: u64,
         result: Result<Message, String>,
     ) -> Vec<TelegramCommand> {
-        if self.active_reply_request != Some((chat_id, message_id, request_id)) {
+        let Some(request) = self.active_reply_request else {
+            return Vec::new();
+        };
+        if request.source_chat != chat_id
+            || request.target_message != message_id
+            || request.request_id != request_id
+        {
+            return Vec::new();
+        }
+        let source_still_matches = self.reply_source_matches(request);
+        if !source_still_matches {
+            self.active_reply_request = None;
+            if self
+                .status_message
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Loading reply #"))
+            {
+                self.status_message =
+                    Some("Reply target changed before loading completed".to_owned());
+            }
+            return Vec::new();
+        }
+        if self.active_chat_id != Some(request.source_chat)
+            || self.selected_message != Some(request.source_message)
+            || self.mode != Mode::Navigate
+        {
+            self.active_reply_request = None;
+            if self
+                .status_message
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Loading reply #"))
+            {
+                self.status_message = None;
+            }
             return Vec::new();
         }
         self.active_reply_request = None;
         match result {
-            Ok(mut message) if message.id == message_id => {
+            Ok(mut message)
+                if message.id == request.target_message
+                    && message.chat_id == request.target_chat =>
+            {
                 sanitize_message(&mut message);
                 let sender = message.sender.clone();
-                if let Some(messages) = self.messages.get_mut(&chat_id) {
+                if let Some(messages) = self.messages.get_mut(&request.source_chat) {
                     for cached in messages.iter_mut() {
                         if let Some(reply) = &mut cached.reply_to {
-                            if reply.message_id == message_id && reply.sender.is_none() {
+                            if reply.message_id == request.target_message
+                                && reply.chat_id == message.chat_id
+                                && reply.sender.is_none()
+                            {
                                 reply.sender = Some(sender.clone());
                             }
                         }
                     }
                 }
-                if message.chat_id == chat_id {
-                    if let Some(messages) = self.messages.get_mut(&chat_id) {
-                        upsert_message_preserving(messages, message, message_id);
+                if message.chat_id == request.source_chat {
+                    if let Some(messages) = self.messages.get_mut(&request.source_chat) {
+                        upsert_message_preserving(messages, message, request.target_message);
                     } else {
-                        self.messages.insert(chat_id, vec![message]);
+                        self.messages.insert(request.source_chat, vec![message]);
                     }
                 } else if let Some(chat) = self
                     .chats
@@ -1726,8 +1784,8 @@ impl App {
                     );
                     return Vec::new();
                 }
-                if self.active_chat_id == Some(chat_id) {
-                    self.focus_reply_target(message_id);
+                if self.active_chat_id == Some(request.source_chat) {
+                    self.focus_reply_target(request.target_message);
                 }
                 self.prune_message_cache();
             }
@@ -1737,12 +1795,26 @@ impl App {
             Err(error) => {
                 self.status_message = Some(format!(
                     "Could not load reply #{}: {}",
-                    message_id,
+                    request.target_message,
                     sanitize_terminal_line(&error)
                 ));
             }
         }
         Vec::new()
+    }
+
+    fn reply_source_matches(&self, request: ReplyRequest) -> bool {
+        self.messages
+            .get(&request.source_chat)
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message.id == request.source_message)
+            })
+            .and_then(|message| message.reply_to.as_ref())
+            .is_some_and(|reply| {
+                reply.chat_id == request.target_chat && reply.message_id == request.target_message
+            })
     }
 
     fn fail_message(
@@ -2979,6 +3051,31 @@ mod tests {
     }
 
     #[test]
+    fn old_link_target_survives_a_full_cached_destination() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.selected_message = Some(20);
+        app.messages.insert(
+            2,
+            (1000..1000 + i32::try_from(MAX_MESSAGES_PER_CHAT).expect("small cap"))
+                .map(|id| message(id, 2, "recent", false))
+                .collect(),
+        );
+
+        app.handle_network(NetworkEvent::LinkResolved {
+            chat: chat(2, "Beta"),
+            message: Some(message(5, 2, "old exact target", false)),
+        });
+
+        assert_eq!(app.active_chat_id, Some(2));
+        assert_eq!(app.selected_message, Some(5));
+        assert!(app
+            .active_messages()
+            .iter()
+            .any(|message| message.id == 5 && message.text == "old exact target"));
+    }
+
+    #[test]
     fn selecting_actionable_message_sets_a_visible_semantic_anchor() {
         let mut app = ready_app();
         open_first(&mut app);
@@ -3124,6 +3221,162 @@ mod tests {
         assert!(commands
             .iter()
             .any(|command| matches!(command, TelegramCommand::LoadHistory { chat_id: 2, .. })));
+    }
+
+    #[test]
+    fn cross_chat_reply_requests_distinguish_source_and_target_identity() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        for (source_id, target_chat_id) in [(20, 2), (19, 3)] {
+            app.messages
+                .get_mut(&1)
+                .unwrap()
+                .iter_mut()
+                .find(|message| message.id == source_id)
+                .unwrap()
+                .reply_to = Some(ReplyInfo {
+                message_id: 99,
+                chat_id: target_chat_id,
+                sender: None,
+            });
+        }
+
+        app.selected_message = Some(20);
+        assert_eq!(
+            app.handle_action(KeyAction::Character('r')),
+            vec![TelegramCommand::LoadMessage {
+                chat_id: 1,
+                source_message_id: 20,
+                message_id: 99,
+                request_id: 2,
+            }]
+        );
+        // Repeating exactly the same action is deduplicated.
+        assert!(app.handle_action(KeyAction::Character('r')).is_empty());
+
+        app.selected_message = Some(19);
+        assert_eq!(
+            app.handle_action(KeyAction::Character('r')),
+            vec![TelegramCommand::LoadMessage {
+                chat_id: 1,
+                source_message_id: 19,
+                message_id: 99,
+                request_id: 3,
+            }]
+        );
+
+        // The first request has been superseded even though its target has the
+        // same numeric message ID.
+        assert!(app
+            .handle_network(NetworkEvent::MessageLoaded {
+                chat_id: 1,
+                message_id: 99,
+                request_id: 2,
+                message: message(99, 2, "from beta", false),
+            })
+            .is_empty());
+        assert_eq!(app.active_chat_id, Some(1));
+
+        let mut target = message(99, 3, "from gamma", false);
+        target.sender = "Gamma author".to_owned();
+        app.handle_network(NetworkEvent::MessageLoaded {
+            chat_id: 1,
+            message_id: 99,
+            request_id: 3,
+            message: target,
+        });
+        assert_eq!(app.active_chat_id, Some(3));
+        let source_messages = app.messages.get(&1).unwrap();
+        assert_eq!(
+            source_messages
+                .iter()
+                .find(|message| message.id == 19)
+                .and_then(|message| message.reply_to.as_ref())
+                .and_then(|reply| reply.sender.as_deref()),
+            Some("Gamma author")
+        );
+        assert_eq!(
+            source_messages
+                .iter()
+                .find(|message| message.id == 20)
+                .and_then(|message| message.reply_to.as_ref())
+                .and_then(|reply| reply.sender.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_result_is_rejected_when_source_target_changed_or_peer_is_wrong() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let source = app.messages.get_mut(&1).unwrap().last_mut().unwrap();
+        source.reply_to = Some(ReplyInfo {
+            message_id: 99,
+            chat_id: 2,
+            sender: None,
+        });
+        app.selected_message = Some(20);
+        app.handle_action(KeyAction::Character('r'));
+
+        // An edit that retargets the source makes the in-flight result stale.
+        app.messages
+            .get_mut(&1)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .reply_to
+            .as_mut()
+            .unwrap()
+            .chat_id = 3;
+        assert!(app
+            .handle_network(NetworkEvent::MessageLoaded {
+                chat_id: 1,
+                message_id: 99,
+                request_id: 2,
+                message: message(99, 2, "stale beta", false),
+            })
+            .is_empty());
+        assert_eq!(app.active_chat_id, Some(1));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|status| status.contains("target changed")));
+
+        // A fresh request records peer 3 and must reject the same message ID
+        // returned from peer 2.
+        app.handle_action(KeyAction::Character('r'));
+        app.handle_network(NetworkEvent::MessageLoaded {
+            chat_id: 1,
+            message_id: 99,
+            request_id: 3,
+            message: message(99, 2, "wrong peer", false),
+        });
+        assert_eq!(app.active_chat_id, Some(1));
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|status| status.contains("wrong reply target")));
+        assert!(!app
+            .messages
+            .get(&2)
+            .is_some_and(|messages| messages.iter().any(|message| message.id == 99)));
+
+        // Leaving the source conversation while a valid request is in flight
+        // must not let its eventual response hijack the active chat.
+        app.handle_action(KeyAction::Character('r'));
+        app.active_chat_id = Some(2);
+        app.selected_message = None;
+        app.handle_network(NetworkEvent::MessageLoaded {
+            chat_id: 1,
+            message_id: 99,
+            request_id: 4,
+            message: message(99, 3, "late target", false),
+        });
+        assert_eq!(app.active_chat_id, Some(2));
+        assert!(!app
+            .messages
+            .get(&3)
+            .is_some_and(|messages| messages.iter().any(|message| message.id == 99)));
     }
 
     #[test]

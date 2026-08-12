@@ -93,6 +93,9 @@ Termgram checks the selected channel at most once per day in the background and
 shows a quiet footer hint when an update is available; applying it is always an
 explicit command. The updater trusts GitHub's HTTPS release delivery and uses
 `SHA256SUMS` to verify download integrity before atomic replacement.
+On Windows, replacement completes after the updating process exits. If another
+`tg` process keeps the executable locked, the next launch shows a fixed warning
+and `tg update` performs a fresh verified download.
 
 Press `s` while navigating to open the small settings overlay. It stores only
 four non-sensitive preferences: automatic update checks, stable/prerelease

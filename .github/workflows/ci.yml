@@ -125,12 +125,15 @@ jobs:
           - platform: linux
             os: ubuntu-latest
             extension: tar.gz
+            target: x86_64-unknown-linux-musl
           - platform: macos
             os: macos-latest
             extension: tar.gz
+            target: aarch64-apple-darwin
           - platform: windows
             os: windows-latest
             extension: zip
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_PLAN: ${{ needs.version.outputs.plan }}
@@ -140,9 +143,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: ${{ matrix.platform }}
+      - name: Install static Linux linker
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Verify release credentials
         if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         shell: bash
@@ -167,21 +178,27 @@ jobs:
             git checkout --detach "$sha"
             export TERMGRAM_BUILD_VERSION="$version"
             cargo test --locked --all-targets --all-features
-            cargo build --locked --release
-            binary="target/release/tg"
+            cargo build --locked --release --target "${{ matrix.target }}"
+            binary="target/${{ matrix.target }}/release/tg"
             if [[ "$RUNNER_OS" == Windows ]]; then
               binary+=".exe"
             fi
             test "$("$binary" --version)" = "tg $version"
+            if [[ "$RUNNER_OS" == Linux ]]; then
+              if readelf -d "$binary" | grep -q '(NEEDED)'; then
+                echo "Linux release unexpectedly has dynamic dependencies" >&2
+                exit 1
+              fi
+            fi
 
             if [[ "$RUNNER_OS" == Windows ]]; then
               (
-                cd target/release
+                cd "target/${{ matrix.target }}/release"
                 7z a -tzip \
-                  "../../dist/termgram-$version-${{ matrix.platform }}.zip" tg.exe
+                  "../../../dist/termgram-$version-${{ matrix.platform }}.zip" tg.exe
               )
             else
-              tar -C target/release -czf \
+              tar -C "target/${{ matrix.target }}/release" -czf \
                 "dist/termgram-$version-${{ matrix.platform }}.tar.gz" tg
             fi
           done < <(jq -r '.[] | [.sha, .version] | @tsv' <<<"$RELEASE_PLAN")

@@ -165,26 +165,99 @@ jobs:
             gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$known_hosts"
           }
 
+          lookup_remote_tag_sha() {
+            local tag="$1"
+            local output
+
+            if ! output="$(git ls-remote --refs \
+                "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$tag")"; then
+              echo "Could not inspect remote tag $tag" >&2
+              return 2
+            fi
+            [[ -n "$output" ]] || return 1
+            [[ "$output" != *$'\n'* ]] || {
+              echo "Remote returned multiple exact matches for tag $tag" >&2
+              return 2
+            }
+            printf '%s\n' "${output%%$'\t'*}"
+          }
+
           wait_for_tag_sha() {
             local tag="$1"
             local expected_sha="$2"
-            local actual_sha=
+            local actual_sha
             local attempt
 
-            # Git accepts the tag before the REST commit endpoint always sees it.
-            # Retry that eventual-consistency window, while still failing closed
-            # if the newly visible tag points anywhere unexpected.
+            # A successful push can take a moment to reach every GitHub service.
             for attempt in {1..10}; do
-              if actual_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" \
-                  --jq .sha 2>/dev/null)"; then
+              if actual_sha="$(lookup_remote_tag_sha "$tag")"; then
                 test "$actual_sha" = "$expected_sha"
                 return
               fi
               sleep 2
             done
 
-            echo "Tag $tag was pushed but did not become visible through the API" >&2
+            echo "Tag $tag was pushed but did not become visible" >&2
             return 1
+          }
+
+          release_state() {
+            gh release view "$1" --repo "$GITHUB_REPOSITORY" \
+              --json assets,databaseId,isDraft,isPrerelease,url 2>/dev/null
+          }
+
+          verify_published_release() {
+            local tag="$1"
+            local version="$2"
+            local prerelease="$3"
+            local release_json="$4"
+            local existing_prerelease verify_dir expected_names downloaded_names
+            local downloaded_assets remote_assets
+
+            existing_prerelease="$(jq -r .isPrerelease <<<"$release_json")"
+            if [[ "$existing_prerelease" != "$prerelease" ]]; then
+              echo "Existing $tag release has the wrong release type" >&2
+              return 1
+            fi
+            verify_dir="$(mktemp -d)"
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
+            expected_names="$(printf '%s\n' \
+              SHA256SUMS install.sh install.ps1 \
+              "termgram-$version-linux.tar.gz" \
+              "termgram-$version-macos.tar.gz" \
+              "termgram-$version-windows.zip" | sort)"
+            downloaded_names="$(find "$verify_dir" -maxdepth 1 -type f -printf '%f\n' | sort)"
+            test "$downloaded_names" = "$expected_names"
+            (
+              cd "$verify_dir"
+              test "$(wc -l < SHA256SUMS)" = 5
+              manifest_names="$(awk '{ name=$2; sub(/^\\*/, "", name); print name }' \
+                SHA256SUMS | sort)"
+              expected_manifest_names="$(printf '%s\n' \
+                install.sh install.ps1 \
+                "termgram-$version-linux.tar.gz" \
+                "termgram-$version-macos.tar.gz" \
+                "termgram-$version-windows.zip" | sort)"
+              test "$manifest_names" = "$expected_manifest_names"
+              sha256sum --strict --check SHA256SUMS
+            )
+            downloaded_assets="$(
+              find "$verify_dir" -maxdepth 1 -type f -exec sh -c '
+                for file do
+                  digest="$(sha256sum "$file")"
+                  printf "sha256:%s\t%s\n" \
+                    "${digest%% *}" "$(basename "$file")"
+                done
+              ' sh {} + | sort
+            )"
+            remote_assets="$(jq -r '.assets[] | [.digest, .name] | @tsv' \
+              <<<"$release_json" | sort)"
+            if [[ "$remote_assets" != "$downloaded_assets" ]]; then
+              echo "Existing $tag release API digests do not match downloaded bytes" >&2
+              return 1
+            fi
+            rm -rf -- "$verify_dir"
+            echo "Verified existing release $(jq -r .url <<<"$release_json")"
           }
 
           while IFS=$'\t' read -r source_sha _height version; do
@@ -200,12 +273,16 @@ jobs:
             fi
             asset_dir="prepared/$version"
 
-            if tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null)"; then
+            if tag_sha="$(lookup_remote_tag_sha "$tag")"; then
               if [[ "$tag_sha" != "$source_sha" ]]; then
                 echo "Refusing to move conflicting tag $tag from $tag_sha to $source_sha" >&2
                 exit 1
               fi
             else
+              lookup_status=$?
+              if [[ "$lookup_status" != 1 ]]; then
+                exit "$lookup_status"
+              fi
               [[ -n "$key_path" ]] || setup_release_ssh
               git tag "$tag" "$source_sha"
               GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
@@ -213,63 +290,39 @@ jobs:
               wait_for_tag_sha "$tag" "$source_sha"
             fi
 
-            if release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json assets,databaseId,isDraft,isPrerelease,url 2>/dev/null)"; then
+            if release_json="$(release_state "$tag")"; then
               is_draft="$(jq -r .isDraft <<<"$release_json")"
               if [[ "$is_draft" == false ]]; then
-                existing_prerelease="$(jq -r .isPrerelease <<<"$release_json")"
-                if [[ "$existing_prerelease" != "$prerelease" ]]; then
-                  echo "Existing $tag release has the wrong release type" >&2
-                  exit 1
-                fi
-                verify_dir="$(mktemp -d)"
-                gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$verify_dir"
-                expected_names="$(printf '%s\n' \
-                  SHA256SUMS install.sh install.ps1 \
-                  "termgram-$version-linux.tar.gz" \
-                  "termgram-$version-macos.tar.gz" \
-                  "termgram-$version-windows.zip" | sort)"
-                downloaded_names="$(find "$verify_dir" -maxdepth 1 -type f -printf '%f\n' | sort)"
-                test "$downloaded_names" = "$expected_names"
-                (
-                  cd "$verify_dir"
-                  test "$(wc -l < SHA256SUMS)" = 5
-                  manifest_names="$(awk '{ name=$2; sub(/^\\*/, "", name); print name }' \
-                    SHA256SUMS | sort)"
-                  expected_manifest_names="$(printf '%s\n' \
-                    install.sh install.ps1 \
-                    "termgram-$version-linux.tar.gz" \
-                    "termgram-$version-macos.tar.gz" \
-                    "termgram-$version-windows.zip" | sort)"
-                  test "$manifest_names" = "$expected_manifest_names"
-                  sha256sum --strict --check SHA256SUMS
-                )
-                downloaded_assets="$(
-                  find "$verify_dir" -maxdepth 1 -type f -exec sh -c '
-                    for file do
-                      digest="$(sha256sum "$file")"
-                      printf "sha256:%s\t%s\n" \
-                        "${digest%% *}" "$(basename "$file")"
-                    done
-                  ' sh {} + | sort
-                )"
-                remote_assets="$(jq -r '.assets[] | [.digest, .name] | @tsv' \
-                  <<<"$release_json" | sort)"
-                if [[ "$remote_assets" != "$downloaded_assets" ]]; then
-                  echo "Existing $tag release API digests do not match downloaded bytes" >&2
-                  exit 1
-                fi
-                rm -rf -- "$verify_dir"
-                echo "Verified existing release $(jq -r .url <<<"$release_json")"
+                verify_published_release "$tag" "$version" "$prerelease" "$release_json"
                 continue
               fi
               release_id="$(jq -r .databaseId <<<"$release_json")"
             else
               create_args=(--repo "$GITHUB_REPOSITORY" --draft --title "$title" --generate-notes)
               create_args+=(--verify-tag)
-              gh release create "$tag" "${create_args[@]}"
-              release_id="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
-                --json databaseId --jq .databaseId)"
+              release_ready=false
+              for attempt in {1..10}; do
+                if release_json="$(release_state "$tag")"; then
+                  release_ready=true
+                  break
+                fi
+                gh release create "$tag" "${create_args[@]}" || true
+                if release_json="$(release_state "$tag")"; then
+                  release_ready=true
+                  break
+                fi
+                sleep 2
+              done
+              if [[ "$release_ready" != true ]]; then
+                echo "Tag $tag is visible, but its draft release could not be created" >&2
+                exit 1
+              fi
+              is_draft="$(jq -r .isDraft <<<"$release_json")"
+              if [[ "$is_draft" == false ]]; then
+                verify_published_release "$tag" "$version" "$prerelease" "$release_json"
+                continue
+              fi
+              release_id="$(jq -r .databaseId <<<"$release_json")"
             fi
 
             gh release upload "$tag" "$asset_dir"/* \

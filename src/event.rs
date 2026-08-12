@@ -37,6 +37,14 @@ pub enum TelegramCommand {
         chat_id: ChatId,
         request_id: u64,
     },
+    /// Fetch one message for reply navigation when it is outside the bounded
+    /// in-memory history window.
+    LoadMessage {
+        chat_id: ChatId,
+        source_message_id: i32,
+        message_id: i32,
+        request_id: u64,
+    },
     SendMessage {
         chat_id: ChatId,
         local_id: i32,
@@ -84,6 +92,18 @@ pub enum NetworkEvent {
     },
     HistoryFailed {
         chat_id: ChatId,
+        request_id: u64,
+        error: String,
+    },
+    MessageLoaded {
+        chat_id: ChatId,
+        message_id: i32,
+        request_id: u64,
+        message: Message,
+    },
+    MessageLoadFailed {
+        chat_id: ChatId,
+        message_id: i32,
         request_id: u64,
         error: String,
     },

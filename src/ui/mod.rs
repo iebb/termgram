@@ -10,6 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{telegram_link, AppState, AttachmentState, AuthPhase, Focus, Mode, Screen};
+use crate::config::DownloadBehavior;
 use crate::event::ConnectionStatus;
 use crate::input::TextInput;
 use crate::model::{AttachmentKind, Delivery, Message};
@@ -19,6 +20,7 @@ const MUTED: Color = Color::DarkGray;
 const SUCCESS: Color = Color::Rgb(126, 211, 166);
 const WARNING: Color = Color::Rgb(245, 194, 107);
 const DANGER: Color = Color::Rgb(242, 139, 130);
+const MESSAGE_ID_COLUMN_WIDTH: usize = 12;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let area = frame.area();
@@ -154,6 +156,8 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
 
     if app.mode == Mode::Help {
         render_help(frame, area);
+    } else if app.mode == Mode::Settings {
+        render_settings(frame, area, app);
     }
 }
 
@@ -313,7 +317,9 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             message,
             message_width,
             app.attachment_state(chat_id, message.id),
+            app.settings().download_behavior,
             app.selected_message == Some(message.id),
+            app.settings().show_message_ids,
         ));
         layouts.push(MessageLayout {
             id: message.id,
@@ -490,12 +496,19 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, narrow: bool
             format!(" {message}"),
             Style::default().fg(WARNING),
         ))
+    } else if let Some(version) = app.available_update() {
+        Line::from(Span::styled(
+            format!(" Update {version} available · run tg update"),
+            Style::default().fg(SUCCESS),
+        ))
     } else if app.mode == Mode::Compose {
         Line::from(" Enter send  ·  drop files to attach  ·  Ctrl+J newline  ·  Esc")
+    } else if app.mode == Mode::Settings {
+        Line::from(" ↑↓ select  ·  Enter toggle  ·  Esc close settings")
     } else if narrow && app.narrow_conversation {
-        Line::from(" o action  ·  Enter media  ·  l link  ·  i compose  ·  Esc chats")
+        Line::from(" o action  ·  r reply  ·  Enter media  ·  Esc chats")
     } else {
-        Line::from(" ↑↓/jk move  ·  o action  ·  Enter media  ·  l link  ·  ? help  ·  q quit")
+        Line::from(" ↑↓/jk move  ·  o action  ·  r reply  ·  Enter media  ·  ? help  ·  q quit")
     };
     frame.render_widget(
         Paragraph::new(content).style(Style::default().fg(MUTED)),
@@ -519,10 +532,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Tab             switch chats / conversation"),
         Line::from("PgUp / PgDn     scroll conversation"),
         Line::from("Home / End      oldest loaded / latest"),
-        Line::from("o / O           next / previous Telegram link or file"),
+        Line::from("o / O           next / previous reply, link, or file"),
+        Line::from("r               jump to selected reply target"),
         Line::from("Enter / click   download or reveal selected media"),
         Line::from("l               follow link in selected message/caption"),
         Line::from("/               filter chats (from chat list)"),
+        Line::from("s               settings"),
         Line::from(""),
         Line::from(vec![
             Span::styled("Writing", Style::default().bold()),
@@ -545,6 +560,87 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             .style(Style::default().fg(Color::White)),
         popup,
     );
+}
+
+fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let popup = centered(area, area.width.min(68), 17_u16.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Termgram settings ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let settings = app.settings();
+    let rows = [
+        (
+            "Automatic update checks",
+            if settings.automatic_update_checks {
+                "On"
+            } else {
+                "Off"
+            },
+        ),
+        ("Release channel", settings.release_channel.label()),
+        ("Downloads", settings.download_behavior.label()),
+        (
+            "Message ID column",
+            if settings.show_message_ids {
+                "Shown"
+            } else {
+                "Hidden"
+            },
+        ),
+    ];
+    let width = usize::from(inner.width.saturating_sub(4));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Only non-sensitive preferences are stored locally.",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+    ];
+    for (index, (label, value)) in rows.into_iter().enumerate() {
+        let selected = index == app.settings_selection();
+        let prefix = if selected { "› " } else { "  " };
+        let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
+        let gap = content_width
+            .saturating_sub(UnicodeWidthStr::width(label))
+            .saturating_sub(UnicodeWidthStr::width(value))
+            .max(1);
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(ACCENT).bold()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{label}{}{value}", " ".repeat(gap)),
+            style,
+        )));
+        if index == 2 {
+            lines.push(Line::from(Span::styled(
+                match settings.download_behavior {
+                    DownloadBehavior::TempOnly => {
+                        "  Temp download only; Termgram never reveals files."
+                    }
+                    DownloadBehavior::RevealOnActivation => {
+                        "  Second activation reveals; Termgram never executes files."
+                    }
+                },
+                Style::default().fg(MUTED),
+            )));
+        }
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "↑↓/j/k select · Enter/Space toggle · Esc close",
+            Style::default().fg(MUTED),
+        )),
+    ]);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_fatal(frame: &mut Frame<'_>, area: Rect, message: &str) {
@@ -599,7 +695,9 @@ fn message_lines(
     message: &Message,
     width: usize,
     attachment_state: AttachmentState,
+    download_behavior: DownloadBehavior,
     selected: bool,
+    show_message_ids: bool,
 ) -> Vec<Line<'static>> {
     let time = message
         .timestamp
@@ -610,11 +708,17 @@ fn message_lines(
     let prefix = format!("{time} {sender} │ ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let delivery_width = if message.outgoing { 3 } else { 0 };
+    let id_reserve = usize::from(show_message_ids) * MESSAGE_ID_COLUMN_WIDTH;
     let body_width = width
         .saturating_sub(prefix_width)
         .saturating_sub(delivery_width)
+        .saturating_sub(id_reserve)
         .max(8);
-    let body = message_body(message, attachment_state);
+    let mut body = message_body(message, attachment_state, download_behavior);
+    if let Some(reply) = &message.reply_to {
+        let sender = reply.sender.as_deref().unwrap_or("unknown");
+        body = format!("↩ #{} {}  {body}", reply.message_id, sender);
+    }
     let linked = telegram_link(&message.text).is_some();
     let wrapped = wrap_cells(&body, body_width);
     let mut result = Vec::new();
@@ -657,12 +761,25 @@ fn message_lines(
             }
             spans.push(Span::styled(mark, delivery_style));
         }
-        result.push(Line::from(spans));
+        let mut line = Line::from(spans);
+        if show_message_ids && index == 0 {
+            let label = format!("#{}", message.id);
+            let gap = width
+                .saturating_sub(line.width())
+                .saturating_sub(UnicodeWidthStr::width(label.as_str()));
+            line.spans.push(Span::raw(" ".repeat(gap)));
+            line.spans.push(Span::styled(label, prefix_style));
+        }
+        result.push(line);
     }
     result
 }
 
-fn message_body(message: &Message, state: AttachmentState) -> String {
+fn message_body(
+    message: &Message,
+    state: AttachmentState,
+    download_behavior: DownloadBehavior,
+) -> String {
     let Some(attachment) = &message.attachment else {
         return message.text.clone();
     };
@@ -695,7 +812,10 @@ fn message_body(message: &Message, state: AttachmentState) -> String {
     let action = match state {
         AttachmentState::Ready => "click/Enter to download",
         AttachmentState::Downloading => "downloading…",
-        AttachmentState::Downloaded => "click/Enter to reveal",
+        AttachmentState::Downloaded => match download_behavior {
+            DownloadBehavior::TempOnly => "downloaded to temp",
+            DownloadBehavior::RevealOnActivation => "click/Enter to reveal",
+        },
     };
     label.push_str(" · ");
     label.push_str(action);
@@ -911,14 +1031,19 @@ mod tests {
 
     use super::{editor_lines, input_cursor, render, truncate_cells, wrap_cells};
     use crate::{
-        app::{AppState, Screen},
+        app::{AppState, Mode, Screen},
+        config::{DownloadBehavior, ReleaseChannel, Settings},
         event::ConnectionStatus,
         input::TextInput,
-        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message},
+        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
     };
 
     fn populated_app() -> AppState {
-        let mut app = AppState::new();
+        populated_app_with_settings(Settings::default())
+    }
+
+    fn populated_app_with_settings(settings: Settings) -> AppState {
+        let mut app = AppState::with_ephemeral_settings(settings);
         app.screen = Screen::Main;
         app.connection = ConnectionStatus::Online;
         app.user_name = Some("Me".to_owned());
@@ -937,6 +1062,7 @@ mod tests {
                 id: 11,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: "hello from the terminal 🙂".to_owned(),
                 timestamp: Utc::now(),
                 outgoing: false,
@@ -1020,6 +1146,83 @@ mod tests {
     }
 
     #[test]
+    fn settings_overlay_renders_defaults_and_safety_language() {
+        let mut app = populated_app();
+        app.mode = Mode::Settings;
+        let output = render_text(&app, 100, 30);
+
+        assert!(output.contains("Termgram settings"));
+        assert!(output.contains("Automatic update checks"));
+        assert!(output.contains("Stable"));
+        assert!(output.contains("Reveal on activation"));
+        assert!(output.contains("never executes files"));
+    }
+
+    #[test]
+    fn settings_overlay_reflects_prerelease_and_temp_only() {
+        let mut app = AppState::with_settings(
+            Settings {
+                automatic_update_checks: false,
+                release_channel: ReleaseChannel::Prerelease,
+                download_behavior: DownloadBehavior::TempOnly,
+                show_message_ids: false,
+            },
+            std::env::temp_dir().join("unused-termgram-settings.conf"),
+        );
+        app.screen = Screen::Main;
+        app.mode = Mode::Settings;
+        let output = render_text(&app, 100, 30);
+
+        assert!(output.contains("Off"));
+        assert!(output.contains("Prerelease"));
+        assert!(output.contains("Temp only"));
+        assert!(output.contains("never reveals files"));
+    }
+
+    #[test]
+    fn replies_render_target_metadata_and_optional_right_id_column() {
+        let mut app = populated_app();
+        let message = app.messages.get_mut(&7).unwrap().first_mut().unwrap();
+        message.reply_to = Some(ReplyInfo {
+            message_id: 42,
+            chat_id: 7,
+            sender: Some("Bob".to_owned()),
+        });
+
+        let without_column = render_text(&app, 100, 30);
+        assert!(without_column.contains("↩ #42 Bob"));
+        assert!(!without_column.contains("#11"));
+
+        let settings = Settings {
+            show_message_ids: true,
+            ..Settings::default()
+        };
+        let mut app = populated_app_with_settings(settings);
+        let message = app.messages.get_mut(&7).unwrap().first_mut().unwrap();
+        message.reply_to = Some(ReplyInfo {
+            message_id: 42,
+            chat_id: 7,
+            sender: Some("Bob".to_owned()),
+        });
+        let with_column = render_text(&app, 100, 30);
+        assert!(with_column.contains("↩ #42 Bob"));
+        assert!(with_column.contains("#11"));
+    }
+
+    #[test]
+    fn update_hint_yields_to_transient_status_messages() {
+        let mut app = populated_app();
+        app.set_available_update("0.1.9");
+        let hint = render_text(&app, 100, 30);
+        assert!(hint.contains("Update 0.1.9 available · run tg update"));
+
+        app.status_message = Some("Message failed".to_owned());
+        let status = render_text(&app, 100, 30);
+        assert!(status.contains("Message failed"));
+        assert!(!status.contains("Update 0.1.9 available"));
+    }
+
+    #[test]
     fn attachment_and_sticker_fallbacks_render_as_actionable_terminal_rows() {
         let mut app = populated_app();
         app.messages.get_mut(&7).unwrap().extend([
@@ -1027,6 +1230,7 @@ mod tests {
                 id: 12,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: "receipt".to_owned(),
                 timestamp: Utc::now(),
                 outgoing: false,
@@ -1043,6 +1247,7 @@ mod tests {
                 id: 13,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: String::new(),
                 timestamp: Utc::now(),
                 outgoing: false,
@@ -1141,6 +1346,7 @@ mod tests {
                 id,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: format!("message-{id:02}"),
                 timestamp: Utc::now(),
                 outgoing: false,
@@ -1165,6 +1371,7 @@ mod tests {
                 id: 30,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: "new-one\nnew-two\nnew-three".to_owned(),
                 timestamp: Utc::now(),
                 outgoing: false,
@@ -1197,6 +1404,7 @@ mod tests {
                 id: 99,
                 chat_id: 7,
                 sender: "Alice".to_owned(),
+                reply_to: None,
                 text: format!("oldest\n{}newest", "filler\n".repeat(66_000)),
                 timestamp: Utc::now(),
                 outgoing: false,

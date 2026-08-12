@@ -76,11 +76,28 @@ pub struct Message {
     pub id: i32,
     pub chat_id: ChatId,
     pub sender: String,
+    /// The message this one replies to, when Telegram exposes a stable target.
+    ///
+    /// `sender` is deliberately optional: resolving the target author must not
+    /// turn loading a lightweight history page into one RPC per reply.
+    pub reply_to: Option<ReplyInfo>,
     pub text: String,
     pub timestamp: DateTime<Utc>,
     pub outgoing: bool,
     pub delivery: Delivery,
     pub attachment: Option<Attachment>,
+}
+
+/// Lightweight metadata used to render and navigate a reply.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyInfo {
+    pub message_id: i32,
+    /// Stable dialog identifier for the target. Telegram permits replies to a
+    /// message from another peer, where message IDs alone are ambiguous.
+    pub chat_id: ChatId,
+    /// Best-effort terminal-safe `@username`, falling back to the sender's
+    /// display name when Telegram does not expose a username.
+    pub sender: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

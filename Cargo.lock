@@ -1864,6 +1864,7 @@ dependencies = [
  "grammers-client",
  "grammers-session",
  "ratatui",
+ "sha2",
  "tokio",
  "unicode-segmentation",
  "unicode-width",

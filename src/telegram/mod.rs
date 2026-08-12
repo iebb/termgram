@@ -20,7 +20,7 @@ use crate::config::Config;
 use crate::event::{AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand};
 use crate::model::{
     sanitize_terminal_line, sanitize_terminal_text, Attachment, AttachmentKind, Chat, ChatId,
-    ChatKind, Delivery, Message,
+    ChatKind, Delivery, Message, ReplyInfo,
 };
 
 const HISTORY_LIMIT: usize = 80;
@@ -28,6 +28,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 32;
 const EVENT_QUEUE_CAPACITY: usize = 64;
 const UPDATE_QUEUE_LIMIT: usize = 256;
 const TRANSIENT_SENDER_NAME_LIMIT: usize = 256;
+const MESSAGE_SENDER_CACHE_LIMIT: usize = 512;
 const UNRESOLVED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_TRANSFERS: usize = 3;
 
@@ -51,6 +52,10 @@ struct WorkerCache {
     /// evicted by the bounded transient sender-name cache.
     dialog_name_ids: HashSet<PeerId>,
     transient_name_order: VecDeque<PeerId>,
+    /// A small sender index makes reply labels useful without fetching every
+    /// reply target separately while loading history.
+    message_senders: HashMap<(ChatId, i32), String>,
+    message_sender_order: VecDeque<(ChatId, i32)>,
     /// Broadcasts are intentionally hidden; unresolved channel-shaped peers are
     /// hidden until a later dialog refresh can identify them as a group.
     hidden_broadcasts: HashSet<ChatId>,
@@ -676,6 +681,7 @@ async fn handle_command(
                     messages.push(Box::pin(map_message(client, &message, cache)).await?);
                 }
                 messages.reverse();
+                hydrate_reply_senders(&mut messages, cache);
                 Ok(messages)
             }
             .await;
@@ -695,6 +701,64 @@ async fn handle_command(
                             chat_id,
                             request_id,
                             error: format!("Could not load history: {error:#}"),
+                        })
+                        .await?;
+                }
+            }
+        }
+        TelegramCommand::LoadMessage {
+            chat_id,
+            source_message_id,
+            message_id,
+            request_id,
+        } => {
+            let result: Result<Message> = async {
+                if source_message_id <= 0 || message_id <= 0 {
+                    bail!("invalid Telegram message identifier")
+                }
+                let peer = *cache
+                    .peers
+                    .get(&chat_id)
+                    .context("selected chat is missing its Telegram peer reference")?;
+                let mut messages = client
+                    .get_messages_by_id(peer, &[source_message_id])
+                    .await
+                    .context("could not retrieve the replying message")?;
+                let source = messages
+                    .pop()
+                    .flatten()
+                    .context("replying message is unavailable")?;
+                if source.reply_to_message_id() != Some(message_id) {
+                    bail!("reply relation changed before navigation")
+                }
+                let telegram_message = client
+                    .get_reply_to_message(&source)
+                    .await
+                    .context("could not retrieve reply target")?
+                    .context("reply target is unavailable")?;
+                let mut message = Box::pin(map_message(client, &telegram_message, cache)).await?;
+                hydrate_reply_sender(&mut message, cache);
+                Ok(message)
+            }
+            .await;
+            match result {
+                Ok(message) => {
+                    events
+                        .send(NetworkEvent::MessageLoaded {
+                            chat_id,
+                            message_id,
+                            request_id,
+                            message,
+                        })
+                        .await?;
+                }
+                Err(error) => {
+                    events
+                        .send(NetworkEvent::MessageLoadFailed {
+                            chat_id,
+                            message_id,
+                            request_id,
+                            error: format!("Could not load message: {error:#}"),
                         })
                         .await?;
                 }
@@ -1367,15 +1431,20 @@ async fn map_message(
 ) -> Result<Message> {
     let chat_id = peer_id(message)?;
     let media = message.media();
-    let sender = if message.outgoing() {
-        "You".to_owned()
+    let (sender, reply_sender) = if message.outgoing() {
+        let sender = "You".to_owned();
+        let reply_sender = username_or_sender(message.sender().and_then(Peer::username), &sender);
+        (sender, reply_sender)
     } else {
-        resolve_sender_name(client, message, cache).await
+        resolve_sender(client, message, cache).await
     };
+    let reply_to = reply_info(message, chat_id, cache);
+    cache_message_sender(cache, chat_id, message.id(), reply_sender);
     Ok(Message {
         id: message.id(),
         chat_id,
         sender,
+        reply_to,
         // Telegram stores the Unicode fallback for custom-emoji entities in
         // the raw message string. Keep that text instead of trying to render
         // the custom document in a terminal.
@@ -1398,31 +1467,99 @@ async fn map_message(
     })
 }
 
-async fn resolve_sender_name(
+fn reply_info(
+    message: &TelegramMessage,
+    current_chat_id: ChatId,
+    cache: &WorkerCache,
+) -> Option<ReplyInfo> {
+    let grammers_client::tl::enums::Message::Message(raw) = &message.raw else {
+        return None;
+    };
+    let grammers_client::tl::enums::MessageReplyHeader::Header(header) = raw.reply_to.as_ref()?
+    else {
+        return None;
+    };
+    let message_id = header.reply_to_msg_id?;
+    let chat_id = header
+        .reply_to_peer_id
+        .as_ref()
+        .and_then(|peer| PeerId::from(peer).bot_api_dialog_id())
+        .unwrap_or(current_chat_id);
+    Some(ReplyInfo {
+        message_id,
+        chat_id,
+        sender: cache.message_senders.get(&(chat_id, message_id)).cloned(),
+    })
+}
+
+fn hydrate_reply_senders(messages: &mut [Message], cache: &WorkerCache) {
+    for message in messages {
+        hydrate_reply_sender(message, cache);
+    }
+}
+
+fn hydrate_reply_sender(message: &mut Message, cache: &WorkerCache) {
+    let Some(reply) = &mut message.reply_to else {
+        return;
+    };
+    if reply.sender.is_none() {
+        reply.sender = cache
+            .message_senders
+            .get(&(reply.chat_id, reply.message_id))
+            .cloned();
+    }
+}
+
+fn cache_message_sender(cache: &mut WorkerCache, chat_id: ChatId, message_id: i32, sender: String) {
+    let key = (chat_id, message_id);
+    if !cache.message_senders.contains_key(&key) {
+        cache.message_sender_order.push_back(key);
+    }
+    cache.message_senders.insert(key, sender);
+    while cache.message_sender_order.len() > MESSAGE_SENDER_CACHE_LIMIT {
+        let Some(stale) = cache.message_sender_order.pop_front() else {
+            break;
+        };
+        cache.message_senders.remove(&stale);
+    }
+}
+
+async fn resolve_sender(
     client: &Client,
     message: &TelegramMessage,
     cache: &mut WorkerCache,
-) -> String {
+) -> (String, String) {
     let Some(sender_id) = message.sender_id() else {
-        return "Unknown".to_owned();
+        return ("Unknown".to_owned(), "Unknown".to_owned());
     };
-    if let Some(name) = message.sender().and_then(Peer::name) {
-        let name = safe_name(Some(name), "Unknown");
+    if let Some(peer) = message.sender() {
+        let name = safe_name(peer.name(), "Unknown");
+        let reply_sender = username_or_sender(peer.username(), &name);
         cache_sender_name(cache, sender_id, name.clone());
-        return name;
+        return (name, reply_sender);
     }
     if let Some(name) = cache.names.get(&sender_id) {
-        return name.clone();
+        return (name.clone(), name.clone());
     }
     let Ok(Some(sender)) = message.sender_ref().await else {
-        return "Unknown".to_owned();
+        return ("Unknown".to_owned(), "Unknown".to_owned());
     };
     let Ok(peer) = client.resolve_peer(sender).await else {
-        return "Unknown".to_owned();
+        return ("Unknown".to_owned(), "Unknown".to_owned());
     };
     let name = safe_name(peer.name(), "Unknown");
+    let reply_sender = username_or_sender(peer.username(), &name);
     cache_sender_name(cache, sender_id, name.clone());
-    name
+    (name, reply_sender)
+}
+
+fn username_or_sender(username: Option<&str>, sender: &str) -> String {
+    let username = sanitize_terminal_line(username.unwrap_or_default());
+    if username.is_empty() {
+        sender.to_owned()
+    } else {
+        format!("@{username}")
+    }
 }
 
 fn cache_sender_name(cache: &mut WorkerCache, peer_id: PeerId, name: String) {
@@ -1657,10 +1794,13 @@ mod tests {
 
     use grammers_session::types::PeerId;
 
+    use crate::model::{Delivery, Message, ReplyInfo};
+
     use super::{
-        advance_dialog_watermark, begin_unresolved_refresh, cache_sender_name, parse_telegram_link,
-        reconcile_dialog_snapshot, sanitize_download_name, TelegramLink, WorkerCache,
-        TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
+        advance_dialog_watermark, begin_unresolved_refresh, cache_message_sender,
+        cache_sender_name, hydrate_reply_sender, parse_telegram_link, reconcile_dialog_snapshot,
+        sanitize_download_name, username_or_sender, TelegramLink, WorkerCache,
+        MESSAGE_SENDER_CACHE_LIMIT, TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
     };
 
     #[test]
@@ -1782,6 +1922,86 @@ mod tests {
         assert!(cache
             .names
             .contains_key(&PeerId::user_unchecked(last_sender)));
+    }
+
+    #[test]
+    fn reply_sender_is_hydrated_from_bounded_message_index() {
+        let mut cache = WorkerCache::default();
+        cache_message_sender(&mut cache, 7, 41, "Alice".to_owned());
+        let mut message = Message {
+            id: 42,
+            chat_id: 7,
+            sender: "Bob".to_owned(),
+            reply_to: Some(ReplyInfo {
+                message_id: 41,
+                chat_id: 7,
+                sender: None,
+            }),
+            text: "hello".to_owned(),
+            timestamp: Message::timestamp_from_unix(0),
+            outgoing: false,
+            delivery: Delivery::Read,
+            attachment: None,
+        };
+
+        hydrate_reply_sender(&mut message, &cache);
+
+        assert_eq!(
+            message.reply_to.and_then(|reply| reply.sender),
+            Some("Alice".to_owned())
+        );
+    }
+
+    #[test]
+    fn reply_labels_prefer_a_sanitized_username_and_fall_back_to_display_name() {
+        assert_eq!(
+            username_or_sender(Some("alice_name\u{1b}[31m"), "Alice Example"),
+            "@alice_name"
+        );
+        assert_eq!(username_or_sender(None, "Alice Example"), "Alice Example");
+        assert_eq!(username_or_sender(Some("\u{7}"), "Alice"), "Alice");
+    }
+
+    #[test]
+    fn message_sender_index_stays_bounded_and_updates_in_place() {
+        let mut cache = WorkerCache::default();
+        cache_message_sender(&mut cache, 1, 1, "Old".to_owned());
+        cache_message_sender(&mut cache, 1, 1, "New".to_owned());
+        for id in 2..=i32::try_from(MESSAGE_SENDER_CACHE_LIMIT + 1).unwrap() {
+            cache_message_sender(&mut cache, 1, id, format!("Sender {id}"));
+        }
+
+        assert_eq!(cache.message_senders.len(), MESSAGE_SENDER_CACHE_LIMIT);
+        assert_eq!(cache.message_sender_order.len(), MESSAGE_SENDER_CACHE_LIMIT);
+        assert!(!cache.message_senders.contains_key(&(1, 1)));
+        assert!(cache
+            .message_senders
+            .contains_key(&(1, i32::try_from(MESSAGE_SENDER_CACHE_LIMIT + 1).unwrap())));
+    }
+
+    #[test]
+    fn reply_sender_hydration_is_scoped_to_the_conversation() {
+        let mut cache = WorkerCache::default();
+        cache_message_sender(&mut cache, 8, 41, "Other chat".to_owned());
+        let mut message = Message {
+            id: 42,
+            chat_id: 7,
+            sender: "Bob".to_owned(),
+            reply_to: Some(ReplyInfo {
+                message_id: 41,
+                chat_id: 7,
+                sender: None,
+            }),
+            text: "hello".to_owned(),
+            timestamp: Message::timestamp_from_unix(0),
+            outgoing: false,
+            delivery: Delivery::Read,
+            attachment: None,
+        };
+
+        hydrate_reply_sender(&mut message, &cache);
+
+        assert_eq!(message.reply_to.and_then(|reply| reply.sender), None);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use chrono::Utc;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
+    config::{DownloadBehavior, Settings},
     event::{AppEvent, AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand},
     input::{key_action, KeyAction, TextInput},
     model::{
@@ -64,6 +65,7 @@ pub enum Mode {
     Compose,
     Filter,
     Help,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,6 +97,7 @@ pub struct App {
     pub narrow_conversation: bool,
     pub should_quit: bool,
     pub status_message: Option<String>,
+    available_update: Option<String>,
     pub tick: u64,
     pub loading_history: bool,
     /// Number of rendered terminal rows between the detached viewport and the latest item.
@@ -108,15 +111,20 @@ pub struct App {
     pub viewport_anchor_message: Option<i32>,
     pub viewport_anchor_row: usize,
     pub terminal_focused: bool,
+    settings: Settings,
+    settings_path: Option<PathBuf>,
+    settings_selection: usize,
     auth_input: TextInput,
     drafts: BTreeMap<ChatId, TextInput>,
     retry_message_ids: BTreeMap<ChatId, i32>,
     retry_attachments: BTreeMap<(ChatId, i32), (PathBuf, String, bool)>,
     mode_before_help: Mode,
+    mode_before_settings: Mode,
     force_redraw: bool,
     next_pending_id: i32,
     next_history_request_id: u64,
     active_history_request: Option<(ChatId, u64)>,
+    active_reply_request: Option<(ChatId, i32, u64)>,
     history_target_message: Option<i32>,
     read_ack_pending: BTreeSet<ChatId>,
     refresh_dialogs_pending: bool,
@@ -149,6 +157,7 @@ impl Default for App {
             narrow_conversation: false,
             should_quit: false,
             status_message: None,
+            available_update: None,
             tick: 0,
             loading_history: false,
             message_scroll: 0,
@@ -157,15 +166,20 @@ impl Default for App {
             viewport_anchor_message: None,
             viewport_anchor_row: 0,
             terminal_focused: true,
+            settings: Settings::default(),
+            settings_path: None,
+            settings_selection: 0,
             auth_input: TextInput::new(),
             drafts: BTreeMap::new(),
             retry_message_ids: BTreeMap::new(),
             retry_attachments: BTreeMap::new(),
             mode_before_help: Mode::Navigate,
+            mode_before_settings: Mode::Navigate,
             force_redraw: false,
             next_pending_id: -1,
             next_history_request_id: 1,
             active_history_request: None,
+            active_reply_request: None,
             history_target_message: None,
             read_ack_pending: BTreeSet::new(),
             refresh_dialogs_pending: false,
@@ -182,6 +196,56 @@ impl App {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct state with preferences loaded by the runtime and a path used
+    /// for subsequent atomic saves. Keeping disk access outside `new` makes
+    /// reducer tests and embedders deterministic.
+    #[must_use]
+    pub fn with_settings(settings: Settings, settings_path: PathBuf) -> Self {
+        Self {
+            settings,
+            settings_path: Some(settings_path),
+            ..Self::default()
+        }
+    }
+
+    /// Construct state with in-memory preferences when persistence is not
+    /// available. The settings overlay remains usable for the current run.
+    #[must_use]
+    pub fn with_ephemeral_settings(settings: Settings) -> Self {
+        Self {
+            settings,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub const fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    #[must_use]
+    pub const fn settings_selection(&self) -> usize {
+        self.settings_selection
+    }
+
+    /// Record a background update result without displacing active errors or
+    /// messaging feedback. The footer shows this when no transient status is
+    /// present.
+    pub fn set_available_update(&mut self, version: &str) {
+        let version = sanitize_terminal_line(version.trim());
+        self.available_update =
+            (self.settings.automatic_update_checks && !version.is_empty()).then_some(version);
+    }
+
+    pub fn clear_available_update(&mut self) {
+        self.available_update = None;
+    }
+
+    #[must_use]
+    pub fn available_update(&self) -> Option<&str> {
+        self.available_update.as_deref()
     }
 
     pub fn update(&mut self, event: AppEvent) -> Vec<TelegramCommand> {
@@ -221,7 +285,8 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<TelegramCommand> {
-        if !matches!(self.screen, Screen::Main) || self.mode == Mode::Help {
+        if !matches!(self.screen, Screen::Main) || matches!(self.mode, Mode::Help | Mode::Settings)
+        {
             return Vec::new();
         }
         match mouse.kind {
@@ -298,6 +363,18 @@ impl App {
                 request_id,
                 error,
             } => self.finish_history(chat_id, request_id, Err(error)),
+            NetworkEvent::MessageLoaded {
+                chat_id,
+                message_id,
+                request_id,
+                message,
+            } => self.finish_reply_navigation(chat_id, message_id, request_id, Ok(message)),
+            NetworkEvent::MessageLoadFailed {
+                chat_id,
+                message_id,
+                request_id,
+                error,
+            } => self.finish_reply_navigation(chat_id, message_id, request_id, Err(error)),
             NetworkEvent::NewMessage(message) => self.receive_message(message, true, true),
             NetworkEvent::MessageUpdated(message) => {
                 self.update_message(message);
@@ -368,10 +445,13 @@ impl App {
                 self.downloading_attachments.remove(&(chat_id, message_id));
                 self.downloaded_attachments
                     .insert((chat_id, message_id), path.clone());
-                self.status_message = Some(format!(
-                    "Downloaded to {} · activate again to reveal",
-                    sanitize_terminal_line(&path.display().to_string())
-                ));
+                let location = sanitize_terminal_line(&path.display().to_string());
+                self.status_message = Some(match self.settings.download_behavior {
+                    DownloadBehavior::TempOnly => format!("Downloaded to {location}"),
+                    DownloadBehavior::RevealOnActivation => {
+                        format!("Downloaded to {location} · activate again to reveal")
+                    }
+                });
                 Vec::new()
             }
             NetworkEvent::AttachmentDownloadFailed {
@@ -512,7 +592,8 @@ impl App {
 
     #[must_use]
     pub fn message_is_actionable(&self, message: &Message) -> bool {
-        (message.id > 0 && message.attachment.is_some())
+        message.reply_to.is_some()
+            || (message.id > 0 && message.attachment.is_some())
             || self
                 .retry_attachments
                 .contains_key(&(message.chat_id, message.id))
@@ -645,6 +726,7 @@ impl App {
             Mode::Compose => self.handle_compose(action),
             Mode::Filter => self.handle_filter(action),
             Mode::Help => self.handle_help(action),
+            Mode::Settings => self.handle_settings(action),
         }
     }
 
@@ -654,6 +736,13 @@ impl App {
             KeyAction::Character('?') => {
                 self.mode_before_help = self.mode;
                 self.mode = Mode::Help;
+                Vec::new()
+            }
+            KeyAction::Character('s') => {
+                self.mode_before_settings = self.mode;
+                self.mode = Mode::Settings;
+                self.settings_selection = 0;
+                self.status_message = None;
                 Vec::new()
             }
             KeyAction::Character('/') if self.focus == Focus::Chats => {
@@ -711,6 +800,9 @@ impl App {
             }
             KeyAction::Character('l') if self.focus == Focus::Conversation => {
                 self.activate_selected_link()
+            }
+            KeyAction::Character('r') if self.focus == Focus::Conversation => {
+                self.navigate_to_selected_reply()
             }
             KeyAction::Up | KeyAction::Character('k') => self.move_up(1),
             KeyAction::Down | KeyAction::Character('j') => self.move_down(1),
@@ -844,6 +936,83 @@ impl App {
         }
     }
 
+    fn handle_settings(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        if action == KeyAction::Character('q') {
+            return self.quit();
+        }
+        match action {
+            KeyAction::Escape | KeyAction::Character('s') => {
+                self.mode = self.mode_before_settings;
+                self.status_message = None;
+            }
+            KeyAction::Up | KeyAction::Character('k') => {
+                self.settings_selection = self.settings_selection.saturating_sub(1);
+            }
+            KeyAction::Down | KeyAction::Character('j') => {
+                self.settings_selection = self.settings_selection.saturating_add(1).min(3);
+            }
+            KeyAction::Enter | KeyAction::Left | KeyAction::Right | KeyAction::Character(' ') => {
+                self.toggle_selected_setting();
+            }
+            KeyAction::Character('u') => {
+                self.settings_selection = 0;
+                self.toggle_selected_setting();
+            }
+            KeyAction::Character('c') => {
+                self.settings_selection = 1;
+                self.toggle_selected_setting();
+            }
+            KeyAction::Character('d') => {
+                self.settings_selection = 2;
+                self.toggle_selected_setting();
+            }
+            KeyAction::Character('m') => {
+                self.settings_selection = 3;
+                self.toggle_selected_setting();
+            }
+            KeyAction::Redraw => self.force_redraw = true,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn toggle_selected_setting(&mut self) {
+        let previous = self.settings;
+        let previous_available_update = self.available_update.clone();
+        match self.settings_selection {
+            0 => {
+                self.settings.automatic_update_checks = !self.settings.automatic_update_checks;
+                if !self.settings.automatic_update_checks {
+                    self.available_update = None;
+                }
+            }
+            1 => {
+                self.settings.release_channel = self.settings.release_channel.toggled();
+            }
+            2 => {
+                self.settings.download_behavior = self.settings.download_behavior.toggled();
+            }
+            3 => {
+                self.settings.show_message_ids = !self.settings.show_message_ids;
+            }
+            _ => return,
+        }
+        let Some(path) = self.settings_path.as_deref() else {
+            self.status_message = Some("Settings changed for this session".to_owned());
+            return;
+        };
+        if let Err(error) = self.settings.save_to(path) {
+            self.settings = previous;
+            self.available_update = previous_available_update;
+            self.status_message = Some(format!(
+                "Could not save settings: {}",
+                sanitize_terminal_line(&error.to_string())
+            ));
+        } else {
+            self.status_message = Some("Settings saved".to_owned());
+        }
+    }
+
     fn quit(&mut self) -> Vec<TelegramCommand> {
         if self.should_quit {
             return Vec::new();
@@ -896,6 +1065,7 @@ impl App {
             id: local_id,
             chat_id,
             sender: "You".to_owned(),
+            reply_to: None,
             text: text.clone(),
             timestamp: Utc::now(),
             outgoing: true,
@@ -924,6 +1094,7 @@ impl App {
                 id: local_id,
                 chat_id,
                 sender: "You".to_owned(),
+                reply_to: None,
                 text: String::new(),
                 timestamp: Utc::now(),
                 outgoing: true,
@@ -959,7 +1130,8 @@ impl App {
             .collect::<Vec<_>>();
         if actionable.is_empty() {
             self.selected_message = None;
-            self.status_message = Some("No files or Telegram links in loaded messages".to_owned());
+            self.status_message =
+                Some("No replies, files, or Telegram links in loaded messages".to_owned());
             return Vec::new();
         }
         let selected = self
@@ -1029,11 +1201,18 @@ impl App {
                 .cloned()
             {
                 if path.is_file() {
-                    if let Err(error) = reveal_path(&path) {
+                    let location = sanitize_terminal_line(&path.display().to_string());
+                    if self.settings.download_behavior == DownloadBehavior::TempOnly {
+                        self.status_message = Some(format!(
+                            "Downloaded to {location} · reveal is disabled in settings"
+                        ));
+                    } else if let Err(error) = reveal_path(&path) {
                         self.status_message = Some(format!(
                             "Could not reveal attachment: {}",
                             sanitize_terminal_line(&error.to_string())
                         ));
+                    } else {
+                        self.status_message = Some(format!("Revealed {location}"));
                     }
                     return Vec::new();
                 }
@@ -1079,6 +1258,74 @@ impl App {
         self.pending_telegram_link = Some(url.clone());
         self.status_message = Some("Opening Telegram link…".to_owned());
         vec![TelegramCommand::ResolveTelegramLink { url }]
+    }
+
+    fn navigate_to_selected_reply(&mut self) -> Vec<TelegramCommand> {
+        let Some(chat_id) = self.active_chat_id else {
+            return Vec::new();
+        };
+        let Some(message) = self
+            .selected_message
+            .and_then(|message_id| {
+                self.messages
+                    .get(&chat_id)
+                    .and_then(|messages| messages.iter().find(|message| message.id == message_id))
+            })
+            .cloned()
+        else {
+            self.status_message = Some("Select a reply with o first".to_owned());
+            return Vec::new();
+        };
+        let Some(reply) = message.reply_to else {
+            self.status_message = Some("Selected message is not a reply".to_owned());
+            return Vec::new();
+        };
+        if let Some(target) = self.messages.get(&reply.chat_id).and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message.id == reply.message_id)
+                .cloned()
+        }) {
+            if reply.chat_id == chat_id {
+                self.focus_reply_target(reply.message_id);
+                return Vec::new();
+            }
+            if let Some(chat) = self
+                .chats
+                .iter()
+                .find(|candidate| candidate.id == reply.chat_id)
+                .cloned()
+            {
+                return self.open_resolved_link(chat, Some(target));
+            }
+        }
+        if self
+            .active_reply_request
+            .is_some_and(|request| request.0 == chat_id && request.1 == reply.message_id)
+        {
+            self.status_message = Some(format!("Loading reply #{}…", reply.message_id));
+            return Vec::new();
+        }
+        let request_id = self.next_history_request_id;
+        self.next_history_request_id = self.next_history_request_id.wrapping_add(1).max(1);
+        self.active_reply_request = Some((chat_id, reply.message_id, request_id));
+        self.status_message = Some(format!("Loading reply #{}…", reply.message_id));
+        vec![TelegramCommand::LoadMessage {
+            chat_id,
+            source_message_id: message.id,
+            message_id: reply.message_id,
+            request_id,
+        }]
+    }
+
+    fn focus_reply_target(&mut self, message_id: i32) {
+        self.selected_message = Some(message_id);
+        self.viewport_anchor_message = Some(message_id);
+        self.viewport_anchor_row = 0;
+        // A non-zero detached state instructs the renderer to honor the
+        // semantic anchor instead of snapping back to the latest message.
+        self.message_scroll = 1;
+        self.status_message = Some(format!("Reply target #{message_id}"));
     }
 
     fn open_resolved_link(
@@ -1293,6 +1540,7 @@ impl App {
             self.new_messages_to_anchor = 0;
             self.clear_viewport_anchor();
             self.active_history_request = None;
+            self.active_reply_request = None;
             self.history_target_message = None;
             self.loading_history = false;
             self.mode = Mode::Navigate;
@@ -1332,7 +1580,11 @@ impl App {
         }
         let retained = {
             let messages = self.messages.entry(chat_id).or_default();
-            upsert_message(messages, message);
+            if let Some(preserved_id) = active.then_some(self.selected_message).flatten() {
+                upsert_message_preserving(messages, message, preserved_id);
+            } else {
+                upsert_message(messages, message);
+            }
             messages.iter().any(|current| current.id == message_id)
         };
         let genuinely_new = was_new && retained && reconciled_local_id.is_none();
@@ -1431,6 +1683,68 @@ impl App {
         Vec::new()
     }
 
+    fn finish_reply_navigation(
+        &mut self,
+        chat_id: ChatId,
+        message_id: i32,
+        request_id: u64,
+        result: Result<Message, String>,
+    ) -> Vec<TelegramCommand> {
+        if self.active_reply_request != Some((chat_id, message_id, request_id)) {
+            return Vec::new();
+        }
+        self.active_reply_request = None;
+        match result {
+            Ok(mut message) if message.id == message_id => {
+                sanitize_message(&mut message);
+                let sender = message.sender.clone();
+                if let Some(messages) = self.messages.get_mut(&chat_id) {
+                    for cached in messages.iter_mut() {
+                        if let Some(reply) = &mut cached.reply_to {
+                            if reply.message_id == message_id && reply.sender.is_none() {
+                                reply.sender = Some(sender.clone());
+                            }
+                        }
+                    }
+                }
+                if message.chat_id == chat_id {
+                    if let Some(messages) = self.messages.get_mut(&chat_id) {
+                        upsert_message_preserving(messages, message, message_id);
+                    } else {
+                        self.messages.insert(chat_id, vec![message]);
+                    }
+                } else if let Some(chat) = self
+                    .chats
+                    .iter()
+                    .find(|candidate| candidate.id == message.chat_id)
+                    .cloned()
+                {
+                    return self.open_resolved_link(chat, Some(message));
+                } else {
+                    self.status_message = Some(
+                        "Reply target belongs to a conversation that is not loaded".to_owned(),
+                    );
+                    return Vec::new();
+                }
+                if self.active_chat_id == Some(chat_id) {
+                    self.focus_reply_target(message_id);
+                }
+                self.prune_message_cache();
+            }
+            Ok(_) => {
+                self.status_message = Some("Telegram returned the wrong reply target".to_owned());
+            }
+            Err(error) => {
+                self.status_message = Some(format!(
+                    "Could not load reply #{}: {}",
+                    message_id,
+                    sanitize_terminal_line(&error)
+                ));
+            }
+        }
+        Vec::new()
+    }
+
     fn fail_message(
         &mut self,
         chat_id: ChatId,
@@ -1522,8 +1836,15 @@ impl App {
         if let Some(local_id) = reconciled_local_id {
             self.clear_reconciled_retry(chat_id, local_id, &preview);
         }
+        let preserved = (self.active_chat_id == Some(chat_id))
+            .then_some(self.selected_message)
+            .flatten();
         let messages = self.messages.entry(chat_id).or_default();
-        upsert_message(messages, message);
+        if let Some(preserved_id) = preserved {
+            upsert_message_preserving(messages, message, preserved_id);
+        } else {
+            upsert_message(messages, message);
+        }
         let is_latest = messages
             .last()
             .is_some_and(|latest| latest.id == message_id);
@@ -1566,7 +1887,8 @@ impl App {
             upsert_message(&mut combined, pending);
         }
         if let Some(preserved) = preserved {
-            upsert_message(&mut combined, preserved);
+            let preserved_id = preserved.id;
+            upsert_message_preserving(&mut combined, preserved, preserved_id);
         }
         self.messages.insert(chat_id, combined);
         for (local_id, text) in reconciled {
@@ -1672,6 +1994,12 @@ impl App {
 fn sanitize_message(message: &mut Message) {
     message.sender = sanitize_terminal_line(&message.sender);
     message.text = sanitize_terminal_text(&message.text);
+    if let Some(reply) = &mut message.reply_to {
+        reply.sender = reply
+            .sender
+            .take()
+            .map(|sender| sanitize_terminal_line(&sender));
+    }
     if let Some(attachment) = &mut message.attachment {
         attachment.file_name = attachment
             .file_name
@@ -1896,6 +2224,25 @@ fn upsert_message(messages: &mut Vec<Message>, message: Message) {
     sort_and_cap_messages(messages);
 }
 
+fn upsert_message_preserving(messages: &mut Vec<Message>, message: Message, preserved_id: i32) {
+    if let Some(existing) = messages
+        .iter_mut()
+        .find(|existing| existing.id == message.id)
+    {
+        *existing = message;
+    } else {
+        messages.push(message);
+    }
+    messages.sort_by_key(|message| (message.timestamp, message.id));
+    while messages.len() > MAX_MESSAGES_PER_CHAT {
+        let remove = messages
+            .iter()
+            .position(|message| message.id != preserved_id)
+            .unwrap_or(0);
+        messages.remove(remove);
+    }
+}
+
 fn sort_and_cap_messages(messages: &mut Vec<Message>) {
     messages.sort_by_key(|message| (message.timestamp, message.id));
     let overflow = messages.len().saturating_sub(MAX_MESSAGES_PER_CHAT);
@@ -1951,9 +2298,10 @@ mod tests {
         MAX_MESSAGES_PER_CHAT,
     };
     use crate::{
+        config::{DownloadBehavior, ReleaseChannel, Settings},
         event::{AppEvent, AuthPrompt, NetworkEvent, TelegramCommand},
         input::KeyAction,
-        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message},
+        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
     };
 
     fn chat(id: i64, title: &str) -> Chat {
@@ -1972,6 +2320,7 @@ mod tests {
             id,
             chat_id,
             sender: if outgoing { "Me" } else { "Them" }.to_owned(),
+            reply_to: None,
             text: text.to_owned(),
             timestamp: Utc.timestamp_opt(i64::from(id.max(0)), 0).unwrap(),
             outgoing,
@@ -2333,6 +2682,95 @@ mod tests {
     }
 
     #[test]
+    fn settings_screen_toggles_and_persists_essential_preferences() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "termgram-app-settings-{}-{nonce}",
+            std::process::id()
+        ));
+        let path = directory.join("settings.conf");
+        let mut app = App::with_settings(Settings::default(), path.clone());
+        app.screen = Screen::Main;
+
+        app.handle_action(KeyAction::Character('s'));
+        assert_eq!(app.mode, Mode::Settings);
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Down);
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Down);
+        app.handle_action(KeyAction::Enter);
+        app.handle_action(KeyAction::Down);
+        app.handle_action(KeyAction::Enter);
+        assert_eq!(
+            *app.settings(),
+            Settings {
+                automatic_update_checks: false,
+                release_channel: ReleaseChannel::Prerelease,
+                download_behavior: DownloadBehavior::TempOnly,
+                show_message_ids: true,
+            }
+        );
+        assert_eq!(
+            Settings::load_from(&path).expect("persisted settings"),
+            *app.settings()
+        );
+
+        app.handle_action(KeyAction::Escape);
+        assert_eq!(app.mode, Mode::Navigate);
+        fs::remove_file(path).expect("remove settings");
+        fs::remove_dir(directory).expect("remove settings directory");
+    }
+
+    #[test]
+    fn update_notification_is_sanitized_and_kept_separate_from_status() {
+        let mut app = App::new();
+        app.status_message = Some("Message failed".to_owned());
+        app.set_available_update(" 0.1.9\u{1b}[31m ");
+        assert_eq!(app.available_update(), Some("0.1.9"));
+        assert_eq!(app.status_message.as_deref(), Some("Message failed"));
+        app.clear_available_update();
+        assert_eq!(app.available_update(), None);
+
+        app.settings.automatic_update_checks = false;
+        app.set_available_update("0.2.0");
+        assert_eq!(app.available_update(), None);
+    }
+
+    #[test]
+    fn temp_only_downloads_never_reveal_remote_files() {
+        let mut app = ready_app();
+        app.settings.download_behavior = DownloadBehavior::TempOnly;
+        open_first(&mut app);
+        let mut attachment = message(21, 1, "", false);
+        attachment.attachment = Some(Attachment {
+            kind: AttachmentKind::File,
+            file_name: Some("remote.command".to_owned()),
+            mime_type: None,
+            size: Some(1),
+            fallback_emoji: None,
+        });
+        app.messages.get_mut(&1).unwrap().push(attachment);
+        let path = std::env::temp_dir().join(format!("termgram-temp-only-{}", std::process::id()));
+        fs::write(&path, b"x").expect("download fixture");
+        app.handle_network(NetworkEvent::AttachmentDownloaded {
+            chat_id: 1,
+            message_id: 21,
+            path: path.clone(),
+        });
+        app.selected_message = Some(21);
+
+        assert!(app.handle_action(KeyAction::Enter).is_empty());
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("reveal is disabled")));
+        fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
     fn q_is_text_in_an_editor_but_quits_in_navigation() {
         let mut app = ready_app();
         app.handle_action(KeyAction::Character('/'));
@@ -2572,6 +3010,123 @@ mod tests {
     }
 
     #[test]
+    fn reply_selection_jumps_to_a_cached_target() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let replying = app
+            .messages
+            .get_mut(&1)
+            .unwrap()
+            .iter_mut()
+            .find(|message| message.id == 20)
+            .unwrap();
+        replying.reply_to = Some(ReplyInfo {
+            message_id: 5,
+            chat_id: 1,
+            sender: Some("Them".to_owned()),
+        });
+
+        assert!(app.handle_action(KeyAction::Character('o')).is_empty());
+        assert_eq!(app.selected_message, Some(20));
+        assert!(app.handle_action(KeyAction::Character('r')).is_empty());
+        assert_eq!(app.selected_message, Some(5));
+        assert_eq!(app.viewport_anchor_message, Some(5));
+        assert!(app.message_scroll > 0);
+    }
+
+    #[test]
+    fn reply_navigation_loads_an_uncached_target_and_ignores_stale_results() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let replying = app.messages.get_mut(&1).unwrap().last_mut().unwrap();
+        replying.reply_to = Some(ReplyInfo {
+            message_id: 80,
+            chat_id: 1,
+            sender: None,
+        });
+        app.handle_action(KeyAction::Character('o'));
+        assert_eq!(
+            app.handle_action(KeyAction::Character('r')),
+            vec![TelegramCommand::LoadMessage {
+                chat_id: 1,
+                source_message_id: 20,
+                message_id: 80,
+                request_id: 2,
+            }]
+        );
+        app.handle_network(NetworkEvent::MessageLoadFailed {
+            chat_id: 1,
+            message_id: 80,
+            request_id: 999,
+            error: "stale".to_owned(),
+        });
+        assert!(app
+            .status_message
+            .as_deref()
+            .is_some_and(|status| status.contains("Loading reply")));
+
+        let mut target = message(80, 1, "reply target", false);
+        target.sender = "Target author".to_owned();
+        app.handle_network(NetworkEvent::MessageLoaded {
+            chat_id: 1,
+            message_id: 80,
+            request_id: 2,
+            message: target,
+        });
+        assert_eq!(app.selected_message, Some(80));
+        assert_eq!(app.viewport_anchor_message, Some(80));
+        assert!(app
+            .active_messages()
+            .iter()
+            .any(|message| message.id == 80 && message.text == "reply target"));
+        assert_eq!(
+            app.active_messages()
+                .iter()
+                .find(|message| message.id == 20)
+                .and_then(|message| message.reply_to.as_ref())
+                .and_then(|reply| reply.sender.as_deref()),
+            Some("Target author")
+        );
+    }
+
+    #[test]
+    fn cross_chat_reply_navigation_uses_the_returned_target_conversation() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let replying = app.messages.get_mut(&1).unwrap().last_mut().unwrap();
+        replying.reply_to = Some(ReplyInfo {
+            message_id: 99,
+            chat_id: 2,
+            sender: Some("@beta".to_owned()),
+        });
+        app.handle_action(KeyAction::Character('o'));
+        let commands = app.handle_action(KeyAction::Character('r'));
+        assert_eq!(
+            commands,
+            vec![TelegramCommand::LoadMessage {
+                chat_id: 1,
+                source_message_id: 20,
+                message_id: 99,
+                request_id: 2,
+            }]
+        );
+
+        let commands = app.handle_network(NetworkEvent::MessageLoaded {
+            chat_id: 1,
+            message_id: 99,
+            request_id: 2,
+            message: message(99, 2, "from beta", false),
+        });
+
+        assert_eq!(app.active_chat_id, Some(2));
+        assert_eq!(app.selected_message, Some(99));
+        assert_eq!(app.viewport_anchor_message, Some(99));
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, TelegramCommand::LoadHistory { chat_id: 2, .. })));
+    }
+
+    #[test]
     fn failed_attachment_remains_selectable_and_retries_exact_path() {
         let mut app = ready_app();
         open_first(&mut app);
@@ -2614,6 +3169,7 @@ mod tests {
             id: -1,
             chat_id: 1,
             sender: "You".to_owned(),
+            reply_to: None,
             text: String::new(),
             timestamp: Utc::now(),
             outgoing: true,

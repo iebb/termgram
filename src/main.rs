@@ -1,24 +1,45 @@
 use std::collections::VecDeque;
 use std::io;
+use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use termgram::app::{AppState, Screen};
-use termgram::config::Config;
+use termgram::config::{Config, ReleaseChannel, Settings};
 use termgram::event::{AppEvent, NetworkEvent, TelegramCommand};
 use termgram::telegram::{self, TelegramHandle};
 use termgram::terminal::{install_panic_restore_hook, TerminalGuard};
 use termgram::ui;
-use tokio::sync::mpsc;
+use termgram::update::{self, UpdateOutcome, UpdateStatus};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 
 enum RuntimeEvent {
     Terminal(Option<io::Result<Event>>),
     Network(Box<Option<NetworkEvent>>),
+    UpdateCheck {
+        channel: ReleaseChannel,
+        result: UpdateCheckResult,
+    },
     ShutdownSignal(io::Result<()>),
     Tick,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandLine {
+    Tui,
+    Version,
+    Help,
+    Update(Option<ReleaseChannel>),
+}
+
+type UpdateCheckResult = std::result::Result<Option<UpdateStatus>, String>;
+
+struct UpdateCheck {
+    channel: ReleaseChannel,
+    receiver: oneshot::Receiver<UpdateCheckResult>,
 }
 
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
@@ -27,14 +48,27 @@ const MAX_PENDING_COMMANDS: usize = 64;
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
-    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
-        println!("tg {}", termgram::VERSION);
-        return Ok(());
+    match parse_arguments(std::env::args().skip(1))? {
+        CommandLine::Version => {
+            println!("tg {}", termgram::VERSION);
+            return Ok(());
+        }
+        CommandLine::Help => {
+            print_help();
+            return Ok(());
+        }
+        CommandLine::Update(channel) => {
+            run_update_command(channel)?;
+            return Ok(());
+        }
+        CommandLine::Tui => {}
     }
 
     install_panic_restore_hook();
     let mut terminal = TerminalGuard::enter().context("failed to initialize the terminal")?;
-    let mut app = AppState::new();
+    let (mut app, settings) = load_app_settings();
+    let mut update_check = spawn_update_check(settings);
+    let mut update_preferences = settings;
 
     let (mut commands, mut events, mut worker) = match Config::load() {
         Ok(config) => {
@@ -88,12 +122,14 @@ async fn main() -> Result<()> {
             tokio::select! {
                 event = input.next() => RuntimeEvent::Terminal(event),
                 event = network.recv() => RuntimeEvent::Network(Box::new(event)),
+                (channel, result) = wait_for_update_check(&mut update_check) => RuntimeEvent::UpdateCheck { channel, result },
                 result = &mut shutdown_signal => RuntimeEvent::ShutdownSignal(result),
                 () = animation_tick => RuntimeEvent::Tick,
             }
         } else {
             tokio::select! {
                 event = input.next() => RuntimeEvent::Terminal(event),
+                (channel, result) = wait_for_update_check(&mut update_check) => RuntimeEvent::UpdateCheck { channel, result },
                 result = &mut shutdown_signal => RuntimeEvent::ShutdownSignal(result),
                 () = animation_tick => RuntimeEvent::Tick,
             }
@@ -136,6 +172,23 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            RuntimeEvent::UpdateCheck { channel, result } => {
+                update_check = None;
+                if app.settings().automatic_update_checks
+                    && app.settings().release_channel == channel
+                {
+                    match result {
+                        Ok(Some(UpdateStatus::Available { version, .. })) => {
+                            app.set_available_update(&version);
+                        }
+                        Ok(Some(UpdateStatus::UpToDate) | None) => app.clear_available_update(),
+                        Err(_) => {}
+                    }
+                } else if app.settings().automatic_update_checks {
+                    update_check = spawn_update_check(*app.settings());
+                }
+                Vec::new()
+            }
             RuntimeEvent::ShutdownSignal(Ok(())) => {
                 app.handle_action(termgram::input::KeyAction::Quit)
             }
@@ -149,6 +202,7 @@ async fn main() -> Result<()> {
         };
 
         dispatch(&mut app, &mut commands, &mut pending_commands, outgoing);
+        synchronize_update_preferences(&mut app, &mut update_preferences, &mut update_check);
     }
 
     drop(terminal);
@@ -164,6 +218,160 @@ async fn main() -> Result<()> {
     }
 
     runtime_error.map_or(Ok(()), Err)
+}
+
+fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<CommandLine> {
+    let Some(command) = arguments.next() else {
+        return Ok(CommandLine::Tui);
+    };
+    match command.as_str() {
+        "--version" | "-V" => {
+            ensure_no_more_arguments(&mut arguments)?;
+            Ok(CommandLine::Version)
+        }
+        "--help" | "-h" => {
+            ensure_no_more_arguments(&mut arguments)?;
+            Ok(CommandLine::Help)
+        }
+        "update" => {
+            let mut channel = None;
+            for argument in arguments.by_ref() {
+                let selected = match argument.as_str() {
+                    "--stable" => ReleaseChannel::Stable,
+                    "--prerelease" => ReleaseChannel::Prerelease,
+                    "--help" | "-h" => {
+                        ensure_no_more_arguments(&mut arguments)?;
+                        return Ok(CommandLine::Help);
+                    }
+                    _ => bail!("unknown update option {argument:?}; run `tg --help`"),
+                };
+                if channel.replace(selected).is_some() {
+                    bail!("choose only one update channel");
+                }
+            }
+            Ok(CommandLine::Update(channel))
+        }
+        _ => bail!("unknown argument {command:?}; run `tg --help`"),
+    }
+}
+
+fn ensure_no_more_arguments(arguments: &mut impl Iterator<Item = String>) -> Result<()> {
+    if let Some(argument) = arguments.next() {
+        bail!("unexpected argument {argument:?}; run `tg --help`");
+    }
+    Ok(())
+}
+
+fn print_help() {
+    println!(
+        "Termgram — essential Telegram messaging in the terminal\n\n\
+         Usage:\n  tg                         Open the TUI\n  \
+         tg update [--stable|--prerelease]\n                             Install the newest release\n  \
+         tg --version             Print the installed version\n  \
+         tg --help                Show this help\n\n\
+         Press s while navigating to configure update checks, release channel,\n\
+         and downloaded-file behavior."
+    );
+}
+
+fn run_update_command(channel: Option<ReleaseChannel>) -> Result<()> {
+    let channel = match channel {
+        Some(channel) => channel,
+        None => {
+            Settings::load()
+                .context("could not load the saved update channel; pass --stable or --prerelease")?
+                .release_channel
+        }
+    };
+    println!("Checking the {} channel…", channel.label().to_lowercase());
+    match update::run(channel).context("Termgram update failed")? {
+        UpdateOutcome::UpToDate => println!("tg {} is up to date", termgram::VERSION),
+        UpdateOutcome::Installed { version } => println!("Updated tg to {version}"),
+        UpdateOutcome::Staged { version, path } => println!(
+            "Downloaded tg {version} to {}; replacement will finish after this process exits",
+            path.display()
+        ),
+    }
+    Ok(())
+}
+
+fn load_app_settings() -> (AppState, Settings) {
+    let path = match Settings::path() {
+        Ok(path) => path,
+        Err(error) => {
+            let settings = Settings {
+                automatic_update_checks: false,
+                ..Settings::default()
+            };
+            let mut app = AppState::with_ephemeral_settings(settings);
+            app.handle_network(NetworkEvent::Error(format!(
+                "Could not locate settings: {error:#}"
+            )));
+            return (app, settings);
+        }
+    };
+    match Settings::load_from(&path) {
+        Ok(settings) => (AppState::with_settings(settings, path), settings),
+        Err(error) => {
+            let settings = Settings {
+                automatic_update_checks: false,
+                ..Settings::default()
+            };
+            let mut app = AppState::with_settings(settings, path);
+            app.handle_network(NetworkEvent::Error(format!(
+                "Could not load settings: {error:#}"
+            )));
+            (app, settings)
+        }
+    }
+}
+
+fn spawn_update_check(settings: Settings) -> Option<UpdateCheck> {
+    if !settings.automatic_update_checks {
+        return None;
+    }
+    let (sender, receiver) = oneshot::channel();
+    thread::Builder::new()
+        .name("termgram-update-check".to_owned())
+        .spawn(move || {
+            let result = update::check_if_due(settings.release_channel)
+                .map_err(|error| format!("{error:#}"));
+            drop(sender.send(result));
+        })
+        .ok()?;
+    Some(UpdateCheck {
+        channel: settings.release_channel,
+        receiver,
+    })
+}
+
+fn synchronize_update_preferences(
+    app: &mut AppState,
+    previous: &mut Settings,
+    update_check: &mut Option<UpdateCheck>,
+) {
+    let current = *app.settings();
+    if current.automatic_update_checks != previous.automatic_update_checks
+        || current.release_channel != previous.release_channel
+    {
+        if current.automatic_update_checks && update_check.is_none() {
+            *update_check = spawn_update_check(current);
+        }
+        app.clear_available_update();
+    }
+    *previous = current;
+}
+
+async fn wait_for_update_check(
+    update_check: &mut Option<UpdateCheck>,
+) -> (ReleaseChannel, UpdateCheckResult) {
+    let Some(update_check) = update_check else {
+        return std::future::pending().await;
+    };
+    let result = (&mut update_check.receiver)
+        .await
+        .unwrap_or_else(|_| Err("update-check worker stopped unexpectedly".to_owned()));
+    (update_check.channel, result)
 }
 
 async fn wait_for_animation_tick(enabled: bool) {
@@ -256,6 +464,17 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
             request_id,
             error: "Telegram command queue is busy".to_owned(),
         },
+        TelegramCommand::LoadMessage {
+            chat_id,
+            source_message_id: _,
+            message_id,
+            request_id,
+        } => NetworkEvent::MessageLoadFailed {
+            chat_id,
+            message_id,
+            request_id,
+            error: "Telegram command queue is busy".to_owned(),
+        },
         TelegramCommand::MarkRead { chat_id } => NetworkEvent::ReadMarkFailed {
             chat_id,
             error: "Telegram command queue is busy".to_owned(),
@@ -288,5 +507,72 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_arguments, synchronize_update_preferences, CommandLine, UpdateCheck};
+    use termgram::{
+        app::AppState,
+        config::{ReleaseChannel, Settings},
+    };
+
+    fn parse(arguments: &[&str]) -> anyhow::Result<CommandLine> {
+        parse_arguments(arguments.iter().map(ToString::to_string))
+    }
+
+    #[test]
+    fn command_line_defaults_to_the_tui() {
+        assert_eq!(parse(&[]).expect("command"), CommandLine::Tui);
+    }
+
+    #[test]
+    fn command_line_selects_update_channels() {
+        assert_eq!(
+            parse(&["update"]).expect("saved channel"),
+            CommandLine::Update(None)
+        );
+        assert_eq!(
+            parse(&["update", "--stable"]).expect("stable"),
+            CommandLine::Update(Some(ReleaseChannel::Stable))
+        );
+        assert_eq!(
+            parse(&["update", "--prerelease"]).expect("prerelease"),
+            CommandLine::Update(Some(ReleaseChannel::Prerelease))
+        );
+    }
+
+    #[test]
+    fn command_line_rejects_unknown_or_ambiguous_arguments() {
+        assert!(parse(&["wat"]).is_err());
+        assert!(parse(&["--version", "extra"]).is_err());
+        assert!(parse(&["update", "--stable", "--prerelease"]).is_err());
+        assert!(parse(&["update", "--help", "extra"]).is_err());
+    }
+
+    #[test]
+    fn disabling_update_checks_ignores_inflight_result_and_clears_the_hint() {
+        let settings = Settings {
+            automatic_update_checks: false,
+            ..Settings::default()
+        };
+        let mut app = AppState::with_settings(
+            settings,
+            std::env::temp_dir().join("unused-termgram-settings"),
+        );
+        app.set_available_update("0.1.9");
+        let mut previous = Settings::default();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let mut receiver = Some(UpdateCheck {
+            channel: ReleaseChannel::Stable,
+            receiver,
+        });
+
+        synchronize_update_preferences(&mut app, &mut previous, &mut receiver);
+
+        assert!(receiver.is_some());
+        assert_eq!(previous, settings);
+        assert_eq!(app.available_update(), None);
     }
 }

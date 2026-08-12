@@ -22,7 +22,85 @@ Broadcast channels are intentionally hidden. Telegram requires third-party
 clients that display channels to implement additional sponsored-message
 behavior, which is outside this essential messaging scope.
 
-## Setup
+## Install
+
+Prebuilt releases currently target x86_64 Linux, Apple silicon macOS (arm64),
+and x64 Windows. The installers reject other operating-system architectures
+before downloading a binary. Linux and macOS also require Bash, `curl`, `tar`,
+and either `sha256sum` or `shasum`; Windows requires PowerShell 5.1 or newer.
+
+On Linux or macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSfL \
+  https://github.com/iebb/termgram/releases/latest/download/install.sh | bash
+```
+
+This installs `tg` in `~/.local/bin`. To install the newest prerelease, or use
+another directory, pass noninteractive environment overrides to `bash`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSfL \
+  https://github.com/iebb/termgram/releases/latest/download/install.sh \
+  | CHANNEL=prerelease INSTALL_DIR="$HOME/bin" bash
+```
+
+The shortest form pipes the download directly into the shell. To inspect the
+installer first, download it and run the saved copy only after reviewing it:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fLo termgram-install.sh \
+  https://github.com/iebb/termgram/releases/latest/download/install.sh
+less termgram-install.sh
+bash termgram-install.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+$installer = Invoke-RestMethod 'https://github.com/iebb/termgram/releases/latest/download/install.ps1'
+& ([scriptblock]::Create([string]$installer))
+```
+
+The default destination is `%LOCALAPPDATA%\Programs\Termgram\bin`. Parameters
+provide the same noninteractive overrides:
+
+```powershell
+& ([scriptblock]::Create([string]$installer)) -Channel prerelease -BinDir "$HOME\bin"
+```
+
+To inspect before executing:
+
+```powershell
+Invoke-WebRequest 'https://github.com/iebb/termgram/releases/latest/download/install.ps1' -OutFile termgram-install.ps1
+Get-Content termgram-install.ps1
+$installer = Get-Content termgram-install.ps1 -Raw
+& ([scriptblock]::Create($installer))
+```
+
+Both installers default to the highest stable `0.1.Z` release. The prerelease
+channel chooses the highest `0.1.Z` release of either type, so it never
+downgrades past a newer stable release. Downloads come from the public
+`iebb/termgram` repository and are checked against that release's
+`SHA256SUMS`; the archive must contain only `tg` or `tg.exe`. Replacement is
+atomic and fails without damaging an existing binary. The scripts do not ask
+for elevation or edit `PATH`; if the destination is not already present, they
+print the directory to add.
+
+After installation, launch Termgram with `tg`. Update within the terminal with
+`tg update`, or opt into the newest prerelease with `tg update --prerelease`.
+Termgram checks the selected channel at most once per day in the background and
+shows a quiet footer hint when an update is available; applying it is always an
+explicit command. The updater trusts GitHub's HTTPS release delivery and uses
+`SHA256SUMS` to verify download integrity before atomic replacement.
+
+Press `s` while navigating to open the small settings overlay. It stores only
+four non-sensitive preferences: automatic update checks, stable/prerelease
+channel, temporary-download reveal behavior, and the optional right-aligned
+message-ID column. Settings use the platform config directory; Telegram login
+credentials remain exclusively in the separate session database.
+
+## Source build
 
 Official GitHub release archives include the project's Telegram application
 credentials from encrypted Actions secrets, so those binaries can go directly
@@ -82,6 +160,7 @@ credentials and Telegram update state survive restarts.
 | Chats | `↑`/`↓` or `j`/`k` move, `Enter` open, `/` filter |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
 | Message actions | click or use `o`/`O` to select; `Enter` downloads/reveals media, `l` follows its Telegram link |
+| Replies | reply rows show `↩`, target ID, and `@username`/sender; select with `o`/`O`, then `r` jumps to the target |
 | Wide layout | `Tab` switch pane |
 | Narrow conversation | `Esc` return to chats |
 | Composer | `i` or `Enter` start, `Enter` send, `Ctrl+J`/`Shift+Enter` newline, `Esc` preserve draft |
@@ -89,7 +168,8 @@ credentials and Telegram update state survive restarts.
 
 `?` opens contextual help while navigating. In a conversation, `/` starts a
 message so Telegram bot commands remain usable; chat filtering is only active
-from the chat list.
+from the chat list. Press `s` to configure the message-ID column and the other
+essential preferences.
 
 Drag one or more files from the desktop into an open conversation and drop them
 on the terminal. JPG, JPEG, PNG, and WebP files are sent as compressed Telegram
@@ -126,7 +206,7 @@ affiliated with Telegram.
 ## Intentionally out of scope
 
 Broadcast channels, reactions, sticker/GIF selection, calls, stories, contacts,
-chat creation, replies, edits/deletes/forwarding, message search, group
+chat creation, composing replies, edits/deletes/forwarding, message search, group
 administration, notifications, polls, and secret chats.
 
 ## Development
@@ -142,8 +222,8 @@ cargo build --release
 
 Pushing an ordinary commit to the default branch creates a GitHub prerelease
 after every check and all three native builds pass. Release publication reuses
-those exact tested artifacts and adds `SHA256SUMS`; a failed CI run never
-publishes anything.
+those exact tested artifacts, the two installation scripts, and `SHA256SUMS`;
+a failed CI run never publishes anything.
 
 To promote the current tree as a stable release, create a release commit and
 push it:

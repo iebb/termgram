@@ -6,6 +6,7 @@ pub mod model;
 pub mod telegram;
 pub mod terminal;
 pub mod ui;
+pub mod update;
 
 /// Version embedded into distributable binaries by CI. Source builds fall
 /// back to the package's base development version.

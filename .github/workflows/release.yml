@@ -165,6 +165,28 @@ jobs:
             gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$known_hosts"
           }
 
+          wait_for_tag_sha() {
+            local tag="$1"
+            local expected_sha="$2"
+            local actual_sha=
+            local attempt
+
+            # Git accepts the tag before the REST commit endpoint always sees it.
+            # Retry that eventual-consistency window, while still failing closed
+            # if the newly visible tag points anywhere unexpected.
+            for attempt in {1..10}; do
+              if actual_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" \
+                  --jq .sha 2>/dev/null)"; then
+                test "$actual_sha" = "$expected_sha"
+                return
+              fi
+              sleep 2
+            done
+
+            echo "Tag $tag was pushed but did not become visible through the API" >&2
+            return 1
+          }
+
           while IFS=$'\t' read -r source_sha _height version; do
             tag="v$version"
             subject="$(git show -s --format=%s "$source_sha")"
@@ -188,7 +210,7 @@ jobs:
               git tag "$tag" "$source_sha"
               GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts" \
                 git push "git@github.com:$GITHUB_REPOSITORY.git" "refs/tags/$tag"
-              test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha)" = "$source_sha"
+              wait_for_tag_sha "$tag" "$source_sha"
             fi
 
             if release_json="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" \

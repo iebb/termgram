@@ -155,4 +155,6 @@ git push
 
 Versions stay on the `0.1` line for now. `Z` advances once per first-parent
 default-branch commit, so merge internals do not unexpectedly consume several
-versions. Existing tags are never moved; a height collision fails closed.
+versions. Failed or interrupted publications are retried by the next push.
+Existing tags are never moved; a height collision fails closed. Automatic
+publishing starts at `0.1.2`, the commit that introduced this release pipeline.

@@ -29,29 +29,38 @@ jobs:
         shell: bash
         env:
           AFTER_SHA: ${{ github.sha }}
-          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(git rev-parse --is-shallow-repository)" = "false"
 
-          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
-            if [[ ! "$BEFORE_SHA" =~ ^0+$ ]]; then
-              git merge-base --is-ancestor "$BEFORE_SHA" "$AFTER_SHA"
-              git rev-list --first-parent --reverse "$BEFORE_SHA..$AFTER_SHA" > commits.txt
-            else
-              printf '%s\n' "$AFTER_SHA" > commits.txt
-            fi
-          else
-            printf '%s\n' "$AFTER_SHA" > commits.txt
-          fi
-          test -s commits.txt
-
           : > release-plan.tsv
-          while IFS= read -r sha; do
-            height="$(git rev-list --first-parent --count "$sha")"
-            test "$height" -gt 0
-            printf '%s\t%s\t0.1.%s\n' "$sha" "$height" "$height" >> release-plan.tsv
-          done < commits.txt
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | select(.draft == false) | .tag_name' > published-tags.txt
+            height=0
+            while IFS= read -r sha; do
+              height=$((height + 1))
+              # Automatic publishing began at height 2. Older source did not
+              # yet contain the build-version entry point.
+              if ((height < 2)); then
+                continue
+              fi
+              tag="v0.1.$height"
+              if grep -Fxq "$tag" published-tags.txt; then
+                test "$(git rev-list -n 1 "$tag")" = "$sha"
+              else
+                printf '%s\t%s\t0.1.%s\n' "$sha" "$height" "$height" \
+                  >> release-plan.tsv
+              fi
+            done < <(git rev-list --first-parent --reverse "$AFTER_SHA")
+          else
+            height="$(git rev-list --first-parent --count "$AFTER_SHA")"
+            printf '%s\t%s\t0.1.%s\n' "$AFTER_SHA" "$height" "$height" \
+              >> release-plan.tsv
+          fi
+          test -s release-plan.tsv
 
           plan="$(jq -Rsc '
             split("\n")
@@ -132,6 +141,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           while IFS=$'\t' read -r sha version; do
+            sha="${sha%$'\r'}"
+            version="${version%$'\r'}"
             git checkout --detach "$sha"
             export TERMGRAM_BUILD_VERSION="$version"
             cargo test --locked --all-targets --all-features

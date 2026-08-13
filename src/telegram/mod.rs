@@ -1407,7 +1407,8 @@ async fn handle_command(
         | TelegramCommand::SubmitPhone(_)
         | TelegramCommand::SubmitCode(_)
         | TelegramCommand::SubmitPassword(_)
-        | TelegramCommand::RestartAuth => {}
+        | TelegramCommand::RestartAuth
+        | TelegramCommand::SwitchAccount { .. } => {}
     }
     Ok(false)
 }

@@ -32,6 +32,8 @@ pub enum KeyAction {
     Clear,
     DeleteWord,
     Redraw,
+    NextAccount,
+    AddAccount,
 }
 
 /// Convert a crossterm key event into an action understood by the app.
@@ -89,6 +91,8 @@ pub fn key_action(event: KeyEvent) -> Option<KeyAction> {
         KeyCode::PageDown => Some(KeyAction::PageDown),
         KeyCode::Home => Some(KeyAction::Home),
         KeyCode::End => Some(KeyAction::End),
+        KeyCode::F(2) => Some(KeyAction::NextAccount),
+        KeyCode::F(3) => Some(KeyAction::AddAccount),
         _ => None,
     }
 }
@@ -322,6 +326,18 @@ mod tests {
         assert_eq!(
             key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
             Some(KeyAction::Character('q'))
+        );
+    }
+
+    #[test]
+    fn function_keys_select_account_actions() {
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(KeyAction::NextAccount)
+        );
+        assert_eq!(
+            key_action(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(KeyAction::AddAccount)
         );
     }
 

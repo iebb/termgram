@@ -37,7 +37,9 @@ pub fn install_panic_restore_hook() {
 }
 
 impl TerminalGuard {
-    /// Enter raw alternate-screen mode and enable paste/focus reporting.
+    /// Enter raw alternate-screen mode and request paste, focus, and mouse
+    /// reporting. Terminals that do not report mouse events remain fully
+    /// keyboard-operable.
     ///
     /// # Errors
     ///

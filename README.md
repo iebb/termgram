@@ -7,7 +7,7 @@ direct messages and groups.
 The first release deliberately does less:
 
 - phone/login-code, optional 2FA password, and QR-code authentication;
-- locally persisted Telegram session;
+- up to eight locally persisted Telegram accounts with fast in-app switching;
 - direct-message and group conversation list with unread counts;
 - recent history, live incoming messages, and read acknowledgements;
 - plain-text messages with a Unicode-aware, multiline, per-chat draft;
@@ -15,6 +15,7 @@ The first release deliberately does less:
 - lazy download and opening of incoming photos, files, video, audio, and stickers;
 - in-app navigation for supported Telegram chat and message links;
 - sticker and custom-emoji Unicode fallbacks;
+- optional terminal mouse input for chats, media, scrolling, settings, and accounts;
 - wide split-pane and narrow single-pane layouts;
 - chat filtering, contextual help, connection/error states, and safe terminal cleanup.
 
@@ -98,11 +99,11 @@ On Windows, replacement completes after the updating process exits. If another
 `tg` process keeps the executable locked, the next launch shows a fixed warning
 and `tg update` performs a fresh verified download.
 
-Press `s` while navigating to open the small settings overlay. It stores only
-four non-sensitive preferences: automatic update checks, stable/prerelease
-channel, temporary-download reveal behavior, and the optional right-aligned
-message-ID column. Settings use the platform config directory; Telegram login
-credentials remain exclusively in the separate session database.
+Press `s` while navigating to open the small settings overlay. It stores four
+non-sensitive preferences: automatic update checks, stable/prerelease channel,
+temporary-download reveal behavior, and the optional right-aligned message-ID
+column. The same private settings file remembers the selected account slot;
+Telegram login credentials remain exclusively in separate session databases.
 
 ## Source build
 
@@ -128,8 +129,10 @@ Termgram uses Rust 1.88, installed automatically by `rustup` from the pinned
 `rust-toolchain.toml`. The session database defaults to the operating system's
 application-data directory. It is effectively an account credential; keep it
 private and never commit or share it. Set `TERMGRAM_SESSION` to override its
-location. Upgrades continue to recognize `TUIGRAM_SESSION` and an existing
-TUIGram session database, so renaming the application does not sign you out.
+location for Account 1; additional account sessions use a private `accounts`
+subdirectory beside it. Upgrades continue to recognize `TUIGRAM_SESSION` and an
+existing TUIGram session database, so renaming the application does not sign
+you out.
 
 After the first build, launch the optimized client directly with:
 
@@ -164,9 +167,10 @@ credentials and Telegram update state survive restarts.
 
 | Context | Keys |
 | --- | --- |
-| Anywhere | `Ctrl+C` quit, `Ctrl+L` redraw |
-| Sign in | `Enter` submit, `Tab` switch from phone to QR login, `Esc` return to phone |
+| Anywhere | `Ctrl+C` quit, `Ctrl+L` redraw, `F2` next account, `F3` add account |
+| Sign in | `Enter` submit, `Tab` opens QR login or switches its compact/full-cell display, `Esc` return to phone |
 | Chats | `↑`/`↓` or `j`/`k` move, `Enter` open, `/` filter |
+| Accounts | `a` open picker, `↑`/`↓` select, `Enter` switch/add, `1`–`8` direct |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
 | Message actions | click or use `o`/`O` to select; `Enter` downloads/reveals media, `l` follows its Telegram link |
 | Replies | reply rows show `↩`, target ID, and `@username`/sender; select with `o`/`O`, then `r` jumps to the target |
@@ -180,11 +184,23 @@ message so Telegram bot commands remain usable; chat filtering is only active
 from the chat list. Press `s` to configure the message-ID column and the other
 essential preferences.
 
+When the terminal supports mouse reporting, clicking a chat opens it, clicking
+media activates it, and the wheel scrolls the pane under the pointer. Settings
+and account rows are clickable too. Every mouse action has a keyboard equivalent,
+so terminals without mouse reporting remain fully usable.
+
+Account switching keeps Termgram lightweight: only one account is connected at
+a time. Each account has an isolated private SQLite session. Press `a` from the
+chat list for the picker, or use `F2`/`F3` even from login and error screens so
+an unfinished new login never traps you away from an existing account.
+
 During sign-in, Termgram shows a fixed progress message while Telegram checks a
 phone number, login code, or 2FA password. Password entry stays masked. QR login
 rotates its short-lived code automatically; scan it from Telegram on a device
-where the account is already signed in. QR tokens, codes, passwords, and phone
-numbers are never written to settings or logs.
+where the account is already signed in. Its compact display fits an 80 × 24
+terminal; press `Tab` for a larger compatibility display made only from colored
+spaces when half-block glyphs render poorly. QR tokens, codes, passwords, and
+phone numbers are never written to settings or logs.
 
 Drag one or more files from the desktop into an open conversation and drop them
 on the terminal. JPG, JPEG, PNG, and WebP files are sent as compressed Telegram

@@ -10,7 +10,9 @@ use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{telegram_link, AppState, AttachmentState, AuthPhase, Focus, Mode, Screen};
+use crate::app::{
+    telegram_link, AppState, AttachmentState, AuthPhase, Focus, Mode, QrRenderMode, Screen,
+};
 use crate::config::DownloadBehavior;
 use crate::event::ConnectionStatus;
 use crate::input::TextInput;
@@ -41,19 +43,33 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         Screen::Connecting => render_connecting(frame, area, app),
         Screen::Auth(phase) => render_auth(frame, area, app, phase),
         Screen::Main => render_main(frame, area, app),
-        Screen::Fatal(message) => render_fatal(frame, area, message),
+        Screen::Fatal(message) => render_fatal(frame, area, app, message),
     }
 }
 
 fn render_connecting(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let spinner = spinner(app.tick);
-    let body = Paragraph::new(vec![
-        Line::from(Span::styled("Termgram", Style::default().fg(ACCENT).bold())),
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Termgram · Account {}", app.active_account()),
+            Style::default().fg(ACCENT).bold(),
+        )),
         Line::from(""),
         Line::from(format!("{spinner}  Connecting to Telegram…")),
-    ])
-    .alignment(Alignment::Center);
-    frame.render_widget(body, vertically_centered(area, 3));
+        Line::from(Span::styled(
+            "F2 next account · F3 add account · Ctrl+C quits",
+            Style::default().fg(MUTED),
+        )),
+    ];
+    if let Some(message) = &app.status_message {
+        lines.push(Line::from(Span::styled(
+            message.as_str(),
+            Style::default().fg(WARNING),
+        )));
+    }
+    let height = clamp_u16(lines.len());
+    let body = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(body, vertically_centered(area, height));
 }
 
 fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPhase) {
@@ -70,7 +86,10 @@ fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPh
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(ACCENT))
-            .title(" Termgram · Sign in "),
+            .title(format!(
+                " Termgram · Account {} · Sign in ",
+                app.active_account()
+            )),
         popup,
     );
     let inner = popup.inner(ratatui::layout::Margin {
@@ -137,9 +156,9 @@ fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPh
         );
     }
     let footer = if matches!(phase, AuthPhase::Phone) {
-        "Tab QR sign-in · session stored locally · Ctrl+C quits"
+        "Tab QR · F2 next account · F3 add account · Ctrl+C quits"
     } else {
-        "Esc starts over · your session is stored locally · Ctrl+C quits"
+        "Esc starts over · F2 next account · F3 add account · Ctrl+C quits"
     };
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().fg(MUTED)),
@@ -158,14 +177,16 @@ fn render_qr_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, url: &str) 
     };
 
     let modules = code.width().saturating_add(QR_QUIET_ZONE * 2);
-    let qr_width = clamp_u16(modules);
-    let qr_height = clamp_u16(modules.saturating_add(1) / 2);
-    // Pairing two QR module rows into each half-block leaves one terminal row
-    // for instructions, so a real Telegram token fits a standard 80 × 24 PTY.
+    let mode = app.qr_render_mode();
+    let (qr_width, qr_height) = qr_dimensions(modules, mode);
     let required_height = qr_height.saturating_add(1);
     if area.width < qr_width || area.height < required_height {
+        let (mode_name, alternative) = match mode {
+            QrRenderMode::Compact => ("Compact", "full-cell"),
+            QrRenderMode::Compatible => ("Full-cell", "compact"),
+        };
         let message = format!(
-            "QR sign-in needs at least {qr_width} × {required_height} terminal cells. Resize, or press Esc to use your phone number."
+            "{mode_name} QR needs at least {qr_width} × {required_height} terminal cells. Resize, press Tab for {alternative} mode, or Esc for phone sign-in."
         );
         render_qr_unavailable(frame, area, &message);
         return;
@@ -176,14 +197,18 @@ fn render_qr_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, url: &str) 
         .saturating_add(area.height.saturating_sub(required_height) / 2);
     let (guidance, style) = if let Some(message) = &app.status_message {
         (
-            format!("{message} · Esc phone"),
+            format!("{message} · Tab display · F2 next · F3 add · Esc phone"),
             Style::default().fg(DANGER),
         )
     } else {
+        let alternative = match mode {
+            QrRenderMode::Compact => "full",
+            QrRenderMode::Compatible => "compact",
+        };
         (
             format!(
-                "{} Waiting · Telegram Settings → Devices → Link Desktop Device · Esc phone",
-                spinner(app.tick)
+                "{} Telegram: Devices→Link Desktop · Tab {alternative} · F2 next · F3 add · Esc phone",
+                spinner(app.tick),
             ),
             Style::default().fg(WARNING).bold(),
         )
@@ -202,6 +227,7 @@ fn render_qr_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, url: &str) 
         Rect::new(qr_x, view_y.saturating_add(1), qr_width, qr_height),
         &code,
         QR_QUIET_ZONE,
+        mode,
     );
 }
 
@@ -224,7 +250,29 @@ fn render_qr_unavailable(frame: &mut Frame<'_>, area: Rect, message: &str) {
     );
 }
 
-fn render_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
+fn qr_dimensions(modules: usize, mode: QrRenderMode) -> (u16, u16) {
+    match mode {
+        QrRenderMode::Compact => (clamp_u16(modules), clamp_u16(modules.saturating_add(1) / 2)),
+        QrRenderMode::Compatible => (clamp_u16(modules.saturating_mul(2)), clamp_u16(modules)),
+    }
+}
+
+fn render_qr_code(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    code: &QrCode,
+    quiet_zone: usize,
+    mode: QrRenderMode,
+) {
+    match mode {
+        QrRenderMode::Compact => render_compact_qr_code(frame, area, code, quiet_zone),
+        QrRenderMode::Compatible => render_compatible_qr_code(frame, area, code, quiet_zone),
+    }
+}
+
+/// Pair two QR rows into each terminal row. This is the only mode that uses a
+/// Unicode block glyph, and keeps a real Telegram token within an 80 x 24 PTY.
+fn render_compact_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
     let modules = code.width().saturating_add(quiet_zone * 2);
     let mut lines = Vec::with_capacity(modules.saturating_add(1) / 2);
     for top_y in (0..modules).step_by(2) {
@@ -242,6 +290,23 @@ fn render_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: 
                 if top == bottom { " " } else { "▀" },
                 Style::default().fg(foreground).bg(background),
             ));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Draw every QR module as two background-colored ASCII spaces. Terminal font
+/// block-glyph support is irrelevant in this mode, and the 2 x 1 cell geometry
+/// keeps modules approximately square in conventional terminal fonts.
+fn render_compatible_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
+    let modules = code.width().saturating_add(quiet_zone * 2);
+    let mut lines = Vec::with_capacity(modules);
+    for y in 0..modules {
+        let mut spans = Vec::with_capacity(modules);
+        for x in 0..modules {
+            let color = qr_terminal_color(qr_module(code, x, y, quiet_zone));
+            spans.push(Span::styled("  ", Style::default().fg(color).bg(color)));
         }
         lines.push(Line::from(spans));
     }
@@ -295,6 +360,8 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         render_help(frame, area);
     } else if app.mode == Mode::Settings {
         render_settings(frame, area, app);
+    } else if app.mode == Mode::Accounts {
+        render_accounts(frame, area, app);
     }
 }
 
@@ -315,6 +382,10 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" Termgram", Style::default().fg(ACCENT).bold()),
+            Span::styled(
+                format!(" · Account {}", app.active_account()),
+                Style::default().fg(MUTED),
+            ),
             Span::styled(format!("  {user}"), Style::default().fg(MUTED)),
         ])),
         chunks[0],
@@ -327,7 +398,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
-fn render_chats(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn render_chats(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    app.set_chat_pane_region((area.x, area.right(), area.y, area.bottom()));
     let focused = app.focus == Focus::Chats && app.mode != Mode::Compose;
     let title = match app.mode {
         Mode::Filter => format!(" Chats · /{} ", app.filter.value()),
@@ -393,6 +465,18 @@ fn render_chats(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     };
     let mut state = ListState::default()
         .with_selected((!visible.is_empty()).then_some(selected.saturating_sub(viewport_start)));
+    let hit_regions = (viewport_start..viewport_end)
+        .enumerate()
+        .map(|(offset, position)| {
+            (
+                area.x.saturating_add(1),
+                area.right().saturating_sub(1),
+                area.y.saturating_add(1).saturating_add(clamp_u16(offset)),
+                position,
+            )
+        })
+        .collect();
+    app.set_chat_hit_regions(hit_regions);
     frame.render_stateful_widget(
         list.block(block)
             .highlight_symbol("› ")
@@ -405,6 +489,7 @@ fn render_chats(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
 #[allow(clippy::too_many_lines)]
 fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    app.set_conversation_pane_region((area.x, area.right(), area.y, area.bottom()));
     let title = app.active_chat().map_or_else(
         || " Conversation ".to_owned(),
         |chat| format!(" {} ", chat.title),
@@ -642,6 +727,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, narrow: bool
         Line::from(" Enter send  ·  drop files to attach  ·  Ctrl+J newline  ·  Esc")
     } else if app.mode == Mode::Settings {
         Line::from(" ↑↓ select  ·  Enter toggle  ·  Esc close settings")
+    } else if app.mode == Mode::Accounts {
+        Line::from(" ↑↓ select  ·  Enter switch/add  ·  Esc close accounts")
     } else if narrow && app.narrow_conversation {
         Line::from(" o action  ·  r reply  ·  Enter media  ·  Esc chats")
     } else {
@@ -654,7 +741,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, narrow: bool
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered(area, area.width.min(72), area.height.min(25));
+    let popup = centered(area, area.width.min(72), area.height.min(27));
     frame.render_widget(Clear, popup);
     let block = Block::new()
         .borders(Borders::ALL)
@@ -675,6 +762,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("l               follow link in selected message/caption"),
         Line::from("/               filter chats (from chat list)"),
         Line::from("s               settings"),
+        Line::from("a               accounts"),
+        Line::from("F2 / F3         next account / add account"),
         Line::from(""),
         Line::from(vec![
             Span::styled("Writing", Style::default().bold()),
@@ -699,7 +788,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let popup = centered(area, area.width.min(68), 17_u16.min(area.height));
     frame.render_widget(Clear, popup);
     let block = Block::new()
@@ -739,6 +828,8 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         )),
         Line::from(""),
     ];
+    let mut hit_regions = Vec::with_capacity(rows.len());
+    let mut row = inner.y.saturating_add(2);
     for (index, (label, value)) in rows.into_iter().enumerate() {
         let selected = index == app.settings_selection();
         let prefix = if selected { "› " } else { "  " };
@@ -756,6 +847,8 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             format!("{prefix}{label}{}{value}", " ".repeat(gap)),
             style,
         )));
+        hit_regions.push((inner.x, inner.right(), row, index));
+        row = row.saturating_add(1);
         if index == 2 {
             lines.push(Line::from(Span::styled(
                 match settings.download_behavior {
@@ -768,6 +861,7 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 },
                 Style::default().fg(MUTED),
             )));
+            row = row.saturating_add(1);
         }
     }
     lines.extend([
@@ -777,10 +871,87 @@ fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             Style::default().fg(MUTED),
         )),
     ]);
+    app.set_settings_hit_regions(hit_regions);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn render_fatal(frame: &mut Frame<'_>, area: Rect, message: &str) {
+fn render_accounts(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
+    let row_count = u16::from(app.account_count()).saturating_add(7);
+    let popup = centered(area, area.width.min(58), row_count.min(area.height));
+    frame.render_widget(Clear, popup);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Telegram accounts ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Only the selected account stays connected.",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+    ];
+    let mut hit_regions = Vec::with_capacity(usize::from(app.account_count()) + 1);
+    for account in 1..=app.account_count() {
+        let selected = app.account_selection() == usize::from(account - 1);
+        let active = account == app.active_account();
+        let label = if active {
+            format!(
+                "Account {account}  ·  {}  (active)",
+                app.user_name.as_deref().unwrap_or("signing in")
+            )
+        } else {
+            format!("Account {account}")
+        };
+        lines.push(account_row(&label, selected));
+        hit_regions.push((
+            inner.x,
+            inner.right(),
+            inner.y.saturating_add(1).saturating_add(u16::from(account)),
+            usize::from(account - 1),
+        ));
+    }
+    let add_selected = app.account_selection() == usize::from(app.account_count());
+    let add_label = if app.account_count() < crate::config::MAX_ACCOUNTS {
+        "+ Add account".to_owned()
+    } else {
+        format!("Account limit reached ({})", crate::config::MAX_ACCOUNTS)
+    };
+    lines.push(account_row(&add_label, add_selected));
+    hit_regions.push((
+        inner.x,
+        inner.right(),
+        inner
+            .y
+            .saturating_add(2)
+            .saturating_add(u16::from(app.account_count())),
+        usize::from(app.account_count()),
+    ));
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "↑↓/j/k select · Enter switch · 1-8 direct · Esc close",
+            Style::default().fg(MUTED),
+        )),
+    ]);
+    app.set_account_hit_regions(hit_regions);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn account_row(label: &str, selected: bool) -> Line<'static> {
+    let prefix = if selected { "› " } else { "  " };
+    let style = if selected {
+        Style::default().fg(Color::Black).bg(ACCENT).bold()
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(format!("{prefix}{label}"), style))
+}
+
+fn render_fatal(frame: &mut Frame<'_>, area: Rect, app: &AppState, message: &str) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -791,7 +962,10 @@ fn render_fatal(frame: &mut Frame<'_>, area: Rect, message: &str) {
             Line::from(message),
             Line::from(""),
             Line::from(Span::styled(
-                "Press q or Ctrl+C to quit",
+                format!(
+                    "Account {} · F2 next · F3 add · q/Ctrl+C quit",
+                    app.active_account()
+                ),
                 Style::default().fg(MUTED),
             )),
         ])
@@ -1172,6 +1346,7 @@ fn vertically_centered(area: Rect, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
     use unicode_width::UnicodeWidthStr;
 
@@ -1312,6 +1487,7 @@ mod tests {
                 release_channel: ReleaseChannel::Prerelease,
                 download_behavior: DownloadBehavior::TempOnly,
                 show_message_ids: false,
+                ..Settings::default()
             },
             std::env::temp_dir().join("unused-termgram-settings.conf"),
         );
@@ -1323,6 +1499,25 @@ mod tests {
         assert!(output.contains("Prerelease"));
         assert!(output.contains("Temp only"));
         assert!(output.contains("never reveals files"));
+    }
+
+    #[test]
+    fn accounts_overlay_marks_active_slot_and_offers_an_isolated_new_one() {
+        let mut app = populated_app_with_settings(Settings {
+            active_account: 2,
+            account_count: 3,
+            ..Settings::default()
+        });
+        app.handle_action(KeyAction::Character('a'));
+        let output = render_text(&app, 100, 30);
+
+        assert!(output.contains("Telegram accounts"));
+        assert!(output.contains("Only the selected account stays connected"));
+        assert!(output.contains("Account 1"));
+        assert!(output.contains("Account 2  ·  Me  (active)"));
+        assert!(output.contains("Account 3"));
+        assert!(output.contains("+ Add account"));
+        assert!(output.contains("1-8 direct"));
     }
 
     #[test]
@@ -1471,15 +1666,38 @@ mod tests {
         }));
 
         let output = render_text(&app, 80, 24);
-        assert!(output.contains("Telegram Settings → Devices → Link Desktop Device"));
-        assert!(output.contains("Waiting"));
+        assert!(output.contains("Devices→Link Desktop"));
+        assert!(output.contains("Tab full"));
         assert!(output.contains("Esc phone"));
         assert!(output.contains('▀'));
         assert!(!output.contains(secret_url));
 
         let small = render_text(&app, 40, 10);
-        assert!(small.contains("QR sign-in needs at least"));
+        assert!(small.contains("Compact QR needs at least"));
         assert!(!small.contains(secret_url));
+
+        assert!(app.handle_action(KeyAction::Tab).is_empty());
+        let too_short = render_text(&app, 80, 24);
+        assert!(too_short.contains("Full-cell QR needs at least"));
+        assert!(too_short.contains("Tab"));
+        assert!(too_short.contains("compact mode"));
+
+        let backend = TestBackend::new(100, 50);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render succeeds");
+        let buffer = terminal.backend().buffer();
+        let compatible_text: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(compatible_text.contains("Tab compact"));
+        assert!(!compatible_text.contains('▀'));
+        assert!(!compatible_text.contains(secret_url));
+        assert!(buffer.content().iter().any(|cell| cell.bg == Color::Black));
+        assert!(buffer.content().iter().any(|cell| cell.bg == Color::White));
     }
 
     #[test]
@@ -1512,12 +1730,15 @@ mod tests {
 
         render_text_mut(&mut app, 120, 24);
         assert!(app.message_hit_region_count() > 0);
+        assert!(app.chat_hit_region_count() > 0);
         render_text_mut(&mut app, 39, 9);
         assert_eq!(app.message_hit_region_count(), 0);
+        assert_eq!(app.chat_hit_region_count(), 0);
 
         app.narrow_conversation = false;
         render_text_mut(&mut app, 70, 24);
         assert_eq!(app.message_hit_region_count(), 0);
+        assert!(app.chat_hit_region_count() > 0);
     }
 
     #[test]

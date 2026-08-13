@@ -86,18 +86,24 @@ async fn main() -> Result<()> {
     let mut update_check = spawn_update_check(settings);
     let mut update_preferences = settings;
 
-    let (mut commands, mut events, mut worker) = match Config::load() {
-        Ok(config) => {
-            let TelegramHandle {
-                commands,
-                events,
-                task,
-            } = telegram::spawn(config);
-            (Some(commands), Some(events), Some(task))
-        }
+    let (mut commands, mut events, mut worker, base_config) = match Config::load() {
+        Ok(config) => match config.for_account(settings.active_account) {
+            Ok(selected) => {
+                let TelegramHandle {
+                    commands,
+                    events,
+                    task,
+                } = telegram::spawn(selected);
+                (Some(commands), Some(events), Some(task), Some(config))
+            }
+            Err(error) => {
+                app.handle_network(NetworkEvent::Fatal(format!("{error:#}")));
+                (None, None, None, Some(config))
+            }
+        },
         Err(error) => {
             app.handle_network(NetworkEvent::Fatal(format!("{error:#}")));
-            (None, None, None)
+            (None, None, None, None)
         }
     };
 
@@ -231,7 +237,37 @@ async fn main() -> Result<()> {
             RuntimeEvent::Tick => app.update(AppEvent::Tick),
         };
 
-        dispatch(&mut app, &mut commands, &mut pending_commands, outgoing);
+        let account_switch = dispatch(&mut app, &mut commands, &mut pending_commands, outgoing);
+        if let Some(account) = account_switch {
+            if let Err(error) = terminal
+                .terminal_mut()
+                .draw(|frame| ui::render(frame, &mut app))
+                .context("failed to draw account-switch feedback")
+            {
+                runtime_error = Some(error);
+                break;
+            }
+            let Some(config) = base_config.as_ref() else {
+                app.handle_network(NetworkEvent::Fatal(
+                    "Telegram configuration is unavailable".to_owned(),
+                ));
+                continue;
+            };
+            if let Err(error) = restart_telegram_worker(
+                config,
+                account,
+                &mut commands,
+                &mut events,
+                &mut worker,
+                &mut pending_commands,
+            )
+            .await
+            {
+                app.handle_network(NetworkEvent::Fatal(format!(
+                    "Could not switch account: {error:#}"
+                )));
+            }
+        }
         synchronize_update_preferences(&mut app, &mut update_preferences, &mut update_check);
     }
 
@@ -299,8 +335,9 @@ fn print_help() {
          tg update [--stable|--prerelease]\n                             Install the newest release\n  \
          tg --version             Print the installed version\n  \
          tg --help                Show this help\n\n\
-         Press s while navigating to configure update checks, release channel,\n\
-         and downloaded-file behavior."
+         Press a while navigating to switch or add Telegram accounts. F2 cycles\n\
+         accounts and F3 adds one even from the sign-in screen. Press s to\n\
+         configure update checks, release channel, and downloaded-file behavior."
     );
 }
 
@@ -417,17 +454,29 @@ fn dispatch(
     commands: &mut Option<mpsc::Sender<TelegramCommand>>,
     pending: &mut VecDeque<TelegramCommand>,
     outgoing: Vec<TelegramCommand>,
-) {
+) -> Option<u8> {
+    let mut account_switch = None;
     for command in outgoing {
+        let command = match command {
+            TelegramCommand::SwitchAccount { account } => {
+                account_switch = Some(account);
+                pending.clear();
+                continue;
+            }
+            command => command,
+        };
         if pending.len() >= MAX_PENDING_COMMANDS {
             reject_overflow(app, command);
         } else {
             pending.push_back(command);
         }
     }
+    if account_switch.is_some() {
+        return account_switch;
+    }
     let Some(sender) = commands.clone() else {
         pending.clear();
-        return;
+        return None;
     };
     while let Some(command) = pending.pop_front() {
         match sender.try_send(command) {
@@ -446,6 +495,7 @@ fn dispatch(
             }
         }
     }
+    None
 }
 
 fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
@@ -512,6 +562,7 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
         TelegramCommand::RefreshDialogs => {
             NetworkEvent::DialogsFailed("Telegram command queue is busy".to_owned())
         }
+        TelegramCommand::SwitchAccount { .. } | TelegramCommand::Shutdown => return,
         TelegramCommand::StartQrAuth
         | TelegramCommand::SubmitPhone(_)
         | TelegramCommand::SubmitCode(_)
@@ -519,9 +570,40 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
         | TelegramCommand::RestartAuth => {
             NetworkEvent::Fatal("Telegram command queue is busy; restart sign-in".to_owned())
         }
-        TelegramCommand::Shutdown => return,
     };
     app.handle_network(event);
+}
+
+async fn restart_telegram_worker(
+    base_config: &Config,
+    account: u8,
+    commands: &mut Option<mpsc::Sender<TelegramCommand>>,
+    events: &mut Option<mpsc::Receiver<NetworkEvent>>,
+    worker: &mut Option<tokio::task::JoinHandle<()>>,
+    pending: &mut VecDeque<TelegramCommand>,
+) -> Result<()> {
+    pending.clear();
+    if let Some(sender) = commands.take() {
+        drop(sender.try_send(TelegramCommand::Shutdown));
+    }
+    drop(events.take());
+    if let Some(mut task) = worker.take() {
+        if timeout(Duration::from_secs(2), &mut task).await.is_err() {
+            task.abort();
+            drop(task.await);
+        }
+    }
+
+    let selected = base_config.for_account(account)?;
+    let TelegramHandle {
+        commands: next_commands,
+        events: next_events,
+        task,
+    } = telegram::spawn(selected);
+    *commands = Some(next_commands);
+    *events = Some(next_events);
+    *worker = Some(task);
+    Ok(())
 }
 
 async fn wait_for_shutdown_signal() -> io::Result<()> {
@@ -543,10 +625,15 @@ async fn wait_for_shutdown_signal() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_arguments, synchronize_update_preferences, CommandLine, UpdateCheck};
+    use std::collections::VecDeque;
+
+    use super::{
+        dispatch, parse_arguments, synchronize_update_preferences, CommandLine, UpdateCheck,
+    };
     use termgram::{
         app::AppState,
         config::{ReleaseChannel, Settings},
+        event::TelegramCommand,
     };
 
     fn parse(arguments: &[&str]) -> anyhow::Result<CommandLine> {
@@ -605,5 +692,21 @@ mod tests {
         assert!(receiver.is_some());
         assert_eq!(previous, settings);
         assert_eq!(app.available_update(), None);
+    }
+
+    #[test]
+    fn account_switch_commands_are_kept_out_of_the_telegram_queue() {
+        let mut app = AppState::new();
+        let mut commands = None;
+        let mut pending = VecDeque::from([TelegramCommand::RefreshDialogs]);
+        let selected = dispatch(
+            &mut app,
+            &mut commands,
+            &mut pending,
+            vec![TelegramCommand::SwitchAccount { account: 3 }],
+        );
+
+        assert_eq!(selected, Some(3));
+        assert!(pending.is_empty());
     }
 }

@@ -108,6 +108,11 @@ pub enum TelegramCommand {
         chat_id: ChatId,
     },
     RefreshDialogs,
+    /// Select a different local session slot. The runtime intercepts this
+    /// command and replaces the single active Telegram worker.
+    SwitchAccount {
+        account: u8,
+    },
     Shutdown,
 }
 
@@ -189,6 +194,10 @@ impl fmt::Debug for TelegramCommand {
                 .field("chat_id", chat_id)
                 .finish(),
             Self::RefreshDialogs => formatter.write_str("RefreshDialogs"),
+            Self::SwitchAccount { account } => formatter
+                .debug_struct("SwitchAccount")
+                .field("account", account)
+                .finish(),
             Self::Shutdown => formatter.write_str("Shutdown"),
         }
     }

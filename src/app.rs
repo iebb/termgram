@@ -8,7 +8,7 @@ use chrono::Utc;
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
-    config::{DownloadBehavior, Settings},
+    config::{DownloadBehavior, Settings, MAX_ACCOUNTS},
     event::{AppEvent, AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand},
     input::{key_action, KeyAction, TextInput},
     model::{
@@ -51,6 +51,28 @@ pub enum AuthPhase {
     Password {
         hint: Option<String>,
     },
+}
+
+/// Terminal-cell strategy used to draw the transient login QR code.
+///
+/// Compact mode fits a typical 80 x 24 terminal by using Unicode half blocks.
+/// Compatible mode avoids block glyphs entirely and draws square modules with
+/// colored spaces, at the cost of needing a larger terminal.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QrRenderMode {
+    #[default]
+    Compact,
+    Compatible,
+}
+
+impl QrRenderMode {
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Compact => Self::Compatible,
+            Self::Compatible => Self::Compact,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,6 +128,7 @@ pub enum Mode {
     Filter,
     Help,
     Settings,
+    Accounts,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -163,10 +186,12 @@ pub struct App {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_selection: usize,
+    account_selection: usize,
     auth_input: TextInput,
     /// An authentication operation is awaiting a worker response. This keeps
     /// the form visibly responsive without retaining or echoing secrets.
     auth_progress: Option<AuthProgress>,
+    qr_render_mode: QrRenderMode,
     /// Ignore late prompts from an authentication attempt after the user has
     /// explicitly restarted it, until the worker confirms the phone phase.
     auth_restart_pending: bool,
@@ -175,6 +200,7 @@ pub struct App {
     retry_attachments: BTreeMap<(ChatId, i32), (PathBuf, String, bool)>,
     mode_before_help: Mode,
     mode_before_settings: Mode,
+    mode_before_accounts: Mode,
     force_redraw: bool,
     next_pending_id: i32,
     next_history_request_id: u64,
@@ -191,6 +217,14 @@ pub struct App {
     linked_chat_ids: BTreeSet<ChatId>,
     /// Rendered actionable rows from the last frame: x start/end, y, message id.
     message_hit_regions: Vec<(u16, u16, u16, i32)>,
+    /// Rendered chat rows: x start/end, y, filtered-list position.
+    chat_hit_regions: Vec<(u16, u16, u16, usize)>,
+    /// Rendered settings and account rows: x start/end, y, selection index.
+    settings_hit_regions: Vec<(u16, u16, u16, usize)>,
+    account_hit_regions: Vec<(u16, u16, u16, usize)>,
+    /// Frame-local pane bounds used to route wheel events by pointer location.
+    chat_pane_region: Option<(u16, u16, u16, u16)>,
+    conversation_pane_region: Option<(u16, u16, u16, u16)>,
 }
 
 pub type AppState = App;
@@ -224,14 +258,17 @@ impl Default for App {
             settings: Settings::default(),
             settings_path: None,
             settings_selection: 0,
+            account_selection: 0,
             auth_input: TextInput::new(),
             auth_progress: None,
+            qr_render_mode: QrRenderMode::default(),
             auth_restart_pending: false,
             drafts: BTreeMap::new(),
             retry_message_ids: BTreeMap::new(),
             retry_attachments: BTreeMap::new(),
             mode_before_help: Mode::Navigate,
             mode_before_settings: Mode::Navigate,
+            mode_before_accounts: Mode::Navigate,
             force_redraw: false,
             next_pending_id: -1,
             next_history_request_id: 1,
@@ -245,6 +282,11 @@ impl Default for App {
             pending_telegram_link: None,
             linked_chat_ids: BTreeSet::new(),
             message_hit_regions: Vec::new(),
+            chat_hit_regions: Vec::new(),
+            settings_hit_regions: Vec::new(),
+            account_hit_regions: Vec::new(),
+            chat_pane_region: None,
+            conversation_pane_region: None,
         }
     }
 }
@@ -287,6 +329,21 @@ impl App {
         self.settings_selection
     }
 
+    #[must_use]
+    pub const fn account_selection(&self) -> usize {
+        self.account_selection
+    }
+
+    #[must_use]
+    pub const fn active_account(&self) -> u8 {
+        self.settings.active_account
+    }
+
+    #[must_use]
+    pub const fn account_count(&self) -> u8 {
+        self.settings.account_count
+    }
+
     /// Record a background update result without displacing active errors or
     /// messaging feedback. The footer shows this when no transient status is
     /// present.
@@ -327,9 +384,14 @@ impl App {
     }
 
     /// Frame-local pointer targets must never survive a frame that cannot
-    /// render the conversation (for example a terminal-too-small warning).
+    /// render them (for example a terminal-too-small warning).
     pub fn clear_message_hit_regions(&mut self) {
         self.message_hit_regions.clear();
+        self.chat_hit_regions.clear();
+        self.settings_hit_regions.clear();
+        self.account_hit_regions.clear();
+        self.chat_pane_region = None;
+        self.conversation_pane_region = None;
     }
 
     #[cfg(test)]
@@ -337,34 +399,105 @@ impl App {
         self.message_hit_regions.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn chat_hit_region_count(&self) -> usize {
+        self.chat_hit_regions.len()
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<TelegramCommand> {
         key_action(key).map_or_else(Vec::new, |action| self.handle_action(action))
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Vec<TelegramCommand> {
-        if !matches!(self.screen, Screen::Main) || matches!(self.mode, Mode::Help | Mode::Settings)
-        {
+        if !matches!(self.screen, Screen::Main) {
             return Vec::new();
         }
+        if self.mode == Mode::Help {
+            return Vec::new();
+        }
+        if self.mode == Mode::Settings {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => self.handle_settings(KeyAction::Up),
+                MouseEventKind::ScrollDown => self.handle_settings(KeyAction::Down),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let Some(selection) =
+                        pointer_row_hit(&self.settings_hit_regions, mouse.column, mouse.row)
+                    else {
+                        return Vec::new();
+                    };
+                    self.settings_selection = selection;
+                    self.toggle_selected_setting();
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+        }
+        if self.mode == Mode::Accounts {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => self.handle_accounts(KeyAction::Up),
+                MouseEventKind::ScrollDown => self.handle_accounts(KeyAction::Down),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let Some(selection) =
+                        pointer_row_hit(&self.account_hit_regions, mouse.column, mouse.row)
+                    else {
+                        return Vec::new();
+                    };
+                    self.account_selection = selection;
+                    self.handle_accounts(KeyAction::Enter)
+                }
+                _ => Vec::new(),
+            };
+        }
         match mouse.kind {
-            MouseEventKind::ScrollUp if self.focus == Focus::Conversation => self.move_up(3),
-            MouseEventKind::ScrollDown if self.focus == Focus::Conversation => self.move_down(3),
-            MouseEventKind::Down(MouseButton::Left) => {
-                let hit = self
-                    .message_hit_regions
-                    .iter()
-                    .rev()
-                    .find(|&&(start, end, row, _)| {
-                        row == mouse.row && (start..end).contains(&mouse.column)
-                    })
-                    .map(|&(_, _, _, message_id)| message_id);
-                let Some(message_id) = hit else {
-                    return Vec::new();
-                };
+            MouseEventKind::ScrollUp
+                if pointer_in_region(self.chat_pane_region, mouse.column, mouse.row) =>
+            {
+                self.focus = Focus::Chats;
+                self.move_chat_up(3)
+            }
+            MouseEventKind::ScrollDown
+                if pointer_in_region(self.chat_pane_region, mouse.column, mouse.row) =>
+            {
+                self.focus = Focus::Chats;
+                self.move_chat_down(3)
+            }
+            MouseEventKind::ScrollUp
+                if pointer_in_region(self.conversation_pane_region, mouse.column, mouse.row) =>
+            {
                 self.focus = Focus::Conversation;
                 self.narrow_conversation = true;
-                self.selected_message = Some(message_id);
-                self.activate_selected_message()
+                self.move_up(3)
+            }
+            MouseEventKind::ScrollDown
+                if pointer_in_region(self.conversation_pane_region, mouse.column, mouse.row) =>
+            {
+                self.focus = Focus::Conversation;
+                self.narrow_conversation = true;
+                self.move_down(3)
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(selection) =
+                    pointer_row_hit(&self.chat_hit_regions, mouse.column, mouse.row)
+                {
+                    self.selected_chat = selection;
+                    self.focus = Focus::Chats;
+                    self.narrow_conversation = false;
+                    self.selected_message = None;
+                    return self.open_selected_chat();
+                }
+                if let Some(message_id) =
+                    pointer_row_hit(&self.message_hit_regions, mouse.column, mouse.row)
+                {
+                    self.focus = Focus::Conversation;
+                    self.narrow_conversation = true;
+                    self.selected_message = Some(message_id);
+                    return self.activate_selected_message();
+                }
+                if pointer_in_region(self.conversation_pane_region, mouse.column, mouse.row) {
+                    self.focus = Focus::Conversation;
+                    self.narrow_conversation = true;
+                }
+                Vec::new()
             }
             _ => Vec::new(),
         }
@@ -376,6 +509,11 @@ impl App {
                 && matches!(self.screen, Screen::Connecting | Screen::Fatal(_)))
         {
             return self.quit();
+        }
+        match action {
+            KeyAction::NextAccount => return self.switch_to_next_account(),
+            KeyAction::AddAccount => return self.add_account(),
+            _ => {}
         }
         match self.screen {
             Screen::Connecting | Screen::Fatal(_) => Vec::new(),
@@ -612,6 +750,11 @@ impl App {
         self.auth_progress.is_some() || matches!(self.screen, Screen::Auth(AuthPhase::Qr { .. }))
     }
 
+    #[must_use]
+    pub const fn qr_render_mode(&self) -> QrRenderMode {
+        self.qr_render_mode
+    }
+
     /// A fixed, non-secret progress label for the current authentication
     /// request. Values entered by the user are deliberately never included.
     #[must_use]
@@ -709,6 +852,26 @@ impl App {
     /// Replace row hit regions after rendering the current conversation.
     pub fn set_message_hit_regions(&mut self, regions: Vec<(u16, u16, u16, i32)>) {
         self.message_hit_regions = regions;
+    }
+
+    pub fn set_chat_hit_regions(&mut self, regions: Vec<(u16, u16, u16, usize)>) {
+        self.chat_hit_regions = regions;
+    }
+
+    pub fn set_settings_hit_regions(&mut self, regions: Vec<(u16, u16, u16, usize)>) {
+        self.settings_hit_regions = regions;
+    }
+
+    pub fn set_account_hit_regions(&mut self, regions: Vec<(u16, u16, u16, usize)>) {
+        self.account_hit_regions = regions;
+    }
+
+    pub const fn set_chat_pane_region(&mut self, region: (u16, u16, u16, u16)) {
+        self.chat_pane_region = Some(region);
+    }
+
+    pub const fn set_conversation_pane_region(&mut self, region: (u16, u16, u16, u16)) {
+        self.conversation_pane_region = Some(region);
     }
 
     pub fn clear_status(&mut self) {
@@ -810,6 +973,13 @@ impl App {
             self.status_message = None;
             return vec![TelegramCommand::StartQrAuth];
         }
+        if matches!(action, KeyAction::Tab | KeyAction::BackTab)
+            && matches!(self.screen, Screen::Auth(AuthPhase::Qr { .. }))
+        {
+            self.qr_render_mode = self.qr_render_mode.toggled();
+            self.force_redraw = true;
+            return Vec::new();
+        }
         if self.auth_progress.is_some() {
             if action == KeyAction::Redraw {
                 self.force_redraw = true;
@@ -873,6 +1043,7 @@ impl App {
             Mode::Filter => self.handle_filter(action),
             Mode::Help => self.handle_help(action),
             Mode::Settings => self.handle_settings(action),
+            Mode::Accounts => self.handle_accounts(action),
         }
     }
 
@@ -888,6 +1059,13 @@ impl App {
                 self.mode_before_settings = self.mode;
                 self.mode = Mode::Settings;
                 self.settings_selection = 0;
+                self.status_message = None;
+                Vec::new()
+            }
+            KeyAction::Character('a') => {
+                self.mode_before_accounts = self.mode;
+                self.mode = Mode::Accounts;
+                self.account_selection = usize::from(self.settings.active_account - 1);
                 self.status_message = None;
                 Vec::new()
             }
@@ -1120,6 +1298,127 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    fn handle_accounts(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        if action == KeyAction::Character('q') {
+            return self.quit();
+        }
+        let add_row = usize::from(self.settings.account_count);
+        match action {
+            KeyAction::Escape | KeyAction::Character('a') => {
+                self.mode = self.mode_before_accounts;
+                self.status_message = None;
+                Vec::new()
+            }
+            KeyAction::Up | KeyAction::Character('k') => {
+                self.account_selection = self.account_selection.saturating_sub(1);
+                Vec::new()
+            }
+            KeyAction::Down | KeyAction::Character('j') => {
+                self.account_selection = self.account_selection.saturating_add(1).min(add_row);
+                Vec::new()
+            }
+            KeyAction::Enter => {
+                if self.account_selection == add_row {
+                    self.add_account()
+                } else {
+                    let account = u8::try_from(self.account_selection.saturating_add(1))
+                        .unwrap_or(MAX_ACCOUNTS);
+                    self.activate_account(account, self.settings.account_count)
+                }
+            }
+            KeyAction::Character(character) if character.is_ascii_digit() => {
+                let Some(account) = character
+                    .to_digit(10)
+                    .and_then(|value| u8::try_from(value).ok())
+                else {
+                    return Vec::new();
+                };
+                if account == 0 || account > self.settings.account_count {
+                    self.status_message = Some("That account slot has not been added".to_owned());
+                    Vec::new()
+                } else {
+                    self.activate_account(account, self.settings.account_count)
+                }
+            }
+            KeyAction::Redraw => {
+                self.force_redraw = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn switch_to_next_account(&mut self) -> Vec<TelegramCommand> {
+        if self.settings.account_count < 2 {
+            self.status_message = Some("Only one account · press F3 to add another".to_owned());
+            return Vec::new();
+        }
+        let account = if self.settings.active_account == self.settings.account_count {
+            1
+        } else {
+            self.settings.active_account.saturating_add(1)
+        };
+        self.activate_account(account, self.settings.account_count)
+    }
+
+    fn add_account(&mut self) -> Vec<TelegramCommand> {
+        if self.settings.account_count >= MAX_ACCOUNTS {
+            self.status_message = Some(format!("Account limit reached ({MAX_ACCOUNTS})"));
+            return Vec::new();
+        }
+        let account = self.settings.account_count.saturating_add(1);
+        self.activate_account(account, account)
+    }
+
+    fn activate_account(&mut self, account: u8, account_count: u8) -> Vec<TelegramCommand> {
+        if account == self.settings.active_account && account_count == self.settings.account_count {
+            if self.mode == Mode::Accounts {
+                self.mode = self.mode_before_accounts;
+            }
+            self.status_message = Some(format!("Account {account} is already active"));
+            return Vec::new();
+        }
+        if account == 0 || account > account_count || account_count > MAX_ACCOUNTS {
+            self.status_message = Some("Invalid account slot".to_owned());
+            return Vec::new();
+        }
+
+        let previous = self.settings;
+        self.settings.active_account = account;
+        self.settings.account_count = account_count;
+        if let Some(path) = self.settings_path.as_deref() {
+            if let Err(error) = self.settings.save_to(path) {
+                self.settings = previous;
+                self.status_message = Some(format!(
+                    "Could not save account selection: {}",
+                    sanitize_terminal_line(&error.to_string())
+                ));
+                return Vec::new();
+            }
+        }
+
+        self.reset_for_account_switch(account);
+        vec![TelegramCommand::SwitchAccount { account }]
+    }
+
+    fn reset_for_account_switch(&mut self, account: u8) {
+        let settings = self.settings;
+        let settings_path = self.settings_path.clone();
+        let available_update = self.available_update.clone();
+        let terminal_focused = self.terminal_focused;
+        let qr_render_mode = self.qr_render_mode;
+        *self = Self {
+            settings,
+            settings_path,
+            available_update,
+            terminal_focused,
+            qr_render_mode,
+            status_message: Some(format!("Switching to Account {account}…")),
+            force_redraw: true,
+            ..Self::default()
+        };
     }
 
     fn toggle_selected_setting(&mut self) {
@@ -2284,6 +2583,20 @@ pub fn telegram_link(text: &str) -> Option<String> {
     })
 }
 
+fn pointer_row_hit<T: Copy>(regions: &[(u16, u16, u16, T)], column: u16, row: u16) -> Option<T> {
+    regions
+        .iter()
+        .rev()
+        .find(|&&(start, end, hit_row, _)| hit_row == row && (start..end).contains(&column))
+        .map(|&(_, _, _, value)| value)
+}
+
+fn pointer_in_region(region: Option<(u16, u16, u16, u16)>, column: u16, row: u16) -> bool {
+    region.is_some_and(|(left, right, top, bottom)| {
+        (left..right).contains(&column) && (top..bottom).contains(&row)
+    })
+}
+
 fn dropped_file_paths(text: &str) -> Option<Vec<PathBuf>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -2503,11 +2816,11 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     use super::{
-        App, AttachmentState, AuthPhase, Focus, Mode, Screen, MAX_CACHED_CHATS,
+        App, AttachmentState, AuthPhase, Focus, Mode, QrRenderMode, Screen, MAX_CACHED_CHATS,
         MAX_MESSAGES_PER_CHAT,
     };
     use crate::{
-        config::{DownloadBehavior, ReleaseChannel, Settings},
+        config::{DownloadBehavior, ReleaseChannel, Settings, MAX_ACCOUNTS},
         event::{AppEvent, AuthPrompt, NetworkEvent, TelegramCommand},
         input::KeyAction,
         model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
@@ -2642,6 +2955,15 @@ mod tests {
         );
         assert!(app.needs_animation());
         assert!(!format!("{:?}", app.screen).contains(secret_url));
+        assert_eq!(app.qr_render_mode(), QrRenderMode::Compact);
+        assert!(app.handle_action(KeyAction::Tab).is_empty());
+        assert_eq!(app.qr_render_mode(), QrRenderMode::Compatible);
+        assert!(app.handle_action(KeyAction::BackTab).is_empty());
+        assert_eq!(app.qr_render_mode(), QrRenderMode::Compact);
+        assert_eq!(
+            app.auth_progress_label(),
+            Some("Waiting for approval in Telegram…")
+        );
         assert_eq!(
             app.handle_action(KeyAction::Escape),
             vec![TelegramCommand::RestartAuth]
@@ -3094,6 +3416,7 @@ mod tests {
                 release_channel: ReleaseChannel::Prerelease,
                 download_behavior: DownloadBehavior::TempOnly,
                 show_message_ids: true,
+                ..Settings::default()
             }
         );
         assert_eq!(
@@ -3105,6 +3428,90 @@ mod tests {
         assert_eq!(app.mode, Mode::Navigate);
         fs::remove_file(path).expect("remove settings");
         fs::remove_dir(directory).expect("remove settings directory");
+    }
+
+    #[test]
+    fn account_picker_adds_switches_and_isolates_account_state() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "termgram-app-accounts-{}-{nonce}",
+            std::process::id()
+        ));
+        let path = directory.join("settings.conf");
+        let mut app = App::with_settings(Settings::default(), path.clone());
+        app.screen = Screen::Main;
+        app.user_name = Some("First".to_owned());
+        app.chats.push(chat(7, "Private chat"));
+        app.messages
+            .insert(7, vec![message(1, 7, "account one", false)]);
+
+        assert!(app.handle_action(KeyAction::Character('a')).is_empty());
+        assert_eq!(app.mode, Mode::Accounts);
+        assert_eq!(app.account_selection(), 0);
+        assert!(app.handle_action(KeyAction::Down).is_empty());
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::SwitchAccount { account: 2 }]
+        );
+        assert_eq!(app.active_account(), 2);
+        assert_eq!(app.account_count(), 2);
+        assert_eq!(app.screen, Screen::Connecting);
+        assert!(app.chats.is_empty());
+        assert!(app.messages.is_empty());
+        assert!(app.user_name.is_none());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Switching to Account 2…")
+        );
+        assert_eq!(
+            Settings::load_from(&path).expect("persisted account selection"),
+            *app.settings()
+        );
+
+        app.handle_network(NetworkEvent::Ready {
+            user_name: "Second".to_owned(),
+        });
+        assert_eq!(
+            app.handle_action(KeyAction::NextAccount),
+            vec![TelegramCommand::SwitchAccount { account: 1 }]
+        );
+        assert_eq!(app.active_account(), 1);
+
+        fs::remove_file(path).expect("remove settings");
+        fs::remove_dir(directory).expect("remove settings directory");
+    }
+
+    #[test]
+    fn account_shortcuts_work_during_login_and_enforce_the_slot_limit() {
+        let mut app = App::with_ephemeral_settings(Settings {
+            active_account: 1,
+            account_count: 2,
+            ..Settings::default()
+        });
+        app.handle_network(NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('+'));
+        assert_eq!(
+            app.handle_action(KeyAction::NextAccount),
+            vec![TelegramCommand::SwitchAccount { account: 2 }]
+        );
+        assert!(app.auth_input().is_empty());
+        assert_eq!(app.screen, Screen::Connecting);
+
+        let mut full = App::with_ephemeral_settings(Settings {
+            active_account: MAX_ACCOUNTS,
+            account_count: MAX_ACCOUNTS,
+            ..Settings::default()
+        });
+        full.screen = Screen::Fatal("network failed".to_owned());
+        assert!(full.handle_action(KeyAction::AddAccount).is_empty());
+        assert_eq!(full.active_account(), MAX_ACCOUNTS);
+        assert_eq!(
+            full.status_message.as_deref(),
+            Some("Account limit reached (8)")
+        );
     }
 
     #[test]
@@ -3873,6 +4280,69 @@ mod tests {
         );
         assert_eq!(app.selected_message, Some(21));
         assert_eq!(app.attachment_state(1, 21), AttachmentState::Downloading);
+    }
+
+    #[test]
+    fn mouse_clicks_open_chats_and_activate_overlay_rows() {
+        let click = |column, row| {
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        let mut app = ready_app();
+        app.set_chat_hit_regions(vec![(1, 30, 4, 1)]);
+        let commands = app.update(click(5, 4));
+        assert_eq!(app.active_chat_id, Some(2));
+        assert!(matches!(
+            commands.first(),
+            Some(TelegramCommand::LoadHistory { chat_id: 2, .. })
+        ));
+
+        app.mode = Mode::Settings;
+        app.set_settings_hit_regions(vec![(20, 70, 8, 0)]);
+        let before = app.settings.automatic_update_checks;
+        assert!(app.update(click(25, 8)).is_empty());
+        assert_eq!(app.settings.automatic_update_checks, !before);
+
+        app.mode = Mode::Accounts;
+        app.settings.active_account = 1;
+        app.settings.account_count = 2;
+        app.set_account_hit_regions(vec![(20, 70, 10, 2)]);
+        assert_eq!(
+            app.update(click(25, 10)),
+            vec![TelegramCommand::SwitchAccount { account: 3 }]
+        );
+        assert_eq!(app.active_account(), 3);
+    }
+
+    #[test]
+    fn mouse_wheel_routes_by_pane_instead_of_keyboard_focus() {
+        let mut app = ready_app();
+        app.focus = Focus::Conversation;
+        app.selected_chat = 2;
+        app.set_chat_pane_region((0, 30, 1, 20));
+        app.set_conversation_pane_region((30, 100, 1, 20));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Chats);
+        assert_eq!(app.selected_chat, 0);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 50,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Conversation);
     }
 
     use crate::input::TextInput;

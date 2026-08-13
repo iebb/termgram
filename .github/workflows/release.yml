@@ -107,8 +107,11 @@ jobs:
             final="$sha"
             {
               printf 'termgram-%s-linux.tar.gz\n' "$version"
+              printf 'termgram-%s-linux-aarch64.tar.gz\n' "$version"
               printf 'termgram-%s-macos.tar.gz\n' "$version"
+              printf 'termgram-%s-macos-x86_64.tar.gz\n' "$version"
               printf 'termgram-%s-windows.zip\n' "$version"
+              printf 'termgram-%s-windows-aarch64.zip\n' "$version"
             } >> expected-assets.txt
           done < metadata/release-plan.tsv
           test -n "$final"
@@ -122,8 +125,11 @@ jobs:
             asset_dir="prepared/$version"
             mkdir -p "$asset_dir"
             cp "dist/termgram-$version-linux.tar.gz" "$asset_dir/"
+            cp "dist/termgram-$version-linux-aarch64.tar.gz" "$asset_dir/"
             cp "dist/termgram-$version-macos.tar.gz" "$asset_dir/"
+            cp "dist/termgram-$version-macos-x86_64.tar.gz" "$asset_dir/"
             cp "dist/termgram-$version-windows.zip" "$asset_dir/"
+            cp "dist/termgram-$version-windows-aarch64.zip" "$asset_dir/"
             test "$(git cat-file -t "$sha:scripts/install.sh")" = blob
             test "$(git cat-file -t "$sha:scripts/install.ps1")" = blob
             git show "$sha:scripts/install.sh" > "$asset_dir/install.sh"
@@ -133,8 +139,11 @@ jobs:
               cd "$asset_dir"
               sha256sum \
                 "termgram-$version-linux.tar.gz" \
+                "termgram-$version-linux-aarch64.tar.gz" \
                 "termgram-$version-macos.tar.gz" \
+                "termgram-$version-macos-x86_64.tar.gz" \
                 "termgram-$version-windows.zip" \
+                "termgram-$version-windows-aarch64.zip" \
                 install.sh install.ps1 > SHA256SUMS
             )
           done < metadata/release-plan.tsv
@@ -224,20 +233,26 @@ jobs:
             expected_names="$(printf '%s\n' \
               SHA256SUMS install.sh install.ps1 \
               "termgram-$version-linux.tar.gz" \
+              "termgram-$version-linux-aarch64.tar.gz" \
               "termgram-$version-macos.tar.gz" \
-              "termgram-$version-windows.zip" | sort)"
+              "termgram-$version-macos-x86_64.tar.gz" \
+              "termgram-$version-windows.zip" \
+              "termgram-$version-windows-aarch64.zip" | sort)"
             downloaded_names="$(find "$verify_dir" -maxdepth 1 -type f -printf '%f\n' | sort)"
             test "$downloaded_names" = "$expected_names"
             (
               cd "$verify_dir"
-              test "$(wc -l < SHA256SUMS)" = 5
+              test "$(wc -l < SHA256SUMS)" = 8
               manifest_names="$(awk '{ name=$2; sub(/^\\*/, "", name); print name }' \
                 SHA256SUMS | sort)"
               expected_manifest_names="$(printf '%s\n' \
                 install.sh install.ps1 \
                 "termgram-$version-linux.tar.gz" \
+                "termgram-$version-linux-aarch64.tar.gz" \
                 "termgram-$version-macos.tar.gz" \
-                "termgram-$version-windows.zip" | sort)"
+                "termgram-$version-macos-x86_64.tar.gz" \
+                "termgram-$version-windows.zip" \
+                "termgram-$version-windows-aarch64.zip" | sort)"
               test "$manifest_names" = "$expected_manifest_names"
               sha256sum --strict --check SHA256SUMS
             )

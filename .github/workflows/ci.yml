@@ -122,21 +122,42 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Keep the three unqualified platform labels for compatibility with
+          # auto-updaters shipped before architecture-specific assets existed.
           - platform: linux
             os: ubuntu-latest
             extension: tar.gz
             target: x86_64-unknown-linux-musl
+            macos_deployment_target: ""
+          - platform: linux-aarch64
+            os: ubuntu-24.04-arm
+            extension: tar.gz
+            target: aarch64-unknown-linux-musl
+            macos_deployment_target: ""
           - platform: macos
             os: macos-latest
             extension: tar.gz
             target: aarch64-apple-darwin
+            macos_deployment_target: "11.0"
+          - platform: macos-x86_64
+            os: macos-15-intel
+            extension: tar.gz
+            target: x86_64-apple-darwin
+            macos_deployment_target: "11.0"
           - platform: windows
             os: windows-latest
             extension: zip
             target: x86_64-pc-windows-msvc
+            macos_deployment_target: ""
+          - platform: windows-aarch64
+            os: windows-11-arm
+            extension: zip
+            target: aarch64-pc-windows-msvc
+            macos_deployment_target: ""
     runs-on: ${{ matrix.os }}
     env:
       RELEASE_PLAN: ${{ needs.version.outputs.plan }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -149,7 +170,7 @@ jobs:
         with:
           shared-key: ${{ matrix.platform }}
       - name: Install static Linux linker
-        if: matrix.platform == 'linux'
+        if: startsWith(matrix.platform, 'linux')
         shell: bash
         run: |
           sudo apt-get update

@@ -23,18 +23,24 @@ os_name="$(uname -s)"
 architecture="$(uname -m)"
 case "$os_name" in
   Linux)
-    platform="linux"
-    if [[ "$architecture" != x86_64 ]]; then
-      printf 'error: Linux release binaries require x86_64; detected %s\n' "$architecture" >&2
-      exit 1
-    fi
+    case "$architecture" in
+      x86_64) platform="linux" ;;
+      aarch64 | arm64) platform="linux-aarch64" ;;
+      *)
+        printf 'error: Linux release binaries require x86_64 or ARM64; detected %s\n' "$architecture" >&2
+        exit 1
+        ;;
+    esac
     ;;
   Darwin)
-    platform="macos"
-    if [[ "$architecture" != arm64 ]]; then
-      printf 'error: macOS release binaries require arm64 (Apple silicon); detected %s\n' "$architecture" >&2
-      exit 1
-    fi
+    case "$architecture" in
+      arm64 | aarch64) platform="macos" ;;
+      x86_64) platform="macos-x86_64" ;;
+      *)
+        printf 'error: macOS release binaries require Apple silicon or Intel x86_64; detected %s\n' "$architecture" >&2
+        exit 1
+        ;;
+    esac
     ;;
   *)
     printf 'error: Termgram release binaries do not support %s\n' "$os_name" >&2

@@ -334,6 +334,20 @@ fn current_platform() -> Result<Platform> {
     })
 }
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "unsupported targets return an error"
+)]
+fn current_platform() -> Result<Platform> {
+    Ok(Platform {
+        asset_label: "linux-aarch64",
+        archive_extension: "tar.gz",
+        binary_name: "tg",
+        compressed_tar: true,
+    })
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(
     clippy::unnecessary_wraps,
@@ -342,6 +356,20 @@ fn current_platform() -> Result<Platform> {
 fn current_platform() -> Result<Platform> {
     Ok(Platform {
         asset_label: "macos",
+        archive_extension: "tar.gz",
+        binary_name: "tg",
+        compressed_tar: true,
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "unsupported targets return an error"
+)]
+fn current_platform() -> Result<Platform> {
+    Ok(Platform {
+        asset_label: "macos-x86_64",
         archive_extension: "tar.gz",
         binary_name: "tg",
         compressed_tar: true,
@@ -362,10 +390,27 @@ fn current_platform() -> Result<Platform> {
     })
 }
 
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "unsupported targets return an error"
+)]
+fn current_platform() -> Result<Platform> {
+    Ok(Platform {
+        asset_label: "windows-aarch64",
+        archive_extension: "zip",
+        binary_name: "tg.exe",
+        compressed_tar: false,
+    })
+}
+
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64"),
     all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64")
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64")
 )))]
 fn current_platform() -> Result<Platform> {
     bail!(
@@ -1290,10 +1335,30 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        check_is_due, checksum_for_asset, parse_version, select_update, AutomaticCheckThrottle,
-        JsonCursor, Release, UpdateStatus, CHECK_INTERVAL,
+        check_is_due, checksum_for_asset, current_platform, parse_version, select_update,
+        AutomaticCheckThrottle, JsonCursor, Release, UpdateStatus, CHECK_INTERVAL,
     };
     use crate::config::ReleaseChannel;
+
+    #[test]
+    fn updater_selects_the_native_release_asset() {
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "linux",
+            ("linux", "aarch64") => "linux-aarch64",
+            ("macos", "aarch64") => "macos",
+            ("macos", "x86_64") => "macos-x86_64",
+            ("windows", "x86_64") => "windows",
+            ("windows", "aarch64") => "windows-aarch64",
+            _ => {
+                assert!(current_platform().is_err());
+                return;
+            }
+        };
+        assert_eq!(
+            current_platform().expect("supported platform").asset_label,
+            expected
+        );
+    }
 
     #[test]
     fn parses_release_objects_without_confusing_nested_asset_fields() {

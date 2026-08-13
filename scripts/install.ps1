@@ -27,8 +27,15 @@ $architecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
 if ([string]::IsNullOrWhiteSpace($architecture)) {
     $architecture = [Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
 }
-if ($architecture -cne "AMD64") {
-    throw "Windows release binaries require x64 (AMD64); detected $architecture."
+if ([string]::IsNullOrWhiteSpace($architecture)) {
+    throw "Unable to determine the native Windows architecture."
+}
+$platform = switch ($architecture.ToUpperInvariant()) {
+    "AMD64" { "windows" }
+    "ARM64" { "windows-aarch64" }
+    default {
+        throw "Windows release binaries require x64 (AMD64) or ARM64; detected $architecture."
+    }
 }
 
 if ($null -ne [Net.ServicePointManager]::SecurityProtocol) {
@@ -85,7 +92,7 @@ if ($null -eq $bestRelease) {
 
 $tag = [string]$bestRelease.tag_name
 $version = $tag.Substring(1)
-$assetName = "termgram-$version-windows.zip"
+$assetName = "termgram-$version-$platform.zip"
 $releaseUrl = "https://github.com/$Repository/releases/download/$tag"
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("termgram-install-" + [Guid]::NewGuid().ToString("N"))

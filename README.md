@@ -24,10 +24,11 @@ behavior, which is outside this essential messaging scope.
 
 ## Install
 
-Prebuilt releases currently target x86_64 Linux, Apple silicon macOS (arm64),
-and x64 Windows. The installers reject other operating-system architectures
-before downloading a binary. Linux and macOS also require Bash, `curl`, `tar`,
-and either `sha256sum` or `shasum`; Windows requires PowerShell 5.1 or newer.
+Prebuilt releases target x86_64 and ARM64 Linux, Apple silicon and Intel macOS,
+and x64 and ARM64 Windows. The installers select the native architecture and
+reject unsupported combinations before downloading a binary. Linux and macOS
+also require Bash, `curl`, `tar`, and either `sha256sum` or `shasum`; Windows
+requires PowerShell 5.1 or newer.
 
 On Linux or macOS:
 
@@ -136,12 +137,17 @@ After the first build, launch the optimized client directly with:
 ./target/release/tg
 ```
 
-On Windows, run `target\release\tg.exe`. GitHub Actions tests and packages the
-client on Linux, macOS, and Windows. Every successful default-branch commit is
-published as a prerelease with version `0.1.Z`, where `Z` is its first-parent
-commit height. A commit whose subject starts with `release:` is published as a
-normal release instead. Archives include both version and platform, for example
-`termgram-0.1.42-linux.tar.gz`. Run `tg --version` to inspect a binary's version.
+On Windows, run `target\release\tg.exe`. GitHub Actions tests and packages six
+native targets across Linux, macOS, and Windows. Every successful
+default-branch commit is published as a prerelease with version `0.1.Z`, where
+`Z` is its first-parent commit height. A commit whose subject starts with
+`release:` is published as a normal release instead. Archives include the
+version and platform/architecture, for example
+`termgram-0.1.42-linux-aarch64.tar.gz` or
+`termgram-0.1.42-macos-x86_64.tar.gz`. The legacy `linux`, `macos`, and `windows`
+asset names remain the x86_64 Linux, Apple-silicon macOS, and x64 Windows builds
+so existing auto-updaters remain compatible. Run `tg --version` to inspect a
+binary's version.
 
 The public repository stores only the `TELEGRAM_API_ID` and
 `TELEGRAM_API_HASH` secret names. GitHub encrypts their values and injects them

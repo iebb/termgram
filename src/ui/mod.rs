@@ -11,12 +11,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    telegram_link, AppState, AttachmentState, AuthPhase, Focus, Mode, QrRenderMode, Screen,
+    AppState, AttachmentState, AuthPhase, Focus, MessageAction, Mode, QrRenderMode, Screen,
 };
 use crate::config::DownloadBehavior;
 use crate::event::ConnectionStatus;
 use crate::input::TextInput;
-use crate::model::{AttachmentKind, Delivery, Message};
+use crate::model::{AttachmentKind, Delivery, Message, MessageButtonKind};
 
 const ACCENT: Color = Color::Rgb(216, 180, 254);
 const MUTED: Color = Color::DarkGray;
@@ -24,7 +24,11 @@ const SUCCESS: Color = Color::Rgb(126, 211, 166);
 const WARNING: Color = Color::Rgb(245, 194, 107);
 const DANGER: Color = Color::Rgb(242, 139, 130);
 const MESSAGE_ID_COLUMN_WIDTH: usize = 12;
-const QR_QUIET_ZONE: usize = 4;
+// Terminal QR renderers such as qr-cli use a compact two-module border. A
+// quiet zone is still required for reliable finder-pattern detection, but a
+// full four-module print margin makes short-lived login tokens unnecessarily
+// large in an 80 x 24 terminal.
+const QR_QUIET_ZONE: usize = 2;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
     let area = frame.area();
@@ -253,7 +257,7 @@ fn render_qr_unavailable(frame: &mut Frame<'_>, area: Rect, message: &str) {
 fn qr_dimensions(modules: usize, mode: QrRenderMode) -> (u16, u16) {
     match mode {
         QrRenderMode::Compact => (clamp_u16(modules), clamp_u16(modules.saturating_add(1) / 2)),
-        QrRenderMode::Compatible => (clamp_u16(modules.saturating_mul(2)), clamp_u16(modules)),
+        QrRenderMode::Compatible => (clamp_u16(modules), clamp_u16(modules)),
     }
 }
 
@@ -270,8 +274,10 @@ fn render_qr_code(
     }
 }
 
-/// Pair two QR rows into each terminal row. This is the only mode that uses a
-/// Unicode block glyph, and keeps a real Telegram token within an 80 x 24 PTY.
+/// Pair two QR rows into each terminal row using the same four-glyph mapping
+/// as established terminal QR tools: space, upper half, lower half, and full
+/// block. A single black foreground on a white background avoids depending on
+/// the user's terminal theme or on background-colored half-block tricks.
 fn render_compact_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
     let modules = code.width().saturating_add(quiet_zone * 2);
     let mut lines = Vec::with_capacity(modules.saturating_add(1) / 2);
@@ -284,11 +290,11 @@ fn render_compact_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quie
             } else {
                 QrColor::Light
             };
-            let foreground = qr_terminal_color(top);
-            let background = qr_terminal_color(bottom);
             spans.push(Span::styled(
-                if top == bottom { " " } else { "▀" },
-                Style::default().fg(foreground).bg(background),
+                qr_pair_symbol(top, bottom),
+                Style::default()
+                    .fg(Color::Rgb(0, 0, 0))
+                    .bg(Color::Rgb(255, 255, 255)),
             ));
         }
         lines.push(Line::from(spans));
@@ -296,9 +302,9 @@ fn render_compact_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quie
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Draw every QR module as two background-colored ASCII spaces. Terminal font
-/// block-glyph support is irrelevant in this mode, and the 2 x 1 cell geometry
-/// keeps modules approximately square in conventional terminal fonts.
+/// Draw every QR module as one background-colored ASCII space. Terminal font
+/// block-glyph support is irrelevant and the fallback stays reasonably sized;
+/// scanners compensate for the terminal cell's rectangular aspect ratio.
 fn render_compatible_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, quiet_zone: usize) {
     let modules = code.width().saturating_add(quiet_zone * 2);
     let mut lines = Vec::with_capacity(modules);
@@ -306,7 +312,7 @@ fn render_compatible_qr_code(frame: &mut Frame<'_>, area: Rect, code: &QrCode, q
         let mut spans = Vec::with_capacity(modules);
         for x in 0..modules {
             let color = qr_terminal_color(qr_module(code, x, y, quiet_zone));
-            spans.push(Span::styled("  ", Style::default().fg(color).bg(color)));
+            spans.push(Span::styled(" ", Style::default().fg(color).bg(color)));
         }
         lines.push(Line::from(spans));
     }
@@ -326,8 +332,17 @@ fn qr_module(code: &QrCode, x: usize, y: usize, quiet_zone: usize) -> QrColor {
 
 const fn qr_terminal_color(color: QrColor) -> Color {
     match color {
-        QrColor::Dark => Color::Black,
-        QrColor::Light => Color::White,
+        QrColor::Dark => Color::Rgb(0, 0, 0),
+        QrColor::Light => Color::Rgb(255, 255, 255),
+    }
+}
+
+const fn qr_pair_symbol(top: QrColor, bottom: QrColor) -> &'static str {
+    match (top, bottom) {
+        (QrColor::Dark, QrColor::Dark) => "█",
+        (QrColor::Dark, QrColor::Light) => "▀",
+        (QrColor::Light, QrColor::Dark) => "▄",
+        (QrColor::Light, QrColor::Light) => " ",
     }
 }
 
@@ -535,19 +550,31 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let mut layouts = Vec::with_capacity(messages.len());
     for message in messages {
         let start = lines.len();
-        lines.extend(message_lines(
+        let actions = app.message_actions(message);
+        let rendered = message_lines(
             message,
             message_width,
             app.attachment_state(chat_id, message.id),
             app.settings().download_behavior,
             app.selected_message == Some(message.id),
+            app.selected_action,
             app.settings().show_message_ids,
-        ));
+            &actions,
+        );
+        let hit_rows = rendered
+            .action_rows
+            .into_iter()
+            .map(|(row, action)| (start.saturating_add(row), action))
+            .chain(rendered.body_action.into_iter().flat_map(|action| {
+                (0..rendered.body_height).map(move |row| (start.saturating_add(row), action))
+            }))
+            .collect();
+        lines.extend(rendered.lines);
         layouts.push(MessageLayout {
             id: message.id,
             start,
             height: lines.len().saturating_sub(start),
-            actionable: app.message_is_actionable(message),
+            hit_rows,
         });
     }
     let available = usize::from(inner.height);
@@ -605,22 +632,16 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     frame.render_widget(Paragraph::new(Text::from(visible_lines)), inner);
     let hit_regions = layouts
         .iter()
-        .filter(|layout| layout.actionable)
         .flat_map(|layout| {
-            let first = layout.start.max(scroll);
-            let last = layout
-                .start
-                .saturating_add(layout.height)
-                .min(scroll + available);
-            (first..last).map(move |row| {
-                (
+            layout.hit_rows.iter().filter_map(move |&(row, action)| {
+                (row >= scroll && row < scroll.saturating_add(available)).then_some((
                     inner.x,
                     inner.right(),
                     inner
                         .y
                         .saturating_add(clamp_u16(row.saturating_sub(scroll))),
-                    layout.id,
-                )
+                    (layout.id, action),
+                ))
             })
         })
         .collect();
@@ -632,7 +653,7 @@ struct MessageLayout {
     id: i32,
     start: usize,
     height: usize,
-    actionable: bool,
+    hit_rows: Vec<(usize, usize)>,
 }
 
 fn render_new_message_badge(frame: &mut Frame<'_>, area: Rect, count: usize) {
@@ -730,9 +751,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, narrow: bool
     } else if app.mode == Mode::Accounts {
         Line::from(" ↑↓ select  ·  Enter switch/add  ·  Esc close accounts")
     } else if narrow && app.narrow_conversation {
-        Line::from(" o action  ·  r reply  ·  Enter media  ·  Esc chats")
+        Line::from(" o/O action  ·  Enter activate  ·  r reply  ·  Esc chats")
     } else {
-        Line::from(" ↑↓/jk move  ·  o action  ·  r reply  ·  Enter media  ·  ? help  ·  q quit")
+        Line::from(
+            " ↑↓/jk move  ·  o/O action  ·  Enter activate  ·  r reply  ·  ? help  ·  q quit",
+        )
     };
     frame.render_widget(
         Paragraph::new(content).style(Style::default().fg(MUTED)),
@@ -756,10 +779,10 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
         Line::from("Tab             switch chats / conversation"),
         Line::from("PgUp / PgDn     scroll conversation"),
         Line::from("Home / End      oldest loaded / latest"),
-        Line::from("o / O           next / previous reply, link, or file"),
+        Line::from("o / O           next / previous reply, file, link, or button"),
         Line::from("r               jump to selected reply target"),
-        Line::from("Enter / click   download or reveal selected media"),
-        Line::from("l               follow link in selected message/caption"),
+        Line::from("Enter / click   activate selected media, link, or bot button"),
+        Line::from("l               follow selected/first link in a message"),
         Line::from("/               filter chats (from chat list)"),
         Line::from("s               settings"),
         Line::from("a               accounts"),
@@ -1011,14 +1034,24 @@ fn render_input(
     }
 }
 
+struct RenderedMessage {
+    lines: Vec<Line<'static>>,
+    body_height: usize,
+    body_action: Option<usize>,
+    action_rows: Vec<(usize, usize)>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn message_lines(
     message: &Message,
     width: usize,
     attachment_state: AttachmentState,
     download_behavior: DownloadBehavior,
     selected: bool,
+    selected_action: usize,
     show_message_ids: bool,
-) -> Vec<Line<'static>> {
+    actions: &[MessageAction],
+) -> RenderedMessage {
     let time = message
         .timestamp
         .with_timezone(&Local)
@@ -1039,7 +1072,6 @@ fn message_lines(
         let sender = reply.sender.as_deref().unwrap_or("unknown");
         body = format!("↩ #{} {}  {body}", reply.message_id, sender);
     }
-    let linked = telegram_link(&message.text).is_some();
     let wrapped = wrap_cells(&body, body_width);
     let mut result = Vec::new();
     for (index, part) in wrapped.into_iter().enumerate() {
@@ -1054,9 +1086,6 @@ fn message_lines(
         } else {
             Style::default()
         };
-        if linked {
-            body_style = body_style.fg(ACCENT).add_modifier(Modifier::UNDERLINED);
-        }
         if let Some(background) = selection {
             body_style = body_style.bg(background);
         }
@@ -1092,7 +1121,123 @@ fn message_lines(
         }
         result.push(line);
     }
-    result
+    let body_height = result.len();
+    let body_action = actions
+        .iter()
+        .position(|action| matches!(action, MessageAction::Attachment | MessageAction::Reply));
+    let continuation = format!("{}│ ", " ".repeat(prefix_width.saturating_sub(2)));
+    let action_rows = append_message_actions(
+        &mut result,
+        message,
+        actions,
+        selected,
+        selected_action,
+        body_width,
+        &continuation,
+    );
+    RenderedMessage {
+        lines: result,
+        body_height,
+        body_action,
+        action_rows,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_message_actions(
+    result: &mut Vec<Line<'static>>,
+    message: &Message,
+    actions: &[MessageAction],
+    selected: bool,
+    selected_action: usize,
+    body_width: usize,
+    continuation: &str,
+) -> Vec<(usize, usize)> {
+    let mut action_rows = Vec::new();
+    for (link_index, link) in message.links.iter().enumerate() {
+        let Some(action_index) = actions
+            .iter()
+            .position(|action| *action == MessageAction::Link(link_index))
+        else {
+            continue;
+        };
+        let label = if link.label == link.url {
+            format!("↗ {}", link.url)
+        } else {
+            format!("↗ {} → {}", link.label, link.url)
+        };
+        push_action_lines(
+            result,
+            &mut action_rows,
+            continuation,
+            &label,
+            body_width,
+            action_index,
+            selected && selected_action == action_index,
+            true,
+        );
+    }
+    for (button_index, button) in message.buttons.iter().enumerate() {
+        let action_index = actions
+            .iter()
+            .position(|action| *action == MessageAction::Button(button_index));
+        let (icon, suffix) = match button.kind {
+            MessageButtonKind::Url => ("↗", ""),
+            MessageButtonKind::Callback => ("●", ""),
+            MessageButtonKind::Game => ("▶", ""),
+            MessageButtonKind::Unsupported => ("×", " · graphical client required"),
+        };
+        let label = format!("{icon} [ {} ]{suffix}", button.label);
+        if let Some(action_index) = action_index {
+            push_action_lines(
+                result,
+                &mut action_rows,
+                continuation,
+                &label,
+                body_width,
+                action_index,
+                selected && selected_action == action_index,
+                button.kind == MessageButtonKind::Url,
+            );
+        } else {
+            result.push(Line::from(vec![
+                Span::styled(continuation.to_owned(), Style::default().fg(MUTED)),
+                Span::styled(label, Style::default().fg(MUTED)),
+            ]));
+        }
+    }
+    action_rows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_action_lines(
+    lines: &mut Vec<Line<'static>>,
+    action_rows: &mut Vec<(usize, usize)>,
+    prefix: &str,
+    label: &str,
+    width: usize,
+    action_index: usize,
+    selected: bool,
+    underlined: bool,
+) {
+    for part in wrap_cells(label, width) {
+        let row = lines.len();
+        let background = selected.then_some(Color::DarkGray);
+        let mut prefix_style = Style::default().fg(MUTED);
+        let mut action_style = Style::default().fg(ACCENT);
+        if underlined {
+            action_style = action_style.add_modifier(Modifier::UNDERLINED);
+        }
+        if let Some(background) = background {
+            prefix_style = prefix_style.bg(background);
+            action_style = action_style.bg(background);
+        }
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_owned(), prefix_style),
+            Span::styled(part, action_style),
+        ]));
+        action_rows.push((row, action_index));
+    }
 }
 
 fn message_body(
@@ -1346,17 +1491,21 @@ fn vertically_centered(area: Rect, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use qrcode::Color as QrColor;
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
     use unicode_width::UnicodeWidthStr;
 
-    use super::{editor_lines, input_cursor, render, truncate_cells, wrap_cells};
+    use super::{editor_lines, input_cursor, qr_pair_symbol, render, truncate_cells, wrap_cells};
     use crate::{
         app::{AppState, Mode, Screen},
         config::{DownloadBehavior, ReleaseChannel, Settings},
         event::{AuthPrompt, ConnectionStatus},
         input::{KeyAction, TextInput},
-        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
+        model::{
+            Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, MessageButton,
+            MessageButtonKind, MessageLink, ReplyInfo,
+        },
     };
 
     fn populated_app() -> AppState {
@@ -1389,6 +1538,8 @@ mod tests {
                 outgoing: false,
                 delivery: Delivery::Read,
                 attachment: None,
+                links: Vec::new(),
+                buttons: Vec::new(),
             }],
         );
         app
@@ -1583,6 +1734,8 @@ mod tests {
                     size: Some(2048),
                     fallback_emoji: None,
                 }),
+                links: Vec::new(),
+                buttons: Vec::new(),
             },
             Message {
                 id: 13,
@@ -1600,6 +1753,8 @@ mod tests {
                     size: None,
                     fallback_emoji: Some("🙂".to_owned()),
                 }),
+                links: Vec::new(),
+                buttons: Vec::new(),
             },
         ]);
 
@@ -1609,6 +1764,34 @@ mod tests {
         // exact amount of padding between these two tokens is backend-specific.
         assert!(output.contains("🙂"));
         assert!(output.contains("[sticker]"));
+    }
+
+    #[test]
+    fn message_links_and_inline_buttons_render_as_distinct_actions() {
+        let mut app = populated_app();
+        let message = app.messages.get_mut(&7).unwrap().first_mut().unwrap();
+        message.links = vec![MessageLink {
+            label: "Project site".to_owned(),
+            url: "https://example.com/docs".to_owned(),
+        }];
+        message.buttons = vec![
+            MessageButton {
+                label: "Confirm".to_owned(),
+                index: 0,
+                kind: MessageButtonKind::Callback,
+            },
+            MessageButton {
+                label: "Pay".to_owned(),
+                index: 1,
+                kind: MessageButtonKind::Unsupported,
+            },
+        ];
+
+        let output = render_text_mut(&mut app, 120, 36);
+        assert!(output.contains("↗ Project site → https://example.com/docs"));
+        assert!(output.contains("● [ Confirm ]"));
+        assert!(output.contains("× [ Pay ] · graphical client required"));
+        assert!(app.message_hit_region_count() >= 2);
     }
 
     #[test]
@@ -1671,6 +1854,10 @@ mod tests {
         assert!(output.contains("Esc phone"));
         assert!(output.contains('▀'));
         assert!(!output.contains(secret_url));
+        assert_eq!(qr_pair_symbol(QrColor::Dark, QrColor::Dark), "█");
+        assert_eq!(qr_pair_symbol(QrColor::Dark, QrColor::Light), "▀");
+        assert_eq!(qr_pair_symbol(QrColor::Light, QrColor::Dark), "▄");
+        assert_eq!(qr_pair_symbol(QrColor::Light, QrColor::Light), " ");
 
         let small = render_text(&app, 40, 10);
         assert!(small.contains("Compact QR needs at least"));
@@ -1696,8 +1883,14 @@ mod tests {
         assert!(compatible_text.contains("Tab compact"));
         assert!(!compatible_text.contains('▀'));
         assert!(!compatible_text.contains(secret_url));
-        assert!(buffer.content().iter().any(|cell| cell.bg == Color::Black));
-        assert!(buffer.content().iter().any(|cell| cell.bg == Color::White));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.bg == Color::Rgb(0, 0, 0)));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|cell| cell.bg == Color::Rgb(255, 255, 255)));
     }
 
     #[test]
@@ -1774,6 +1967,8 @@ mod tests {
                 outgoing: false,
                 delivery: Delivery::Read,
                 attachment: None,
+                links: Vec::new(),
+                buttons: Vec::new(),
             })
             .collect::<Vec<_>>();
         app.messages.insert(7, messages);
@@ -1799,6 +1994,8 @@ mod tests {
                 outgoing: false,
                 delivery: Delivery::Read,
                 attachment: None,
+                links: Vec::new(),
+                buttons: Vec::new(),
             });
         app.new_messages_while_scrolled = 1;
         app.new_messages_to_anchor = 1;
@@ -1832,6 +2029,8 @@ mod tests {
                 outgoing: false,
                 delivery: Delivery::Read,
                 attachment: None,
+                links: Vec::new(),
+                buttons: Vec::new(),
             }],
         );
 

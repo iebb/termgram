@@ -172,7 +172,7 @@ credentials and Telegram update state survive restarts.
 | Chats | `↑`/`↓` or `j`/`k` move, `Enter` open, `/` filter |
 | Accounts | `a` open picker, `↑`/`↓` select, `Enter` switch/add, `1`–`8` direct |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
-| Message actions | click or use `o`/`O` to select; `Enter` downloads/reveals media, `l` follows its Telegram link |
+| Message actions | click or use `o`/`O` to select each action; `Enter` activates media, links, and supported bot buttons; `l` follows the selected/first link |
 | Replies | reply rows show `↩`, target ID, and `@username`/sender; select with `o`/`O`, then `r` jumps to the target |
 | Wide layout | `Tab` switch pane |
 | Narrow conversation | `Esc` return to chats |
@@ -185,7 +185,7 @@ from the chat list. Press `s` to configure the message-ID column and the other
 essential preferences.
 
 When the terminal supports mouse reporting, clicking a chat opens it, clicking
-media activates it, and the wheel scrolls the pane under the pointer. Settings
+media, a link, or an inline bot button activates it, and the wheel scrolls the pane under the pointer. Settings
 and account rows are clickable too. Every mouse action has a keyboard equivalent,
 so terminals without mouse reporting remain fully usable.
 
@@ -197,9 +197,11 @@ an unfinished new login never traps you away from an existing account.
 During sign-in, Termgram shows a fixed progress message while Telegram checks a
 phone number, login code, or 2FA password. Password entry stays masked. QR login
 rotates its short-lived code automatically; scan it from Telegram on a device
-where the account is already signed in. Its compact display fits an 80 × 24
-terminal; press `Tab` for a larger compatibility display made only from colored
-spaces when half-block glyphs render poorly. QR tokens, codes, passwords, and
+where the account is already signed in. Its default display follows established
+terminal QR tools: exact RGB black-on-white `█`/`▀`/`▄` cells, two QR rows per
+terminal row, and a two-module quiet zone. It fits an 80 × 24 terminal; press
+`Tab` for a larger compatibility display made only from colored spaces when
+block glyphs render poorly. QR tokens, codes, passwords, and
 phone numbers are never written to settings or logs.
 
 Drag one or more files from the desktop into an open conversation and drop them
@@ -211,10 +213,14 @@ the operating system's file manager—Termgram never executes downloaded files.
 Downloads remain available for the current session and are left to the operating
 system's normal temporary-file cleanup.
 
-Termgram follows public `t.me`/`telegram.me` and `tg://resolve` links in-app,
-including message links. Private `t.me/c` and `tg://privatepost` links work for
-groups already loaded in the conversation list. Invite links and broadcast
-channel links remain outside the client's scope.
+Termgram renders Telegram URL entities—including URLs hidden behind display
+text—as explicit selectable rows. Public `t.me`/`telegram.me` and `tg://resolve`
+targets open in-app; ordinary HTTP(S) targets open through the operating system
+without a shell. Private `t.me/c` and `tg://privatepost` links work for groups
+already loaded in the conversation list. Inline URL, web-view, callback, and
+game buttons are supported; password-gated, payment, contact/location, and
+peer-selection buttons are shown as requiring a graphical Telegram client.
+Invite links and broadcast channel links remain outside the client's scope.
 
 Run `cargo test` for the reducer, input, sanitization, wrapping, and rendering
 behavior.

@@ -13,7 +13,7 @@ use crate::{
     input::{key_action, KeyAction, TextInput},
     model::{
         sanitize_terminal_line, sanitize_terminal_text, Attachment, AttachmentKind, Chat, ChatId,
-        Delivery, Message,
+        Delivery, Message, MessageLink,
     },
 };
 
@@ -27,6 +27,14 @@ pub enum AttachmentState {
     Ready,
     Downloading,
     Downloaded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageAction {
+    Attachment,
+    Reply,
+    Link(usize),
+    Button(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,8 +64,8 @@ pub enum AuthPhase {
 /// Terminal-cell strategy used to draw the transient login QR code.
 ///
 /// Compact mode fits a typical 80 x 24 terminal by using Unicode half blocks.
-/// Compatible mode avoids block glyphs entirely and draws square modules with
-/// colored spaces, at the cost of needing a larger terminal.
+/// Compatible mode avoids block glyphs entirely and draws one background cell
+/// per module, at the cost of needing a taller terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum QrRenderMode {
     #[default]
@@ -165,6 +173,9 @@ pub struct App {
     pub messages: BTreeMap<ChatId, Vec<Message>>,
     /// Actionable message selected for Enter activation.
     pub selected_message: Option<i32>,
+    /// Action within the selected message. Messages may contain several links
+    /// and inline bot buttons, so selection cannot be message-only.
+    pub selected_action: usize,
     pub filter: TextInput,
     pub narrow_conversation: bool,
     pub should_quit: bool,
@@ -216,7 +227,7 @@ pub struct App {
     /// them, so a refresh cannot collapse the newly opened conversation.
     linked_chat_ids: BTreeSet<ChatId>,
     /// Rendered actionable rows from the last frame: x start/end, y, message id.
-    message_hit_regions: Vec<(u16, u16, u16, i32)>,
+    message_hit_regions: Vec<(u16, u16, u16, (i32, usize))>,
     /// Rendered chat rows: x start/end, y, filtered-list position.
     chat_hit_regions: Vec<(u16, u16, u16, usize)>,
     /// Rendered settings and account rows: x start/end, y, selection index.
@@ -242,6 +253,7 @@ impl Default for App {
             active_chat_id: None,
             messages: BTreeMap::new(),
             selected_message: None,
+            selected_action: 0,
             filter: TextInput::new(),
             narrow_conversation: false,
             should_quit: false,
@@ -485,12 +497,13 @@ impl App {
                     self.selected_message = None;
                     return self.open_selected_chat();
                 }
-                if let Some(message_id) =
+                if let Some((message_id, action_index)) =
                     pointer_row_hit(&self.message_hit_regions, mouse.column, mouse.row)
                 {
                     self.focus = Focus::Conversation;
                     self.narrow_conversation = true;
                     self.selected_message = Some(message_id);
+                    self.selected_action = action_index;
                     return self.activate_selected_message();
                 }
                 if pointer_in_region(self.conversation_pane_region, mouse.column, mouse.row) {
@@ -641,8 +654,10 @@ impl App {
                     message.delivery = Delivery::Failed;
                     self.retry_attachments
                         .insert((chat_id, local_id), (path, caption, as_photo));
-                    self.selected_message =
-                        (self.active_chat_id == Some(chat_id)).then_some(local_id);
+                    if self.active_chat_id == Some(chat_id) {
+                        self.selected_message = Some(local_id);
+                        self.selected_action = 0;
+                    }
                     self.status_message = Some(format!(
                         "Attachment not sent: {} · Enter retries",
                         sanitize_terminal_line(&error)
@@ -691,6 +706,37 @@ impl App {
                     "Could not open Telegram link: {}",
                     sanitize_terminal_line(&error)
                 ));
+                Vec::new()
+            }
+            NetworkEvent::ButtonActivated {
+                chat_id: _,
+                message_id: _,
+                message,
+                url,
+            } => {
+                let message = message.map(|value| sanitize_terminal_line(&value));
+                if let Some(url) = url {
+                    let commands = self.activate_url(&url);
+                    if let Some(message) = message.filter(|value| !value.is_empty()) {
+                        self.status_message = Some(message);
+                    }
+                    commands
+                } else {
+                    self.status_message = Some(
+                        message
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| "Button activated".to_owned()),
+                    );
+                    Vec::new()
+                }
+            }
+            NetworkEvent::ButtonFailed {
+                chat_id: _,
+                message_id: _,
+                error,
+            } => {
+                self.status_message =
+                    Some(format!("Button failed: {}", sanitize_terminal_line(&error)));
                 Vec::new()
             }
             NetworkEvent::Status(status) => {
@@ -841,16 +887,36 @@ impl App {
 
     #[must_use]
     pub fn message_is_actionable(&self, message: &Message) -> bool {
-        message.reply_to.is_some()
-            || (message.id > 0 && message.attachment.is_some())
+        !self.message_actions(message).is_empty()
+    }
+
+    #[must_use]
+    pub fn message_actions(&self, message: &Message) -> Vec<MessageAction> {
+        let mut actions = Vec::new();
+        if (message.id > 0 && message.attachment.is_some())
             || self
                 .retry_attachments
                 .contains_key(&(message.chat_id, message.id))
-            || telegram_link(&message.text).is_some()
+        {
+            actions.push(MessageAction::Attachment);
+        }
+        if message.reply_to.is_some() {
+            actions.push(MessageAction::Reply);
+        }
+        actions.extend((0..message.links.len()).map(MessageAction::Link));
+        actions.extend(
+            message
+                .buttons
+                .iter()
+                .enumerate()
+                .filter(|(_, button)| button.kind.is_supported())
+                .map(|(index, _)| MessageAction::Button(index)),
+        );
+        actions
     }
 
     /// Replace row hit regions after rendering the current conversation.
-    pub fn set_message_hit_regions(&mut self, regions: Vec<(u16, u16, u16, i32)>) {
+    pub fn set_message_hit_regions(&mut self, regions: Vec<(u16, u16, u16, (i32, usize))>) {
         self.message_hit_regions = regions;
     }
 
@@ -1516,6 +1582,8 @@ impl App {
             outgoing: true,
             delivery: Delivery::Pending,
             attachment: None,
+            links: plain_message_links(&text),
+            buttons: Vec::new(),
         };
         let mut commands = self.receive_message(pending, replacing_failed.is_none(), false);
         self.status_message = None;
@@ -1545,6 +1613,8 @@ impl App {
                 outgoing: true,
                 delivery: Delivery::Pending,
                 attachment: Some(attachment),
+                links: Vec::new(),
+                buttons: Vec::new(),
             };
             commands.extend(self.receive_message(pending, true, false));
             commands.push(TelegramCommand::SendAttachment {
@@ -1570,26 +1640,35 @@ impl App {
         let actionable = self
             .active_messages()
             .iter()
-            .filter(|message| self.message_is_actionable(message))
-            .map(|message| message.id)
+            .flat_map(|message| {
+                self.message_actions(message)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(action, _)| (message.id, action))
+            })
             .collect::<Vec<_>>();
         if actionable.is_empty() {
             self.selected_message = None;
+            self.selected_action = 0;
             self.status_message =
-                Some("No replies, files, or Telegram links in loaded messages".to_owned());
+                Some("No replies, files, links, or buttons in loaded messages".to_owned());
             return Vec::new();
         }
-        let selected = self
-            .selected_message
-            .and_then(|id| actionable.iter().position(|candidate| *candidate == id));
+        let selected = self.selected_message.and_then(|id| {
+            actionable
+                .iter()
+                .position(|candidate| *candidate == (id, self.selected_action))
+        });
         let index = match (selected, forward) {
             (Some(index), true) => index.saturating_add(1).min(actionable.len() - 1),
             (Some(index), false) => index.saturating_sub(1),
             (None, true) => 0,
             (None, false) => actionable.len() - 1,
         };
-        self.selected_message = Some(actionable[index]);
-        self.viewport_anchor_message = Some(actionable[index]);
+        let (message_id, action) = actionable[index];
+        self.selected_message = Some(message_id);
+        self.selected_action = action;
+        self.viewport_anchor_message = Some(message_id);
         self.viewport_anchor_row = 0;
         self.message_scroll = 1;
         self.status_message = None;
@@ -1613,6 +1692,49 @@ impl App {
             return Vec::new();
         };
 
+        let actions = self.message_actions(&message);
+        let Some(action) = actions.get(self.selected_action).copied() else {
+            self.selected_action = 0;
+            return Vec::new();
+        };
+
+        if action == MessageAction::Attachment {
+            return self.activate_attachment(chat_id, message_id, &message);
+        }
+        if action == MessageAction::Reply {
+            return self.navigate_to_selected_reply();
+        }
+        if let MessageAction::Link(index) = action {
+            let Some(link) = message.links.get(index) else {
+                return Vec::new();
+            };
+            return self.activate_url(&link.url);
+        }
+        let MessageAction::Button(index) = action else {
+            return Vec::new();
+        };
+        let Some(button) = message.buttons.get(index) else {
+            return Vec::new();
+        };
+        if !button.kind.is_supported() {
+            self.status_message =
+                Some("This button requires a graphical Telegram client".to_owned());
+            return Vec::new();
+        }
+        self.status_message = Some(format!("Activating {}…", button.label));
+        vec![TelegramCommand::ActivateButton {
+            chat_id,
+            message_id,
+            button_index: button.index,
+        }]
+    }
+
+    fn activate_attachment(
+        &mut self,
+        chat_id: ChatId,
+        message_id: i32,
+        message: &Message,
+    ) -> Vec<TelegramCommand> {
         if let Some((path, caption, as_photo)) =
             self.retry_attachments.get(&(chat_id, message_id)).cloned()
         {
@@ -1674,12 +1796,6 @@ impl App {
             }];
         }
 
-        if let Some(url) = telegram_link(&message.text) {
-            self.pending_telegram_link = Some(url.clone());
-            self.status_message = Some("Opening Telegram link…".to_owned());
-            return vec![TelegramCommand::ResolveTelegramLink { url }];
-        }
-
         Vec::new()
     }
 
@@ -1693,16 +1809,43 @@ impl App {
             })
             .cloned()
         else {
-            self.status_message = Some("Select a Telegram link with o first".to_owned());
+            self.status_message = Some("Select a link with o first".to_owned());
             return Vec::new();
         };
-        let Some(url) = telegram_link(&message.text) else {
-            self.status_message = Some("Selected message has no Telegram link".to_owned());
+        let links = &message.links;
+        let selected = self
+            .message_actions(&message)
+            .get(self.selected_action)
+            .and_then(|action| match action {
+                MessageAction::Link(index) => links.get(*index),
+                _ => None,
+            })
+            .or_else(|| links.first());
+        let Some(link) = selected else {
+            self.status_message = Some("Selected message has no link".to_owned());
             return Vec::new();
         };
-        self.pending_telegram_link = Some(url.clone());
-        self.status_message = Some("Opening Telegram link…".to_owned());
-        vec![TelegramCommand::ResolveTelegramLink { url }]
+        self.activate_url(&link.url)
+    }
+
+    fn activate_url(&mut self, url: &str) -> Vec<TelegramCommand> {
+        if telegram_link(url).is_some() {
+            self.pending_telegram_link = Some(url.to_owned());
+            self.status_message = Some("Opening Telegram link…".to_owned());
+            return vec![TelegramCommand::ResolveTelegramLink {
+                url: url.to_owned(),
+            }];
+        }
+        match open_external_url(url) {
+            Ok(()) => self.status_message = Some("Opened link in your browser".to_owned()),
+            Err(error) => {
+                self.status_message = Some(format!(
+                    "Could not open link: {}",
+                    sanitize_terminal_line(&error.to_string())
+                ));
+            }
+        }
+        Vec::new()
     }
 
     fn navigate_to_selected_reply(&mut self) -> Vec<TelegramCommand> {
@@ -1773,6 +1916,7 @@ impl App {
 
     fn focus_reply_target(&mut self, message_id: i32) {
         self.selected_message = Some(message_id);
+        self.selected_action = 0;
         self.viewport_anchor_message = Some(message_id);
         self.viewport_anchor_row = 0;
         // A non-zero detached state instructs the renderer to honor the
@@ -1806,6 +1950,7 @@ impl App {
         // cannot evict an older exact link/reply target during navigation.
         self.active_chat_id = Some(chat_id);
         self.selected_message = selected_message;
+        self.selected_action = 0;
         if let Some(message) = message {
             self.update_message(message);
         }
@@ -2522,6 +2667,54 @@ fn sanitize_message(message: &mut Message) {
             .take()
             .map(|emoji| sanitize_terminal_line(&emoji));
     }
+    for link in &mut message.links {
+        link.label = sanitize_terminal_line(&link.label);
+        link.url = sanitize_terminal_line(&link.url);
+    }
+    for button in &mut message.buttons {
+        button.label = sanitize_terminal_line(&button.label);
+    }
+    for inferred in plain_message_links(&message.text) {
+        if !message.links.iter().any(|link| link.url == inferred.url) {
+            message.links.push(inferred);
+        }
+    }
+}
+
+fn plain_message_links(text: &str) -> Vec<MessageLink> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let label = word.trim_matches(|character: char| {
+                matches!(character, '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'')
+            });
+            let label = label.trim_end_matches(|character: char| {
+                matches!(character, '.' | ',' | ';' | ':' | '!' | '?')
+            });
+            if label.is_empty() || label.len() > 8 * 1024 || label.chars().any(char::is_control) {
+                return None;
+            }
+            let lower = label.to_ascii_lowercase();
+            let url = if lower.starts_with("https://")
+                || lower.starts_with("http://")
+                || lower.starts_with("tg://")
+            {
+                label.to_owned()
+            } else if lower.starts_with("t.me/")
+                || lower.starts_with("www.t.me/")
+                || lower.starts_with("telegram.me/")
+                || lower.starts_with("www.telegram.me/")
+            {
+                format!("https://{label}")
+            } else {
+                return None;
+            };
+            Some(MessageLink {
+                label: label.to_owned(),
+                url,
+            })
+        })
+        .take(32)
+        .collect()
 }
 
 /// Extract the first internal Telegram chat/message link without treating
@@ -2721,6 +2914,44 @@ fn reveal_path_platform(_path: &Path) -> std::io::Result<std::process::Child> {
     ))
 }
 
+fn open_external_url(url: &str) -> std::io::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if url.len() > 8 * 1024
+        || url.chars().any(char::is_control)
+        || url.chars().any(char::is_whitespace)
+        || !(lower.starts_with("https://") || lower.starts_with("http://"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only HTTP(S) links can be opened",
+        ));
+    }
+    open_external_url_platform(url).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn open_external_url_platform(url: &str) -> std::io::Result<std::process::Child> {
+    Command::new("open").arg("-u").arg(url).spawn()
+}
+
+#[cfg(target_os = "linux")]
+fn open_external_url_platform(url: &str) -> std::io::Result<std::process::Child> {
+    Command::new("xdg-open").arg(url).spawn()
+}
+
+#[cfg(target_os = "windows")]
+fn open_external_url_platform(url: &str) -> std::io::Result<std::process::Child> {
+    Command::new("explorer.exe").arg(url).spawn()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn open_external_url_platform(_url: &str) -> std::io::Result<std::process::Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening links is unsupported on this platform",
+    ))
+}
+
 fn normalized_messages(mut messages: Vec<Message>) -> Vec<Message> {
     for message in &mut messages {
         sanitize_message(message);
@@ -2823,7 +3054,10 @@ mod tests {
         config::{DownloadBehavior, ReleaseChannel, Settings, MAX_ACCOUNTS},
         event::{AppEvent, AuthPrompt, NetworkEvent, TelegramCommand},
         input::KeyAction,
-        model::{Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, ReplyInfo},
+        model::{
+            Attachment, AttachmentKind, Chat, ChatKind, Delivery, Message, MessageButton,
+            MessageButtonKind, MessageLink, ReplyInfo,
+        },
     };
 
     fn chat(id: i64, title: &str) -> Chat {
@@ -2848,6 +3082,8 @@ mod tests {
             outgoing,
             delivery: Delivery::Sent,
             attachment: None,
+            links: super::plain_message_links(text),
+            buttons: Vec::new(),
         }
     }
 
@@ -3725,6 +3961,44 @@ mod tests {
     }
 
     #[test]
+    fn message_actions_cycle_across_links_and_inline_buttons() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        let mut actionable = message(21, 1, "actions", false);
+        actionable.links = vec![MessageLink {
+            label: "Rust chat".to_owned(),
+            url: "https://t.me/rustlang/42".to_owned(),
+        }];
+        actionable.buttons = vec![MessageButton {
+            label: "Confirm".to_owned(),
+            index: 3,
+            kind: MessageButtonKind::Callback,
+        }];
+        app.handle_network(NetworkEvent::NewMessage(actionable));
+
+        app.handle_action(KeyAction::Character('o'));
+        assert_eq!(app.selected_message, Some(21));
+        assert_eq!(app.selected_action, 0);
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::ResolveTelegramLink {
+                url: "https://t.me/rustlang/42".to_owned(),
+            }]
+        );
+
+        app.handle_action(KeyAction::Character('o'));
+        assert_eq!(app.selected_action, 1);
+        assert_eq!(
+            app.handle_action(KeyAction::Enter),
+            vec![TelegramCommand::ActivateButton {
+                chat_id: 1,
+                message_id: 21,
+                button_index: 3,
+            }]
+        );
+    }
+
+    #[test]
     fn linked_target_survives_history_and_dialog_refresh_with_anchor() {
         let mut app = ready_app();
         open_first(&mut app);
@@ -4152,6 +4426,8 @@ mod tests {
                 size: Some(1),
                 fallback_emoji: None,
             }),
+            links: Vec::new(),
+            buttons: Vec::new(),
         };
         let second = Message {
             id: -2,
@@ -4263,7 +4539,7 @@ mod tests {
             fallback_emoji: None,
         });
         app.handle_network(NetworkEvent::NewMessage(photo));
-        app.set_message_hit_regions(vec![(10, 70, 8, 21)]);
+        app.set_message_hit_regions(vec![(10, 70, 8, (21, 0))]);
 
         let commands = app.update(AppEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),

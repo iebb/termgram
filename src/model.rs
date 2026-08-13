@@ -86,6 +86,40 @@ pub struct Message {
     pub outgoing: bool,
     pub delivery: Delivery,
     pub attachment: Option<Attachment>,
+    /// HTTP(S) and Telegram targets extracted from message entities. Hidden
+    /// `textUrl` targets live here instead of being appended to the body.
+    pub links: Vec<MessageLink>,
+    /// Inline bot buttons rendered below the message. Callback payloads stay
+    /// in the Telegram worker and are looked up by the stable flattened index.
+    pub buttons: Vec<MessageButton>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageLink {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageButton {
+    pub label: String,
+    pub index: u16,
+    pub kind: MessageButtonKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageButtonKind {
+    Url,
+    Callback,
+    Game,
+    Unsupported,
+}
+
+impl MessageButtonKind {
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Url | Self::Callback | Self::Game)
+    }
 }
 
 /// Lightweight metadata used to render and navigate a reply.

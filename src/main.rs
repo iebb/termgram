@@ -536,6 +536,15 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
             url,
             error: "Telegram command queue is busy".to_owned(),
         },
+        TelegramCommand::ActivateButton {
+            chat_id,
+            message_id,
+            button_index: _,
+        } => NetworkEvent::ButtonFailed {
+            chat_id,
+            message_id,
+            error: "Telegram command queue is busy".to_owned(),
+        },
         TelegramCommand::LoadHistory {
             chat_id,
             request_id,

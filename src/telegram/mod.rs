@@ -23,7 +23,7 @@ use crate::config::Config;
 use crate::event::{AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand};
 use crate::model::{
     sanitize_terminal_line, sanitize_terminal_text, Attachment, AttachmentKind, Chat, ChatId,
-    ChatKind, Delivery, Message, ReplyInfo,
+    ChatKind, Delivery, Message, MessageButton, MessageButtonKind, MessageLink, ReplyInfo,
 };
 
 const HISTORY_LIMIT: usize = 80;
@@ -1376,6 +1376,31 @@ async fn handle_command(
                 }
             }
         }
+        TelegramCommand::ActivateButton {
+            chat_id,
+            message_id,
+            button_index,
+        } => match activate_inline_button(client, cache, chat_id, message_id, button_index).await {
+            Ok((message, url)) => {
+                events
+                    .send(NetworkEvent::ButtonActivated {
+                        chat_id,
+                        message_id,
+                        message,
+                        url,
+                    })
+                    .await?;
+            }
+            Err(error) => {
+                events
+                    .send(NetworkEvent::ButtonFailed {
+                        chat_id,
+                        message_id,
+                        error: format!("Could not activate button: {error:#}"),
+                    })
+                    .await?;
+            }
+        },
         TelegramCommand::MarkRead { chat_id } => {
             let result = match cache.peers.get(&chat_id).copied() {
                 Some(peer) => client.mark_as_read(peer).await,
@@ -1411,6 +1436,77 @@ async fn handle_command(
         | TelegramCommand::SwitchAccount { .. } => {}
     }
     Ok(false)
+}
+
+async fn activate_inline_button(
+    client: &Client,
+    cache: &WorkerCache,
+    chat_id: ChatId,
+    message_id: i32,
+    button_index: u16,
+) -> Result<(Option<String>, Option<String>)> {
+    if message_id <= 0 {
+        bail!("invalid Telegram message identifier")
+    }
+    let peer = *cache
+        .peers
+        .get(&chat_id)
+        .context("conversation is missing its Telegram peer reference")?;
+    let mut messages = client
+        .get_messages_by_id(peer, &[message_id])
+        .await
+        .context("could not refresh button markup")?;
+    let message = messages
+        .pop()
+        .flatten()
+        .context("button message is unavailable")?;
+    let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = message.reply_markup() else {
+        bail!("message no longer has inline buttons")
+    };
+    let button = markup
+        .rows
+        .into_iter()
+        .flat_map(|row| match row {
+            tl::enums::KeyboardButtonRow::Row(row) => row.buttons,
+        })
+        .nth(usize::from(button_index))
+        .context("button no longer exists")?;
+    match button {
+        tl::enums::KeyboardButton::Url(button) => Ok((None, Some(button.url))),
+        tl::enums::KeyboardButton::WebView(button) => Ok((None, Some(button.url))),
+        tl::enums::KeyboardButton::SimpleWebView(button) => Ok((None, Some(button.url))),
+        tl::enums::KeyboardButton::Callback(button) if button.requires_password => {
+            bail!("this callback requires password confirmation in a graphical client")
+        }
+        tl::enums::KeyboardButton::Callback(button) => {
+            bot_callback(client, peer, message_id, Some(button.data), false).await
+        }
+        tl::enums::KeyboardButton::Game(_) => {
+            bot_callback(client, peer, message_id, None, true).await
+        }
+        _ => bail!("this button type is not supported in the terminal"),
+    }
+}
+
+async fn bot_callback(
+    client: &Client,
+    peer: PeerRef,
+    message_id: i32,
+    data: Option<Vec<u8>>,
+    game: bool,
+) -> Result<(Option<String>, Option<String>)> {
+    let answer = client
+        .invoke(&tl::functions::messages::GetBotCallbackAnswer {
+            game,
+            peer: peer.into(),
+            msg_id: message_id,
+            data,
+            password: None,
+        })
+        .await
+        .context("Telegram rejected the bot callback")?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(answer) = answer;
+    Ok((answer.message, answer.url))
 }
 
 async fn upload_attachment(
@@ -1917,7 +2013,7 @@ async fn map_message(
         // Telegram stores the Unicode fallback for custom-emoji entities in
         // the raw message string. Keep that text instead of trying to render
         // the custom document in a terminal.
-        text: message_text_with_link_fallbacks(message),
+        text: sanitized_message_text(message),
         timestamp: message.date(),
         outgoing: message.outgoing(),
         delivery: if message.outgoing()
@@ -1933,6 +2029,8 @@ async fn map_message(
             Delivery::Read
         },
         attachment: media.as_ref().and_then(attachment_from_media),
+        links: message_links(message),
+        buttons: message_buttons(message),
     })
 }
 
@@ -2130,33 +2228,124 @@ fn peer_id(message: &TelegramMessage) -> Result<ChatId> {
 
 fn message_preview(message: &TelegramMessage) -> String {
     let media = message.media();
-    message_preview_with_media(&message_text_with_link_fallbacks(message), media.as_ref())
+    message_preview_with_media(&sanitized_message_text(message), media.as_ref())
 }
 
-/// Telegram may hide a URL behind formatted display text. A terminal cannot
-/// click that entity directly, so append supported Telegram targets as plain
-/// text while leaving already-visible URLs untouched.
-fn message_text_with_link_fallbacks(message: &TelegramMessage) -> String {
-    let mut text = sanitize_terminal_text(message.text());
+fn sanitized_message_text(message: &TelegramMessage) -> String {
+    sanitize_terminal_text(message.text())
+}
+
+fn message_links(message: &TelegramMessage) -> Vec<MessageLink> {
+    const MAX_LINKS: usize = 32;
+    let raw_text = message.text();
     let Some(entities) = message.fmt_entities() else {
-        return text;
+        return Vec::new();
     };
-    for entity in entities {
-        let grammers_client::tl::enums::MessageEntity::TextUrl(entity) = entity else {
+    let mut links = Vec::new();
+    for entity in entities.iter().take(MAX_LINKS.saturating_mul(2)) {
+        let label = utf16_entity_text(raw_text, entity.offset(), entity.length())
+            .map(sanitize_terminal_line)
+            .unwrap_or_default();
+        let target = match entity {
+            tl::enums::MessageEntity::Url(_) => normalize_message_url(&label),
+            tl::enums::MessageEntity::TextUrl(entity) => normalize_message_url(&entity.url),
+            _ => None,
+        };
+        let Some(url) = target else {
             continue;
         };
-        let url = sanitize_terminal_line(&entity.url);
-        if url.is_empty() || text.contains(&url) || parse_telegram_link(&url).is_err() {
-            continue;
+        let label = if label.is_empty() { url.clone() } else { label };
+        if !links
+            .iter()
+            .any(|existing: &MessageLink| existing.url == url && existing.label == label)
+        {
+            links.push(MessageLink { label, url });
         }
-        if !text.is_empty() {
-            text.push(' ');
+        if links.len() == MAX_LINKS {
+            break;
         }
-        text.push('<');
-        text.push_str(&url);
-        text.push('>');
     }
-    text
+    links
+}
+
+fn message_buttons(message: &TelegramMessage) -> Vec<MessageButton> {
+    const MAX_BUTTONS: usize = 64;
+    let Some(tl::enums::ReplyMarkup::ReplyInlineMarkup(markup)) = message.reply_markup() else {
+        return Vec::new();
+    };
+    markup
+        .rows
+        .into_iter()
+        .flat_map(|row| match row {
+            tl::enums::KeyboardButtonRow::Row(row) => row.buttons,
+        })
+        .take(MAX_BUTTONS)
+        .enumerate()
+        .filter_map(|(index, button)| {
+            let kind = match &button {
+                tl::enums::KeyboardButton::Url(_)
+                | tl::enums::KeyboardButton::WebView(_)
+                | tl::enums::KeyboardButton::SimpleWebView(_) => MessageButtonKind::Url,
+                tl::enums::KeyboardButton::Callback(button) if !button.requires_password => {
+                    MessageButtonKind::Callback
+                }
+                tl::enums::KeyboardButton::Game(_) => MessageButtonKind::Game,
+                _ => MessageButtonKind::Unsupported,
+            };
+            let label = sanitize_terminal_line(&button.text());
+            let index = u16::try_from(index).ok()?;
+            Some(MessageButton { label, index, kind })
+        })
+        .collect()
+}
+
+fn normalize_message_url(value: &str) -> Option<String> {
+    const MAX_URL_BYTES: usize = 8 * 1024;
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_URL_BYTES
+        || value.chars().any(char::is_control)
+        || value.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("tg://") {
+        Some(value.to_owned())
+    } else if lower.starts_with("www.") || value.contains('.') {
+        Some(format!("https://{value}"))
+    } else {
+        None
+    }
+}
+
+fn utf16_entity_text(text: &str, offset: i32, length: i32) -> Option<&str> {
+    let start_units = usize::try_from(offset).ok()?;
+    let length_units = usize::try_from(length).ok()?;
+    let end_units = start_units.checked_add(length_units)?;
+    let mut units = 0;
+    let mut start = None;
+    let mut end = None;
+    for (byte, character) in text.char_indices() {
+        if units == start_units {
+            start = Some(byte);
+        }
+        if units == end_units {
+            end = Some(byte);
+            break;
+        }
+        units += character.len_utf16();
+        if units > start_units && start.is_none() || units > end_units {
+            return None;
+        }
+    }
+    if units == start_units && start.is_none() {
+        start = Some(text.len());
+    }
+    if units == end_units && end.is_none() {
+        end = Some(text.len());
+    }
+    text.get(start?..end?)
 }
 
 fn message_preview_with_media(text: &str, media: Option<&Media>) -> String {
@@ -2272,10 +2461,11 @@ mod tests {
     use super::{
         advance_dialog_watermark, base64_url_no_pad, begin_unresolved_refresh,
         cache_message_sender, cache_sender_name, contains_login_token_update, hydrate_reply_sender,
-        parse_telegram_link, qr_login_url, qr_refresh_delay, reconcile_dialog_snapshot,
-        sanitize_download_name, take_auth_interruption, username_or_sender, AuthInterruption,
-        TelegramLink, WorkerCache, DEFAULT_QR_REFRESH_DELAY, MESSAGE_SENDER_CACHE_LIMIT,
-        MIN_QR_REFRESH_DELAY, TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
+        normalize_message_url, parse_telegram_link, qr_login_url, qr_refresh_delay,
+        reconcile_dialog_snapshot, sanitize_download_name, take_auth_interruption,
+        username_or_sender, utf16_entity_text, AuthInterruption, TelegramLink, WorkerCache,
+        DEFAULT_QR_REFRESH_DELAY, MESSAGE_SENDER_CACHE_LIMIT, MIN_QR_REFRESH_DELAY,
+        TRANSIENT_SENDER_NAME_LIMIT, UNRESOLVED_REFRESH_COOLDOWN,
     };
 
     #[test]
@@ -2299,6 +2489,17 @@ mod tests {
         assert_eq!(qr_refresh_delay(just_expired), MIN_QR_REFRESH_DELAY);
         let far_future = i32::try_from(now.saturating_add(600)).unwrap_or(i32::MAX);
         assert_eq!(qr_refresh_delay(far_future), DEFAULT_QR_REFRESH_DELAY);
+    }
+
+    #[test]
+    fn message_entity_slices_use_telegram_utf16_offsets() {
+        assert_eq!(utf16_entity_text("a🙂b", 1, 2), Some("🙂"));
+        assert_eq!(utf16_entity_text("a🙂b", 2, 1), None);
+        assert_eq!(
+            normalize_message_url("example.com/a"),
+            Some("https://example.com/a".to_owned())
+        );
+        assert_eq!(normalize_message_url("javascript:alert(1)"), None);
     }
 
     #[test]
@@ -2484,6 +2685,8 @@ mod tests {
             outgoing: false,
             delivery: Delivery::Read,
             attachment: None,
+            links: Vec::new(),
+            buttons: Vec::new(),
         };
 
         hydrate_reply_sender(&mut message, &cache);
@@ -2539,6 +2742,8 @@ mod tests {
             outgoing: false,
             delivery: Delivery::Read,
             attachment: None,
+            links: Vec::new(),
+            buttons: Vec::new(),
         };
 
         hydrate_reply_sender(&mut message, &cache);

@@ -104,6 +104,13 @@ pub enum TelegramCommand {
     ResolveTelegramLink {
         url: String,
     },
+    /// Activate a flattened inline-keyboard button. The worker refetches the
+    /// current markup so callback data never enters the UI model or logs.
+    ActivateButton {
+        chat_id: ChatId,
+        message_id: i32,
+        button_index: u16,
+    },
     MarkRead {
         chat_id: ChatId,
     },
@@ -188,6 +195,16 @@ impl fmt::Debug for TelegramCommand {
             Self::ResolveTelegramLink { url } => formatter
                 .debug_struct("ResolveTelegramLink")
                 .field("url", url)
+                .finish(),
+            Self::ActivateButton {
+                chat_id,
+                message_id,
+                button_index,
+            } => formatter
+                .debug_struct("ActivateButton")
+                .field("chat_id", chat_id)
+                .field("message_id", message_id)
+                .field("button_index", button_index)
                 .finish(),
             Self::MarkRead { chat_id } => formatter
                 .debug_struct("MarkRead")
@@ -290,6 +307,17 @@ pub enum NetworkEvent {
     },
     LinkFailed {
         url: String,
+        error: String,
+    },
+    ButtonActivated {
+        chat_id: ChatId,
+        message_id: i32,
+        message: Option<String>,
+        url: Option<String>,
+    },
+    ButtonFailed {
+        chat_id: ChatId,
+        message_id: i32,
         error: String,
     },
     Status(ConnectionStatus),

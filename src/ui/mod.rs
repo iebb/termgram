@@ -561,13 +561,13 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
             app.settings().show_message_ids,
             &actions,
         );
+        let body_action = rendered.body_action;
+        let body_height = rendered.body_height;
         let hit_rows = rendered
             .action_rows
             .into_iter()
-            .map(|(row, action)| (start.saturating_add(row), action))
-            .chain(rendered.body_action.into_iter().flat_map(|action| {
-                (0..rendered.body_height).map(move |row| (start.saturating_add(row), action))
-            }))
+            .map(|(row, action)| (start.saturating_add(row), Some(action)))
+            .chain((0..body_height).map(move |row| (start.saturating_add(row), body_action)))
             .collect();
         lines.extend(rendered.lines);
         layouts.push(MessageLayout {
@@ -653,7 +653,7 @@ struct MessageLayout {
     id: i32,
     start: usize,
     height: usize,
-    hit_rows: Vec<(usize, usize)>,
+    hit_rows: Vec<(usize, Option<usize>)>,
 }
 
 fn render_new_message_badge(frame: &mut Frame<'_>, area: Rect, count: usize) {
@@ -678,6 +678,16 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &AppState, enabled: b
     let active = app.mode == Mode::Compose;
     let title = if !enabled || app.active_chat_id.is_none() {
         " Message · select a chat ".to_owned()
+    } else if let Some(reply) = app.active_reply_target() {
+        let sender = reply.sender.as_deref().unwrap_or("unknown");
+        if active {
+            format!(
+                " Reply to #{} {sender} · Enter send · Esc cancel ",
+                reply.message_id
+            )
+        } else {
+            format!(" Reply draft to #{} {sender} · i resume ", reply.message_id)
+        }
     } else if active {
         " Message · Enter send · Esc keep draft ".to_owned()
     } else {
@@ -745,17 +755,20 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState, narrow: bool
             Style::default().fg(SUCCESS),
         ))
     } else if app.mode == Mode::Compose {
-        Line::from(" Enter send  ·  drop files to attach  ·  Ctrl+J newline  ·  Esc")
+        let prefix = app.active_reply_target().map_or_else(String::new, |reply| {
+            format!(" Reply #{}  · ", reply.message_id)
+        });
+        Line::from(format!(
+            "{prefix} Enter send  ·  drop files to attach  ·  Ctrl+J newline  ·  Esc"
+        ))
     } else if app.mode == Mode::Settings {
         Line::from(" ↑↓ select  ·  Enter toggle  ·  Esc close settings")
     } else if app.mode == Mode::Accounts {
         Line::from(" ↑↓ select  ·  Enter switch/add  ·  Esc close accounts")
     } else if narrow && app.narrow_conversation {
-        Line::from(" o/O action  ·  Enter activate  ·  r reply  ·  Esc chats")
+        Line::from(" [/ ] select · R reply · o/O action · r target · Esc chats")
     } else {
-        Line::from(
-            " ↑↓/jk move  ·  o/O action  ·  Enter activate  ·  r reply  ·  ? help  ·  q quit",
-        )
+        Line::from(" ↑↓/jk move · [/] select · R reply · o/O action · r target · ? help · q quit")
     };
     frame.render_widget(
         Paragraph::new(content).style(Style::default().fg(MUTED)),
@@ -777,26 +790,24 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Span::raw("  ↑↓ or j/k · Enter opens"),
         ]),
         Line::from("Tab             switch chats / conversation"),
-        Line::from("PgUp / PgDn     scroll conversation"),
-        Line::from("Home / End      oldest loaded / latest"),
-        Line::from("o / O           next / previous reply, file, link, or button"),
-        Line::from("r               jump to selected reply target"),
-        Line::from("Enter / click   activate selected media, link, or bot button"),
+        Line::from("PgUp/PgDn/Home/End  scroll / oldest / latest"),
+        Line::from("o/O + Enter     select and activate message actions"),
+        Line::from("[ / ]           select older / newer message (latest first)"),
+        Line::from("R               compose a reply to selected/latest message"),
+        Line::from("r               jump to a selected reply's target"),
+        Line::from("Right click     reply to a message under the pointer"),
         Line::from("l               follow selected/first link in a message"),
         Line::from("/               filter chats (from chat list)"),
-        Line::from("s               settings"),
-        Line::from("a               accounts"),
-        Line::from("F2 / F3         next account / add account"),
+        Line::from("s / a           settings / accounts"),
+        Line::from("F2 / F3         next / add account"),
         Line::from(""),
         Line::from(vec![
             Span::styled("Writing", Style::default().bold()),
             Span::raw("     i or Enter starts"),
         ]),
-        Line::from("Enter           send"),
-        Line::from("Ctrl+J          insert a new line"),
-        Line::from("Ctrl+A / Ctrl+E start / end"),
-        Line::from("Ctrl+W / Ctrl+U delete word / clear"),
-        Line::from("Esc             keep draft and leave composer"),
+        Line::from("Enter / Ctrl+J  send / insert a new line"),
+        Line::from("Ctrl+A/E/W/U    start / end / delete word / clear"),
+        Line::from("Esc             cancel reply, then keep draft and leave"),
         Line::from("Drop / paste    send existing local file paths"),
         Line::from(""),
         Line::from("? / Esc         close help"),
@@ -1498,7 +1509,7 @@ mod tests {
 
     use super::{editor_lines, input_cursor, qr_pair_symbol, render, truncate_cells, wrap_cells};
     use crate::{
-        app::{AppState, Mode, Screen},
+        app::{AppState, Focus, Mode, Screen},
         config::{DownloadBehavior, ReleaseChannel, Settings},
         event::{AuthPrompt, ConnectionStatus},
         input::{KeyAction, TextInput},
@@ -1604,6 +1615,17 @@ mod tests {
         let unicode = TextInput::from_value("東京🙂a");
         assert_eq!(editor_lines(unicode.value(), 5), ["東京", "🙂a"]);
         assert_eq!(input_cursor(&unicode, 5), (1, 3));
+    }
+
+    #[test]
+    fn reply_composer_keeps_its_target_visible() {
+        let mut app = populated_app();
+        app.focus = Focus::Conversation;
+        app.handle_action(KeyAction::Character('R'));
+
+        let output = render_text(&app, 100, 24);
+        assert!(output.contains("Reply to #11 Alice"));
+        assert!(output.contains("Reply #11"));
     }
 
     #[test]

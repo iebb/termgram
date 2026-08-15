@@ -504,10 +504,12 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
             chat_id,
             local_id,
             text,
+            reply_to,
         } => NetworkEvent::SendFailed {
             chat_id,
             local_id,
             text,
+            reply_to,
             error: "Telegram command queue is busy".to_owned(),
         },
         TelegramCommand::SendAttachment {
@@ -516,12 +518,14 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
             path,
             caption,
             as_photo,
+            reply_to,
         } => NetworkEvent::AttachmentSendFailed {
             chat_id,
             local_id,
             path,
             caption,
             as_photo,
+            reply_to,
             error: "Telegram command queue is busy".to_owned(),
         },
         TelegramCommand::DownloadAttachment {

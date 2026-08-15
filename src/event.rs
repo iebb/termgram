@@ -83,6 +83,9 @@ pub enum TelegramCommand {
         chat_id: ChatId,
         local_id: i32,
         text: String,
+        /// Positive message identifier in this conversation when composing a
+        /// native Telegram reply.
+        reply_to: Option<i32>,
     },
     /// Upload a local path and send it as Telegram media.
     SendAttachment {
@@ -93,6 +96,9 @@ pub enum TelegramCommand {
         /// Compress image input as a Telegram photo; otherwise preserve it as
         /// a document.
         as_photo: bool,
+        /// Positive message identifier in this conversation when the media is
+        /// sent as a reply.
+        reply_to: Option<i32>,
     },
     /// Lazily download media from a known message into Termgram's temporary
     /// download directory.
@@ -164,11 +170,13 @@ impl fmt::Debug for TelegramCommand {
                 chat_id,
                 local_id,
                 text,
+                reply_to,
             } => formatter
                 .debug_struct("SendMessage")
                 .field("chat_id", chat_id)
                 .field("local_id", local_id)
                 .field("text", text)
+                .field("reply_to", reply_to)
                 .finish(),
             Self::SendAttachment {
                 chat_id,
@@ -176,6 +184,7 @@ impl fmt::Debug for TelegramCommand {
                 path,
                 caption,
                 as_photo,
+                reply_to,
             } => formatter
                 .debug_struct("SendAttachment")
                 .field("chat_id", chat_id)
@@ -183,6 +192,7 @@ impl fmt::Debug for TelegramCommand {
                 .field("path", path)
                 .field("caption", caption)
                 .field("as_photo", as_photo)
+                .field("reply_to", reply_to)
                 .finish(),
             Self::DownloadAttachment {
                 chat_id,
@@ -279,6 +289,7 @@ pub enum NetworkEvent {
         chat_id: ChatId,
         local_id: i32,
         text: String,
+        reply_to: Option<i32>,
         error: String,
     },
     /// An attachment send failed. Kept distinct from text failures so the UI
@@ -289,6 +300,7 @@ pub enum NetworkEvent {
         path: PathBuf,
         caption: String,
         as_photo: bool,
+        reply_to: Option<i32>,
         error: String,
     },
     AttachmentDownloaded {

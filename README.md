@@ -11,6 +11,7 @@ The first release deliberately does less:
 - direct-message and group conversation list with unread counts;
 - recent history, live incoming messages, and read acknowledgements;
 - plain-text messages with a Unicode-aware, multiline, per-chat draft;
+- native replies with a visible target, optimistic delivery, and exact retry;
 - drag-and-drop upload of photos and arbitrary files;
 - lazy download and opening of incoming photos, files, video, audio, and stickers;
 - in-app navigation for supported Telegram chat and message links;
@@ -173,10 +174,11 @@ credentials and Telegram update state survive restarts.
 | Accounts | `a` open picker, `↑`/`↓` select, `Enter` switch/add, `1`–`8` direct |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
 | Message actions | click or use `o`/`O` to select each action; `Enter` activates media, links, and supported bot buttons; `l` follows the selected/first link |
-| Replies | reply rows show `↩`, target ID, and `@username`/sender; select with `o`/`O`, then `r` jumps to the target |
+| Message cursor | `[`/`]` select older/newer loaded messages, starting at the latest |
+| Replies | `R` replies to the selected/latest message; right-click replies under the pointer; select an existing reply with `o`/`O`, then `r` jumps to its target |
 | Wide layout | `Tab` switch pane |
 | Narrow conversation | `Esc` return to chats |
-| Composer | `i` or `Enter` start, `Enter` send, `Ctrl+J`/`Shift+Enter` newline, `Esc` preserve draft |
+| Composer | `i` or `Enter` start, `Enter` send, `Ctrl+J`/`Shift+Enter` newline; `Esc` cancels reply context first, then preserves the draft and leaves |
 | Editing | arrows, `Home`/`End`, `Ctrl+A`/`Ctrl+E`, `Ctrl+W`, `Ctrl+U` |
 
 `?` opens contextual help while navigating. In a conversation, `/` starts a
@@ -185,8 +187,9 @@ from the chat list. Press `s` to configure the message-ID column and the other
 essential preferences.
 
 When the terminal supports mouse reporting, clicking a chat opens it, clicking
-media, a link, or an inline bot button activates it, and the wheel scrolls the pane under the pointer. Settings
-and account rows are clickable too. Every mouse action has a keyboard equivalent,
+media, a link, or an inline bot button activates it, right-clicking a message
+starts a reply, and the wheel scrolls the pane under the pointer. Settings and
+account rows are clickable too. Every mouse action has a keyboard equivalent,
 so terminals without mouse reporting remain fully usable.
 
 Account switching keeps Termgram lightweight: only one account is connected at
@@ -205,8 +208,9 @@ block glyphs render poorly. QR tokens, codes, passwords, and
 phone numbers are never written to settings or logs.
 
 Drag one or more files from the desktop into an open conversation and drop them
-on the terminal. JPG, JPEG, PNG, and WebP files are sent as compressed Telegram
-photos; other inputs are preserved as documents. Incoming media downloads only
+on the terminal. Text already in the composer becomes the first file's caption,
+including when replying. JPG, JPEG, PNG, and WebP files are sent as compressed
+Telegram photos; other inputs are preserved as documents. Incoming media downloads only
 when activated. Termgram saves it in a private per-process temporary directory
 and sanitizes remote filenames. Activate the row again to reveal the file in
 the operating system's file manager—Termgram never executes downloaded files.
@@ -243,7 +247,7 @@ affiliated with Telegram.
 ## Intentionally out of scope
 
 Broadcast channels, reactions, sticker/GIF selection, calls, stories, contacts,
-chat creation, composing replies, edits/deletes/forwarding, message search, group
+chat creation, edits/deletes/forwarding, message search, group
 administration, notifications, polls, and secret chats.
 
 ## Development

@@ -115,6 +115,7 @@ enum TransferCompletion {
         path: PathBuf,
         caption: String,
         as_photo: bool,
+        reply_to: Option<i32>,
         result: Box<Result<TelegramMessage, String>>,
     },
     Download {
@@ -1235,6 +1236,7 @@ async fn handle_command(
             chat_id,
             local_id,
             text,
+            reply_to,
         } => {
             let Some(peer) = cache.peers.get(&chat_id).copied() else {
                 events
@@ -1242,12 +1244,14 @@ async fn handle_command(
                         chat_id,
                         local_id,
                         text,
+                        reply_to,
                         error: "conversation is missing its Telegram peer reference".to_owned(),
                     })
                     .await?;
                 return Ok(false);
             };
-            match Box::pin(client.send_message(peer, text.clone())).await {
+            let input = InputMessage::new().text(text.clone()).reply_to(reply_to);
+            match Box::pin(client.send_message(peer, input)).await {
                 Ok(message) => {
                     if message.id() <= 0 {
                         events
@@ -1268,6 +1272,7 @@ async fn handle_command(
                             chat_id,
                             local_id,
                             text,
+                            reply_to,
                             error: error.to_string(),
                         })
                         .await?;
@@ -1280,6 +1285,7 @@ async fn handle_command(
             path,
             caption,
             as_photo,
+            reply_to,
         } => {
             let Some(peer) = cache.peers.get(&chat_id).copied() else {
                 events
@@ -1289,6 +1295,7 @@ async fn handle_command(
                         path,
                         caption,
                         as_photo,
+                        reply_to,
                         error: "conversation is missing its Telegram peer reference".to_owned(),
                     })
                     .await?;
@@ -1302,6 +1309,7 @@ async fn handle_command(
                         path,
                         caption,
                         as_photo,
+                        reply_to,
                         error: "too many Telegram transfers are already running".to_owned(),
                     })
                     .await?;
@@ -1309,7 +1317,7 @@ async fn handle_command(
             }
             let client = client.clone();
             transfers.spawn(async move {
-                let result = upload_attachment(&client, peer, &path, &caption, as_photo)
+                let result = upload_attachment(&client, peer, &path, &caption, as_photo, reply_to)
                     .await
                     .map_err(|error| format!("{error:#}"));
                 TransferCompletion::Send {
@@ -1318,6 +1326,7 @@ async fn handle_command(
                     path,
                     caption,
                     as_photo,
+                    reply_to,
                     result: Box::new(result),
                 }
             });
@@ -1515,6 +1524,7 @@ async fn upload_attachment(
     path: &Path,
     caption: &str,
     as_photo: bool,
+    reply_to: Option<i32>,
 ) -> Result<TelegramMessage> {
     let uploaded = client
         .upload_file(path)
@@ -1524,7 +1534,8 @@ async fn upload_attachment(
         InputMessage::new().text(caption).photo(uploaded)
     } else {
         InputMessage::new().text(caption).document(uploaded)
-    };
+    }
+    .reply_to(reply_to);
     Box::pin(client.send_message(peer, input))
         .await
         .map_err(anyhow::Error::from)
@@ -1543,6 +1554,7 @@ async fn process_transfer_completion(
             path,
             caption,
             as_photo,
+            reply_to,
             result,
         } => match *result {
             Ok(message) if message.id() <= 0 => {
@@ -1566,6 +1578,7 @@ async fn process_transfer_completion(
                         path,
                         caption,
                         as_photo,
+                        reply_to,
                         error: format!("Could not send attachment: {error}"),
                     })
                     .await?;

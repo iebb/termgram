@@ -54,4 +54,7 @@ yazi-term = { path = "vendor/yazi-term" }
 
 [workspace]
 members = ["."]
-exclude = ["vendor/yazi-term"]
+exclude = ["vendor/yazi-term", "vendor/grammers-session"]
+
+[patch.crates-io]
+grammers-session = { path = "vendor/grammers-session" }

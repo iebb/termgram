@@ -165,7 +165,7 @@ pub fn spawn(config: Config) -> TelegramHandle {
     let task = tokio::spawn(async move {
         if let Err(error) = Box::pin(run(config, command_rx, event_tx.clone())).await {
             let _ = event_tx
-                .send(NetworkEvent::Fatal(format!("{error:#}")))
+                .send(NetworkEvent::Fatal(describe_worker_error(&error)))
                 .await;
         }
     });
@@ -174,6 +174,15 @@ pub fn spawn(config: Config) -> TelegramHandle {
         events: event_rx,
         task,
     }
+}
+
+fn describe_worker_error(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(InvocationError::Session(source)) = cause.downcast_ref::<InvocationError>() {
+            return format!("Telegram session storage failed: {source}");
+        }
+    }
+    format!("{error:#}")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -254,7 +263,7 @@ async fn run(
                 },
             )
             .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+            .map_err(anyhow::Error::from_boxed)?;
         let mut recovering = false;
         let mut transfers = JoinSet::new();
 
@@ -334,7 +343,7 @@ async fn run(
         updates
             .sync_update_state()
             .await
-            .map_err(|error| anyhow!(error.to_string()))?;
+            .map_err(anyhow::Error::from_boxed)?;
         Ok(())
     })
     .await;
@@ -368,7 +377,7 @@ async fn process_update(
             if let Some(peer) = message
                 .peer_ref()
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?
+                .map_err(anyhow::Error::from_boxed)?
             {
                 cache.peers.insert(chat_id, peer);
             }
@@ -462,7 +471,8 @@ async fn process_update(
                     .ok();
                 events
                     .send(NetworkEvent::Error(format!(
-                        "Telegram update stream: {error}"
+                        "Telegram update stream: {}",
+                        describe_worker_error(&error.into())
                     )))
                     .await
                     .ok();
@@ -1945,7 +1955,7 @@ async fn resolve_telegram_link(
             let peer = resolved
                 .to_ref()
                 .await
-                .map_err(|error| anyhow!(error.to_string()))?
+                .map_err(anyhow::Error::from_boxed)?
                 .context("Telegram did not provide an addressable peer reference")?;
             cache.peers.insert(id, peer);
             cache.linked_peers.insert(id);
@@ -2341,7 +2351,7 @@ async fn is_hidden_broadcast(
     let Some(peer_ref) = message
         .peer_ref()
         .await
-        .map_err(|error| anyhow!(error.to_string()))?
+        .map_err(anyhow::Error::from_boxed)?
     else {
         // Unknown channel-shaped peers may be either broadcasts or megagroups.
         // Drop this update safely, but do not poison either classification cache.

@@ -32,3 +32,16 @@ cleanup sequence. Protocol selection still uses the original `Drivers::matches`;
 old Kitty-only implementations and external-overlay drivers fall back to the
 library's Unicode half-blocks. The former single-surface adapter initialization
 and embedded Yazi presets are no longer needed.
+
+`grammers-session/` vendors crates.io 0.10.0 from
+https://codeberg.org/Lonami/grammers at
+`5c6d44ff30e02d6c9295bcf1fcb51403ad77c981` (`grammers-session/`).
+The original source, tests, MIT and Apache licenses are retained. A narrow patch
+in `src/storages/sqlite.rs` sets a five-second SQLite busy timeout, uses immediate
+write transactions, holds the connection mutex through home-DC transactions,
+and creates the schema and its version in one serialized transaction. The
+session format is unchanged. SQLite's existing rollback journal is retained;
+WAL is not necessary for multi-process operation, and the bundled libSQL SQLite
+engine predates upstream's WAL-reset fix. Reapply and review these changes when
+upgrading the session crate. `tests/session_concurrency.rs` validates independent
+processes opening and writing one session, including initial schema creation.

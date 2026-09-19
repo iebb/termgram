@@ -164,6 +164,8 @@ Termgram uses one async runtime thread plus Yazi's platform input reader. It has
 no idle animation wake-up while the interface is static and bounds message
 histories, outgoing commands, and network caches. It still keeps a private
 SQLite session so login credentials and Telegram update state survive restarts.
+Multiple `tg` processes may use the same account session concurrently; SQLite
+serializes short writes and waits up to five seconds for competing writers.
 
 ## Terminal integration
 

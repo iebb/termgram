@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crossterm::event::{KeyEvent, MouseEvent};
+use yazi_term::event::{KeyEvent, MouseEvent};
 
 use crate::model::{Chat, ChatId, Message};
 
@@ -106,6 +106,14 @@ pub enum TelegramCommand {
         chat_id: ChatId,
         message_id: i32,
     },
+    /// Download a raster image for a specific preview request. Animated stickers
+    /// request Telegram's static thumbnail instead of the original animation.
+    DownloadPreview {
+        chat_id: ChatId,
+        message_id: i32,
+        request_id: u64,
+        thumbnail: bool,
+    },
     /// Resolve a Telegram public/private message URL to an in-app target.
     ResolveTelegramLink {
         url: String,
@@ -130,6 +138,7 @@ pub enum TelegramCommand {
 }
 
 impl fmt::Debug for TelegramCommand {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StartQrAuth => formatter.write_str("StartQrAuth"),
@@ -201,6 +210,18 @@ impl fmt::Debug for TelegramCommand {
                 .debug_struct("DownloadAttachment")
                 .field("chat_id", chat_id)
                 .field("message_id", message_id)
+                .finish(),
+            Self::DownloadPreview {
+                chat_id,
+                message_id,
+                request_id,
+                thumbnail,
+            } => formatter
+                .debug_struct("DownloadPreview")
+                .field("chat_id", chat_id)
+                .field("message_id", message_id)
+                .field("request_id", request_id)
+                .field("thumbnail", thumbnail)
                 .finish(),
             Self::ResolveTelegramLink { url } => formatter
                 .debug_struct("ResolveTelegramLink")
@@ -302,6 +323,23 @@ pub enum NetworkEvent {
         as_photo: bool,
         reply_to: Option<i32>,
         error: String,
+    },
+    PreviewDownloaded {
+        chat_id: ChatId,
+        message_id: i32,
+        request_id: u64,
+        path: PathBuf,
+    },
+    PreviewDownloadFailed {
+        chat_id: ChatId,
+        message_id: i32,
+        request_id: u64,
+        error: String,
+    },
+    /// Non-channel message identifiers share the account-wide namespace.
+    MessagesDeleted {
+        channel_id: Option<ChatId>,
+        message_ids: Vec<i32>,
     },
     AttachmentDownloaded {
         chat_id: ChatId,

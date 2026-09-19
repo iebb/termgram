@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
 use std::ffi::OsString;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::config::{ReleaseChannel, Settings};
@@ -24,10 +24,9 @@ const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 #[cfg(windows)]
-const FAILED_REPLACEMENT_WARNING: &str =
-    "A previous Termgram update could not replace tg; close other tg processes, then run `tg update` again";
+const FAILED_REPLACEMENT_WARNING: &str = "A previous Termgram update could not replace tg; close other tg processes, then run `tg update` again";
 
 static AUTOMATIC_CHECKS: Mutex<AutomaticCheckThrottle> = Mutex::new(AutomaticCheckThrottle::new());
 
@@ -789,11 +788,7 @@ fn stage_binary(source: &Path, target: &Path) -> Result<PathBuf> {
 }
 
 const fn executable_suffix() -> &'static str {
-    if cfg!(windows) {
-        ".exe"
-    } else {
-        ""
-    }
+    if cfg!(windows) { ".exe" } else { "" }
 }
 
 fn unique_child(parent: &Path, prefix: &str, suffix: &str) -> Result<PathBuf> {
@@ -1335,8 +1330,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        check_is_due, checksum_for_asset, current_platform, parse_version, select_update,
-        AutomaticCheckThrottle, JsonCursor, Release, UpdateStatus, CHECK_INTERVAL,
+        AutomaticCheckThrottle, CHECK_INTERVAL, JsonCursor, Release, UpdateStatus, check_is_due,
+        checksum_for_asset, current_platform, parse_version, select_update,
     };
     use crate::config::ReleaseChannel;
 
@@ -1461,14 +1456,18 @@ mod tests {
             check_is_due(Path::new(&path), ReleaseChannel::Prerelease, 1001)
                 .expect("channel changed")
         );
-        assert!(check_is_due(
-            Path::new(&path),
-            ReleaseChannel::Stable,
-            1000 + CHECK_INTERVAL.as_secs()
-        )
-        .expect("expired"));
-        assert!(check_is_due(Path::new(&path), ReleaseChannel::Stable, 999)
-            .expect("clock moved backwards"));
+        assert!(
+            check_is_due(
+                Path::new(&path),
+                ReleaseChannel::Stable,
+                1000 + CHECK_INTERVAL.as_secs()
+            )
+            .expect("expired")
+        );
+        assert!(
+            check_is_due(Path::new(&path), ReleaseChannel::Stable, 999)
+                .expect("clock moved backwards")
+        );
         std::fs::remove_file(path).expect("remove marker");
     }
 

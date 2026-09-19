@@ -1,12 +1,12 @@
 use chrono::Local;
 use qrcode::{Color as QrColor, QrCode};
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
-use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -407,6 +407,9 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     } else if app.mode == Mode::Accounts {
         render_accounts(frame, area, app);
     }
+    if matches!(app.mode, Mode::Help | Mode::Settings | Mode::Accounts) {
+        app.media_slots.clear();
+    }
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
@@ -577,6 +580,7 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let message_width = usize::from(inner.width.saturating_sub(2).max(1));
     let mut lines = Vec::new();
     let mut layouts = Vec::with_capacity(messages.len());
+    let mut media_rows = Vec::new();
     for message in messages {
         let start = lines.len();
         let actions = app.message_actions(message);
@@ -592,13 +596,41 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         );
         let body_action = rendered.body_action;
         let body_height = rendered.body_height;
-        let hit_rows = rendered
+        let mut hit_rows: Vec<_> = rendered
             .action_rows
             .into_iter()
             .map(|(row, action)| (start.saturating_add(row), Some(action)))
             .chain((0..body_height).map(move |row| (start.saturating_add(row), body_action)))
             .collect();
         lines.extend(rendered.lines);
+        if message.id > 0
+            && let Some(attachment) = message.attachment.as_ref().filter(|a| a.supports_preview())
+        {
+            let height = inner
+                .height
+                .saturating_sub(u16::from(app.new_messages_while_scrolled > 0))
+                .min(if attachment.kind == AttachmentKind::Sticker {
+                    6
+                } else {
+                    10
+                });
+            let width =
+                inner
+                    .width
+                    .saturating_sub(21)
+                    .min(if attachment.kind == AttachmentKind::Sticker {
+                        24
+                    } else {
+                        48
+                    });
+            if height > 0 && width > 0 {
+                media_rows.push((message.id, lines.len(), width, height));
+                hit_rows.extend(
+                    (lines.len()..lines.len() + usize::from(height)).map(|row| (row, body_action)),
+                );
+                lines.extend((0..height).map(|_| Line::from("")));
+            }
+        }
         layouts.push(MessageLayout {
             id: message.id,
             start,
@@ -659,6 +691,44 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         .take(available)
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(Text::from(visible_lines)), inner);
+    for (message_id, row, width, height) in media_rows {
+        if row >= scroll.saturating_add(available) || row + usize::from(height) <= scroll {
+            continue;
+        }
+        let offset = if row >= scroll {
+            i16::try_from(row - scroll).unwrap_or(i16::MAX)
+        } else {
+            -i16::try_from(scroll - row).unwrap_or(i16::MAX)
+        };
+        let viewport = Rect::new(
+            inner.x.saturating_add(21),
+            inner.y,
+            width,
+            inner
+                .height
+                .saturating_sub(u16::from(app.new_messages_while_scrolled > 0)),
+        );
+        app.media_slots.push(crate::media::MediaSlot {
+            chat_id,
+            message_id,
+            viewport,
+            offset,
+            size: ratatui::layout::Size::new(width, height),
+        });
+        let status = app
+            .media_previews
+            .get(&(chat_id, message_id))
+            .map_or("Loading preview…", |p| p.status.as_str());
+        if !status.is_empty() {
+            let y = inner
+                .y
+                .saturating_add(clamp_u16(row.saturating_sub(scroll)));
+            frame.render_widget(
+                Paragraph::new(status).style(Style::default().fg(MUTED)),
+                Rect::new(viewport.x, y, width, 1),
+            );
+        }
+    }
     let hit_regions = layouts
         .iter()
         .flat_map(|layout| {
@@ -1341,10 +1411,15 @@ fn message_body(
     };
     if attachment.kind == AttachmentKind::Sticker {
         let fallback = attachment.fallback_emoji.as_deref().unwrap_or("◻");
-        return if message.text.is_empty() {
-            format!("{fallback}  [sticker]")
+        let label = if attachment.preview_uses_thumbnail() {
+            "[sticker · static preview]"
         } else {
-            format!("{fallback}  {}", message.text)
+            "[sticker]"
+        };
+        return if message.text.is_empty() {
+            format!("{fallback}  {label}")
+        } else {
+            format!("{fallback}  {label} {}", message.text)
         };
     }
 
@@ -1365,13 +1440,17 @@ fn message_body(
         label.push_str(" · ");
         label.push_str(&human_size(size));
     }
-    let action = match state {
-        AttachmentState::Ready => "click/Enter to download",
-        AttachmentState::Downloading => "downloading…",
-        AttachmentState::Downloaded => match download_behavior {
-            DownloadBehavior::TempOnly => "downloaded to temp",
-            DownloadBehavior::RevealOnActivation => "click/Enter to reveal",
-        },
+    let action = if attachment.supports_preview() {
+        "inline preview"
+    } else {
+        match state {
+            AttachmentState::Ready => "click/Enter to download",
+            AttachmentState::Downloading => "downloading…",
+            AttachmentState::Downloaded => match download_behavior {
+                DownloadBehavior::TempOnly => "downloaded to temp",
+                DownloadBehavior::RevealOnActivation => "click/Enter to reveal",
+            },
+        }
     };
     label.push_str(" · ");
     label.push_str(action);
@@ -1584,7 +1663,7 @@ mod tests {
     use chrono::Utc;
     use qrcode::Color as QrColor;
     use ratatui::style::Color;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
 
     use super::{editor_lines, input_cursor, qr_pair_symbol, render, truncate_cells, wrap_cells};
@@ -1745,9 +1824,11 @@ mod tests {
     #[test]
     fn wrapping_never_exceeds_width() {
         let result = wrap_cells("hello 世界 and-a-very-long-token", 8);
-        assert!(result
-            .iter()
-            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 8));
+        assert!(
+            result
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 8)
+        );
     }
 
     #[test]
@@ -1939,12 +2020,27 @@ mod tests {
             },
         ]);
 
-        let output = render_text(&app, 120, 36);
-        assert!(output.contains("[photo] image.jpg · 2.0 KiB · click/Enter to download"));
+        let output = render_text_mut(&mut app, 120, 36);
+        assert!(output.contains("[photo] image.jpg · 2.0 KiB · inline preview"));
         // TestBackend retains the continuation cell for a wide emoji, so the
         // exact amount of padding between these two tokens is backend-specific.
         assert!(output.contains("🙂"));
         assert!(output.contains("[sticker]"));
+        assert_eq!(app.media_slots.len(), 2);
+        assert_eq!(app.request_visible_media().len(), 2);
+        app.message_scroll = 3;
+        render_text_mut(&mut app, 120, 20);
+        assert!(
+            app.media_slots
+                .iter()
+                .all(|s| s.size.height <= s.viewport.height)
+        );
+        app.mode = Mode::Help;
+        render_text_mut(&mut app, 120, 36);
+        assert!(app.media_slots.is_empty());
+        app.mode = Mode::Navigate;
+        render_text_mut(&mut app, 30, 8);
+        assert!(app.media_slots.is_empty());
     }
 
     #[test]
@@ -2064,14 +2160,18 @@ mod tests {
         assert!(compatible_text.contains("Tab compact"));
         assert!(!compatible_text.contains('▀'));
         assert!(!compatible_text.contains(secret_url));
-        assert!(buffer
-            .content()
-            .iter()
-            .any(|cell| cell.bg == Color::Rgb(0, 0, 0)));
-        assert!(buffer
-            .content()
-            .iter()
-            .any(|cell| cell.bg == Color::Rgb(255, 255, 255)));
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == Color::Rgb(0, 0, 0))
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == Color::Rgb(255, 255, 255))
+        );
     }
 
     #[test]

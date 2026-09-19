@@ -1,8 +1,8 @@
 //! Terminal key normalization and Unicode-aware single-line text editing.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use yazi_term::event::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 
 const MAX_INPUT_BYTES: usize = 16 * 1024;
 
@@ -36,24 +36,24 @@ pub enum KeyAction {
     AddAccount,
 }
 
-/// Convert a crossterm key event into an action understood by the app.
+/// Convert a Yazi key event into an action understood by the app.
 ///
 /// Key releases and modified characters (except Ctrl-C) are deliberately
 /// ignored. This prevents shortcuts such as Ctrl-Q from unexpectedly entering
 /// text or triggering the plain `q` navigation shortcut.
 #[must_use]
-pub fn key_action(event: KeyEvent) -> Option<KeyAction> {
+pub fn key_action(event: &KeyEvent) -> Option<KeyAction> {
     if event.kind == KeyEventKind::Release {
         return None;
     }
 
-    if event.modifiers.contains(KeyModifiers::CONTROL)
+    if event.modifiers.contains(Modifiers::CONTROL)
         && matches!(event.code, KeyCode::Char('c' | 'C'))
     {
         return Some(KeyAction::Quit);
     }
 
-    if event.modifiers.contains(KeyModifiers::CONTROL) {
+    if event.modifiers.contains(Modifiers::CONTROL) {
         return match event.code {
             KeyCode::Char('j' | 'J') => Some(KeyAction::Newline),
             KeyCode::Char('a' | 'A') => Some(KeyAction::Home),
@@ -65,22 +65,19 @@ pub fn key_action(event: KeyEvent) -> Option<KeyAction> {
         };
     }
 
-    let unsupported_modifiers = KeyModifiers::CONTROL
-        | KeyModifiers::ALT
-        | KeyModifiers::SUPER
-        | KeyModifiers::HYPER
-        | KeyModifiers::META;
+    let unsupported_modifiers =
+        Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER | Modifiers::HYPER | Modifiers::META;
     if event.modifiers.intersects(unsupported_modifiers) {
         return None;
     }
 
-    match event.code {
+    match event.shifted_code() {
         KeyCode::Char(character) => Some(KeyAction::Character(character)),
-        KeyCode::Enter if event.modifiers.contains(KeyModifiers::SHIFT) => Some(KeyAction::Newline),
+        KeyCode::Enter if event.modifiers.contains(Modifiers::SHIFT) => Some(KeyAction::Newline),
         KeyCode::Enter => Some(KeyAction::Enter),
-        KeyCode::Esc => Some(KeyAction::Escape),
+        KeyCode::Escape => Some(KeyAction::Escape),
+        KeyCode::Tab if event.modifiers.contains(Modifiers::SHIFT) => Some(KeyAction::BackTab),
         KeyCode::Tab => Some(KeyAction::Tab),
-        KeyCode::BackTab => Some(KeyAction::BackTab),
         KeyCode::Backspace => Some(KeyAction::Backspace),
         KeyCode::Delete => Some(KeyAction::Delete),
         KeyCode::Left => Some(KeyAction::Left),
@@ -91,8 +88,8 @@ pub fn key_action(event: KeyEvent) -> Option<KeyAction> {
         KeyCode::PageDown => Some(KeyAction::PageDown),
         KeyCode::Home => Some(KeyAction::Home),
         KeyCode::End => Some(KeyAction::End),
-        KeyCode::F(2) => Some(KeyAction::NextAccount),
-        KeyCode::F(3) => Some(KeyAction::AddAccount),
+        KeyCode::Fn(2) => Some(KeyAction::NextAccount),
+        KeyCode::Fn(3) => Some(KeyAction::AddAccount),
         _ => None,
     }
 }
@@ -313,18 +310,18 @@ fn boundary_at_or_after(value: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use yazi_term::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, Modifiers};
 
-    use super::{key_action, KeyAction, TextInput};
+    use super::{KeyAction, TextInput, key_action};
 
     #[test]
     fn ctrl_c_is_quit_and_plain_q_remains_a_character() {
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            key_action(&KeyEvent::new(KeyCode::Char('c'), Modifiers::CONTROL)),
             Some(KeyAction::Quit)
         );
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            key_action(&KeyEvent::new(KeyCode::Char('q'), Modifiers::empty())),
             Some(KeyAction::Character('q'))
         );
     }
@@ -332,12 +329,31 @@ mod tests {
     #[test]
     fn function_keys_select_account_actions() {
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            key_action(&KeyEvent::new(KeyCode::Fn(2), Modifiers::empty())),
             Some(KeyAction::NextAccount)
         );
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            key_action(&KeyEvent::new(KeyCode::Fn(3), Modifiers::empty())),
             Some(KeyAction::AddAccount)
+        );
+    }
+
+    #[test]
+    fn enhanced_keys_preserve_shifted_shortcuts_and_newlines() {
+        let key = KeyEvent {
+            code: KeyCode::Char('/'),
+            shifted: Some('?'),
+            modifiers: Modifiers::SHIFT,
+            ..KeyEvent::default()
+        };
+        assert_eq!(key_action(&key), Some(KeyAction::Character('?')));
+        assert_eq!(
+            key_action(&KeyEvent::new(KeyCode::Tab, Modifiers::SHIFT)),
+            Some(KeyAction::BackTab)
+        );
+        assert_eq!(
+            key_action(&KeyEvent::new(KeyCode::Enter, Modifiers::SHIFT)),
+            Some(KeyAction::Newline)
         );
     }
 
@@ -345,13 +361,14 @@ mod tests {
     fn releases_and_other_control_combinations_are_ignored() {
         let release = KeyEvent {
             code: KeyCode::Enter,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::empty(),
             kind: KeyEventKind::Release,
-            state: KeyEventState::NONE,
+            state: KeyEventState::empty(),
+            ..KeyEvent::default()
         };
-        assert_eq!(key_action(release), None);
+        assert_eq!(key_action(&release), None);
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            key_action(&KeyEvent::new(KeyCode::Char('x'), Modifiers::CONTROL)),
             None
         );
     }
@@ -410,11 +427,11 @@ mod tests {
     #[test]
     fn control_bindings_are_normalized() {
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            key_action(&KeyEvent::new(KeyCode::Char('j'), Modifiers::CONTROL)),
             Some(KeyAction::Newline)
         );
         assert_eq!(
-            key_action(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+            key_action(&KeyEvent::new(KeyCode::Char('w'), Modifiers::CONTROL)),
             Some(KeyAction::DeleteWord)
         );
     }

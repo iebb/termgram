@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 
 const EMBEDDED_API_ID: Option<&str> = option_env!("TERMGRAM_EMBEDDED_API_ID");
@@ -619,8 +619,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        choose_default_session_path, credential, Config, DownloadBehavior, ReleaseChannel,
-        Settings, MAX_ACCOUNTS,
+        Config, DownloadBehavior, MAX_ACCOUNTS, ReleaseChannel, Settings,
+        choose_default_session_path, credential,
     };
 
     fn temporary_settings_path(label: &str) -> PathBuf {
@@ -657,12 +657,14 @@ mod tests {
         .expect("embedded credential");
         assert_eq!(value, "embedded");
 
-        assert!(credential(
-            "TELEGRAM_API_HASH",
-            Err(std::env::VarError::NotPresent),
-            None,
-        )
-        .is_err());
+        assert!(
+            credential(
+                "TELEGRAM_API_HASH",
+                Err(std::env::VarError::NotPresent),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -725,7 +727,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn settings_are_private_and_refuse_symbolic_links() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let path = temporary_settings_path("symlink");
         let directory = path.parent().expect("settings directory").to_path_buf();
@@ -825,7 +827,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prepares_a_private_session_file_in_an_existing_directory() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = std::env::temp_dir().join(format!(
             "termgram-config-test-{}-{}",

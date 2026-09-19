@@ -5,15 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Utc;
-use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use yazi_term::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::{
-    config::{DownloadBehavior, Settings, MAX_ACCOUNTS},
+    config::{DownloadBehavior, MAX_ACCOUNTS, Settings},
     event::{AppEvent, AuthPrompt, ConnectionStatus, NetworkEvent, TelegramCommand},
-    input::{key_action, KeyAction, TextInput},
+    input::{KeyAction, TextInput, key_action},
     model::{
-        sanitize_terminal_line, sanitize_terminal_text, Attachment, AttachmentKind, Chat, ChatId,
-        Delivery, Message, MessageLink, ReplyInfo,
+        Attachment, AttachmentKind, Chat, ChatId, Delivery, Message, MessageLink, ReplyInfo,
+        sanitize_terminal_line, sanitize_terminal_text,
     },
 };
 
@@ -23,6 +23,18 @@ const MAX_CACHED_CHATS: usize = 12;
 const MAX_DROPPED_FILES: usize = 8;
 
 type MessageHitRegion = (u16, u16, u16, (i32, Option<usize>));
+
+/// Download state for an attachment displayed in the conversation.
+#[derive(Clone, Debug)]
+pub struct MediaPreview {
+    pub chat_id: ChatId,
+    pub message_id: i32,
+    pub request_id: u64,
+    pub path: Option<PathBuf>,
+    pub status: String,
+    pub loading: bool,
+    thumbnail: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachmentState {
@@ -190,6 +202,9 @@ pub struct App {
     pub narrow_conversation: bool,
     pub should_quit: bool,
     pub status_message: Option<String>,
+    pub media_previews: BTreeMap<(ChatId, i32), MediaPreview>,
+    pub media_slots: Vec<crate::media::MediaSlot>,
+    next_preview_request_id: u64,
     available_update: Option<String>,
     pub tick: u64,
     pub loading_history: bool,
@@ -272,6 +287,9 @@ impl Default for App {
             narrow_conversation: false,
             should_quit: false,
             status_message: None,
+            media_previews: BTreeMap::new(),
+            media_slots: Vec::new(),
+            next_preview_request_id: 1,
             available_update: None,
             tick: 0,
             loading_history: false,
@@ -391,7 +409,7 @@ impl App {
 
     pub fn update(&mut self, event: AppEvent) -> Vec<TelegramCommand> {
         match event {
-            AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Key(key) => self.handle_key(&key),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
             AppEvent::Network(event) => self.handle_network(event),
             AppEvent::Paste(text) => self.handle_paste(&text),
@@ -413,6 +431,7 @@ impl App {
     /// Frame-local pointer targets must never survive a frame that cannot
     /// render them (for example a terminal-too-small warning).
     pub fn clear_message_hit_regions(&mut self) {
+        self.media_slots.clear();
         self.message_hit_regions.clear();
         self.chat_hit_regions.clear();
         self.settings_hit_regions.clear();
@@ -431,7 +450,18 @@ impl App {
         self.chat_hit_regions.len()
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> Vec<TelegramCommand> {
+    pub fn handle_key(&mut self, key: &KeyEvent) -> Vec<TelegramCommand> {
+        let editing = matches!(self.screen, Screen::Auth(_))
+            || (self.screen == Screen::Main && matches!(self.mode, Mode::Compose | Mode::Filter));
+        if editing && let Some(text) = key.text(&mut [0; 4]) {
+            // Yazi resolves keyboard-layout modifiers and Kitty associated text.
+            // This is typed text, not a paste: never interpret it as an upload path.
+            return text
+                .chars()
+                .filter(|c| !c.is_control())
+                .flat_map(|c| self.handle_action(KeyAction::Character(c)))
+                .collect();
+        }
         key_action(key).map_or_else(Vec::new, |action| self.handle_action(action))
     }
 
@@ -710,6 +740,61 @@ impl App {
                         sanitize_terminal_line(&error)
                     ));
                 }
+                Vec::new()
+            }
+            NetworkEvent::PreviewDownloaded {
+                chat_id,
+                message_id,
+                request_id,
+                path,
+            } => {
+                if let Some(preview) =
+                    self.media_previews
+                        .get_mut(&(chat_id, message_id))
+                        .filter(|preview| {
+                            preview.chat_id == chat_id
+                                && preview.message_id == message_id
+                                && preview.request_id == request_id
+                        })
+                {
+                    if !preview.thumbnail {
+                        self.downloaded_attachments
+                            .insert((chat_id, message_id), path.clone());
+                    }
+                    preview.path = Some(path);
+                    preview.loading = false;
+                    preview.status = if preview.thumbnail {
+                        "Animated sticker · static preview".to_owned()
+                    } else {
+                        String::new()
+                    };
+                }
+                Vec::new()
+            }
+            NetworkEvent::PreviewDownloadFailed {
+                chat_id,
+                message_id,
+                request_id,
+                error,
+            } => {
+                if self
+                    .media_previews
+                    .get(&(chat_id, message_id))
+                    .is_some_and(|preview| {
+                        preview.chat_id == chat_id
+                            && preview.message_id == message_id
+                            && preview.request_id == request_id
+                    })
+                {
+                    self.media_preview_failed(chat_id, message_id, &error);
+                }
+                Vec::new()
+            }
+            NetworkEvent::MessagesDeleted {
+                channel_id,
+                message_ids,
+            } => {
+                self.remove_deleted_messages(channel_id, &message_ids);
                 Vec::new()
             }
             NetworkEvent::AttachmentDownloaded {
@@ -1011,6 +1096,7 @@ impl App {
             Screen::Connecting | Screen::Auth(AuthPhase::Qr { .. }) => true,
             Screen::Main => {
                 self.loading_history
+                    || self.media_previews.values().any(|preview| preview.loading)
                     || matches!(
                         self.connection,
                         ConnectionStatus::Connecting | ConnectionStatus::Reconnecting
@@ -1026,21 +1112,19 @@ impl App {
         if matches!(self.screen, Screen::Main)
             && matches!(self.mode, Mode::Navigate | Mode::Compose)
             && self.focus == Focus::Conversation
-        {
-            if let (Some(chat_id), Some(paths)) =
+            && let (Some(chat_id), Some(paths)) =
                 (self.active_chat_id, dropped_file_paths(&normalized))
-            {
-                let caption = (self.mode == Mode::Compose)
-                    .then(|| self.drafts.get_mut(&chat_id))
-                    .flatten()
-                    .filter(|draft| !draft.value().trim().is_empty())
-                    .map(TextInput::take)
-                    .unwrap_or_default();
-                let reply_to = (self.mode == Mode::Compose)
-                    .then(|| self.reply_targets.remove(&chat_id))
-                    .flatten();
-                return self.send_dropped_files(chat_id, paths, caption, reply_to);
-            }
+        {
+            let caption = (self.mode == Mode::Compose)
+                .then(|| self.drafts.get_mut(&chat_id))
+                .flatten()
+                .filter(|draft| !draft.value().trim().is_empty())
+                .map(TextInput::take)
+                .unwrap_or_default();
+            let reply_to = (self.mode == Mode::Compose)
+                .then(|| self.reply_targets.remove(&chat_id))
+                .flatten();
+            return self.send_dropped_files(chat_id, paths, caption, reply_to);
         }
         match self.screen {
             Screen::Auth(
@@ -1526,15 +1610,15 @@ impl App {
         let previous = self.settings;
         self.settings.active_account = account;
         self.settings.account_count = account_count;
-        if let Some(path) = self.settings_path.as_deref() {
-            if let Err(error) = self.settings.save_to(path) {
-                self.settings = previous;
-                self.status_message = Some(format!(
-                    "Could not save account selection: {}",
-                    sanitize_terminal_line(&error.to_string())
-                ));
-                return Vec::new();
-            }
+        if let Some(path) = self.settings_path.as_deref()
+            && let Err(error) = self.settings.save_to(path)
+        {
+            self.settings = previous;
+            self.status_message = Some(format!(
+                "Could not save account selection: {}",
+                sanitize_terminal_line(&error.to_string())
+            ));
+            return Vec::new();
         }
 
         self.reset_for_account_switch(account);
@@ -1646,10 +1730,10 @@ impl App {
         let text = draft.take();
         let reply_to = self.reply_targets.remove(&chat_id);
         let replacing_failed = self.retry_message_ids.remove(&chat_id);
-        if let Some(failed_id) = replacing_failed {
-            if let Some(messages) = self.messages.get_mut(&chat_id) {
-                messages.retain(|message| message.id != failed_id);
-            }
+        if let Some(failed_id) = replacing_failed
+            && let Some(messages) = self.messages.get_mut(&chat_id)
+        {
+            messages.retain(|message| message.id != failed_id);
         }
         let local_id = self.next_pending_id;
         self.next_pending_id = self.next_pending_id.checked_sub(1).unwrap_or(-1);
@@ -1945,6 +2029,20 @@ impl App {
             }];
         }
 
+        if message.id > 0
+            && let Some(attachment) = message.attachment.as_ref().filter(|a| a.supports_preview())
+        {
+            // A click retries a failed inline download; it never opens a modal.
+            if self
+                .media_previews
+                .get(&(chat_id, message_id))
+                .is_some_and(|p| !p.loading && p.path.is_none())
+            {
+                self.media_previews.remove(&(chat_id, message_id));
+            }
+            return self.request_media_preview(chat_id, message_id, attachment);
+        }
+
         if message.attachment.is_some() && message.id > 0 {
             if let Some(path) = self
                 .downloaded_attachments
@@ -1981,6 +2079,124 @@ impl App {
         }
 
         Vec::new()
+    }
+
+    fn request_media_preview(
+        &mut self,
+        chat_id: ChatId,
+        message_id: i32,
+        attachment: &Attachment,
+    ) -> Vec<TelegramCommand> {
+        if self.media_previews.contains_key(&(chat_id, message_id)) {
+            return Vec::new();
+        }
+        let thumbnail = attachment.preview_uses_thumbnail();
+        let path = (!thumbnail)
+            .then(|| self.downloaded_attachments.get(&(chat_id, message_id)))
+            .flatten()
+            .filter(|path| path.is_file())
+            .cloned();
+        let request_id = self.next_preview_request_id;
+        self.next_preview_request_id = self.next_preview_request_id.wrapping_add(1);
+        let loading = path.is_none();
+        self.media_previews.insert(
+            (chat_id, message_id),
+            MediaPreview {
+                chat_id,
+                message_id,
+                request_id,
+                path,
+                status: if loading && thumbnail {
+                    "Loading static sticker preview…"
+                } else if loading {
+                    "Loading image…"
+                } else {
+                    ""
+                }
+                .to_owned(),
+                loading,
+                thumbnail,
+            },
+        );
+        if loading {
+            vec![TelegramCommand::DownloadPreview {
+                chat_id,
+                message_id,
+                request_id,
+                thumbnail,
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Request only visible attachments, with a small shared download budget.
+    pub fn request_visible_media(&mut self) -> Vec<TelegramCommand> {
+        self.media_previews.retain(|&(chat_id, message_id), _| {
+            self.messages
+                .get(&chat_id)
+                .is_some_and(|messages| messages.iter().any(|m| m.id == message_id))
+        });
+        let mut budget =
+            2_usize.saturating_sub(self.media_previews.values().filter(|p| p.loading).count());
+        let mut commands = Vec::new();
+        for slot in self.media_slots.clone() {
+            if budget == 0 {
+                break;
+            }
+            let Some(attachment) = self
+                .messages
+                .get(&slot.chat_id)
+                .and_then(|messages| messages.iter().find(|m| m.id == slot.message_id))
+                .and_then(|message| message.attachment.clone())
+            else {
+                continue;
+            };
+            let requested = self.request_media_preview(slot.chat_id, slot.message_id, &attachment);
+            budget = budget.saturating_sub(requested.len());
+            commands.extend(requested);
+        }
+        commands
+    }
+
+    pub fn media_preview_failed(&mut self, chat_id: ChatId, message_id: i32, error: &str) {
+        if let Some(preview) = self.media_previews.get_mut(&(chat_id, message_id)) {
+            preview.path = None;
+            preview.loading = false;
+            preview.status = format!(
+                "Preview unavailable · click to retry: {}",
+                sanitize_terminal_line(error)
+            );
+        }
+    }
+
+    fn remove_deleted_messages(&mut self, channel_id: Option<ChatId>, message_ids: &[i32]) {
+        let affected_chat =
+            |id: ChatId| channel_id.map_or(id > -1_000_000_000_000, |channel| channel == id);
+        self.media_previews.retain(|&(chat_id, message_id), _| {
+            !affected_chat(chat_id) || !message_ids.contains(&message_id)
+        });
+        for (&chat_id, messages) in &mut self.messages {
+            if affected_chat(chat_id) {
+                messages.retain(|message| !message_ids.contains(&message.id));
+            }
+        }
+        self.downloaded_attachments
+            .retain(|&(chat_id, message_id), _| {
+                !affected_chat(chat_id) || !message_ids.contains(&message_id)
+            });
+        self.downloading_attachments
+            .retain(|&(chat_id, message_id)| {
+                !affected_chat(chat_id) || !message_ids.contains(&message_id)
+            });
+        if self.active_chat_id.is_some_and(affected_chat)
+            && self
+                .selected_message
+                .is_some_and(|id| message_ids.contains(&id))
+        {
+            self.selected_message = None;
+            self.selected_action = 0;
+        }
     }
 
     fn activate_selected_link(&mut self) -> Vec<TelegramCommand> {
@@ -2521,13 +2737,12 @@ impl App {
                 let sender = message.sender.clone();
                 if let Some(messages) = self.messages.get_mut(&request.source_chat) {
                     for cached in messages.iter_mut() {
-                        if let Some(reply) = &mut cached.reply_to {
-                            if reply.message_id == request.target_message
-                                && reply.chat_id == message.chat_id
-                                && reply.sender.is_none()
-                            {
-                                reply.sender = Some(sender.clone());
-                            }
+                        if let Some(reply) = &mut cached.reply_to
+                            && reply.message_id == request.target_message
+                            && reply.chat_id == message.chat_id
+                            && reply.sender.is_none()
+                        {
+                            reply.sender = Some(sender.clone());
                         }
                     }
                 }
@@ -2664,6 +2879,9 @@ impl App {
         sanitize_message(&mut message);
         let chat_id = message.chat_id;
         let message_id = message.id;
+        self.media_previews.remove(&(chat_id, message_id));
+        // Telegram can replace media while retaining its name, MIME type, and size.
+        self.downloaded_attachments.remove(&(chat_id, message_id));
         let attachment_changed = self.messages.get(&chat_id).is_some_and(|messages| {
             messages
                 .iter()
@@ -2698,10 +2916,8 @@ impl App {
         let is_latest = messages
             .last()
             .is_some_and(|latest| latest.id == message_id);
-        if is_latest {
-            if let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
-                chat.last_message = preview;
-            }
+        if is_latest && let Some(chat) = self.chats.iter_mut().find(|chat| chat.id == chat_id) {
+            chat.last_message = preview;
         }
         self.prune_message_cache();
     }
@@ -3273,14 +3489,14 @@ mod tests {
     use std::fs;
 
     use chrono::{TimeZone, Utc};
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use yazi_term::event::{Modifiers, MouseButton, MouseEvent, MouseEventKind};
 
     use super::{
-        App, AttachmentState, AuthPhase, Focus, Mode, QrRenderMode, Screen, MAX_CACHED_CHATS,
-        MAX_MESSAGES_PER_CHAT,
+        App, AttachmentState, AuthPhase, Focus, MAX_CACHED_CHATS, MAX_MESSAGES_PER_CHAT, Mode,
+        QrRenderMode, Screen,
     };
     use crate::{
-        config::{DownloadBehavior, ReleaseChannel, Settings, MAX_ACCOUNTS},
+        config::{DownloadBehavior, MAX_ACCOUNTS, ReleaseChannel, Settings},
         event::{AppEvent, AuthPrompt, NetworkEvent, TelegramCommand},
         input::KeyAction,
         model::{
@@ -3594,11 +3810,12 @@ mod tests {
     #[test]
     fn ready_does_not_duplicate_the_workers_dialog_load() {
         let mut app = App::new();
-        assert!(app
-            .handle_network(NetworkEvent::Ready {
+        assert!(
+            app.handle_network(NetworkEvent::Ready {
                 user_name: "Ada".to_owned()
             })
-            .is_empty());
+            .is_empty()
+        );
         assert_eq!(app.screen, Screen::Main);
     }
 
@@ -3630,6 +3847,27 @@ mod tests {
         let pending = app.active_messages().last().unwrap();
         assert_eq!(pending.delivery, Delivery::Pending);
         assert_eq!(app.mode, Mode::Compose);
+    }
+
+    #[test]
+    fn associated_text_uses_layout_text_without_executing_shortcuts() {
+        use yazi_term::event::{KeyCode, KeyEvent, KeyEventKind};
+
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        let mut key = KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: Modifiers::CONTROL | Modifiers::ALT,
+            text: "你好🙂".into(),
+            ..KeyEvent::default()
+        };
+        assert!(app.handle_key(&key).is_empty());
+        assert_eq!(app.active_draft().unwrap().value(), "你好🙂");
+        assert!(!app.should_quit);
+        key.kind = KeyEventKind::Release;
+        assert!(app.handle_key(&key).is_empty());
+        assert_eq!(app.active_draft().unwrap().value(), "你好🙂");
     }
 
     #[test]
@@ -3839,9 +4077,10 @@ mod tests {
         app.handle_network(NetworkEvent::ReadMarked { chat_id: 1 });
         app.handle_action(KeyAction::PageUp);
         assert_eq!(app.message_scroll, 10);
-        assert!(app
-            .handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
-            .is_empty());
+        assert!(
+            app.handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
+                .is_empty()
+        );
         assert_eq!(app.message_scroll, 10);
         assert_eq!(app.new_messages_while_scrolled, 1);
         assert_eq!(app.new_messages_to_anchor, 1);
@@ -3907,9 +4146,10 @@ mod tests {
         let mut app = ready_app();
         open_first(&mut app);
         app.update(AppEvent::TerminalFocus(false));
-        assert!(app
-            .handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
-            .is_empty());
+        assert!(
+            app.handle_network(NetworkEvent::NewMessage(message(21, 1, "new", false)))
+                .is_empty()
+        );
         assert!(app.active_chat().unwrap().unread > 0);
     }
 
@@ -4111,10 +4351,11 @@ mod tests {
         app.selected_message = Some(21);
 
         assert!(app.handle_action(KeyAction::Enter).is_empty());
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|message| message.contains("reveal is disabled")));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("reveal is disabled"))
+        );
         fs::remove_file(path).expect("remove fixture");
     }
 
@@ -4420,10 +4661,11 @@ mod tests {
 
         assert_eq!(app.active_chat_id, Some(2));
         assert_eq!(app.selected_message, Some(5));
-        assert!(app
-            .active_messages()
-            .iter()
-            .any(|message| message.id == 5 && message.text == "old exact target"));
+        assert!(
+            app.active_messages()
+                .iter()
+                .any(|message| message.id == 5 && message.text == "old exact target")
+        );
     }
 
     #[test]
@@ -4508,10 +4750,11 @@ mod tests {
             request_id: 999,
             error: "stale".to_owned(),
         });
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|status| status.contains("Loading reply")));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("Loading reply"))
+        );
 
         let mut target = message(80, 1, "reply target", false);
         target.sender = "Target author".to_owned();
@@ -4523,10 +4766,11 @@ mod tests {
         });
         assert_eq!(app.selected_message, Some(80));
         assert_eq!(app.viewport_anchor_message, Some(80));
-        assert!(app
-            .active_messages()
-            .iter()
-            .any(|message| message.id == 80 && message.text == "reply target"));
+        assert!(
+            app.active_messages()
+                .iter()
+                .any(|message| message.id == 80 && message.text == "reply target")
+        );
         assert_eq!(
             app.active_messages()
                 .iter()
@@ -4569,9 +4813,11 @@ mod tests {
         assert_eq!(app.active_chat_id, Some(2));
         assert_eq!(app.selected_message, Some(99));
         assert_eq!(app.viewport_anchor_message, Some(99));
-        assert!(commands
-            .iter()
-            .any(|command| matches!(command, TelegramCommand::LoadHistory { chat_id: 2, .. })));
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, TelegramCommand::LoadHistory { chat_id: 2, .. }))
+        );
     }
 
     #[test]
@@ -4618,14 +4864,15 @@ mod tests {
 
         // The first request has been superseded even though its target has the
         // same numeric message ID.
-        assert!(app
-            .handle_network(NetworkEvent::MessageLoaded {
+        assert!(
+            app.handle_network(NetworkEvent::MessageLoaded {
                 chat_id: 1,
                 message_id: 99,
                 request_id: 2,
                 message: message(99, 2, "from beta", false),
             })
-            .is_empty());
+            .is_empty()
+        );
         assert_eq!(app.active_chat_id, Some(1));
 
         let mut target = message(99, 3, "from gamma", false);
@@ -4679,19 +4926,21 @@ mod tests {
             .as_mut()
             .unwrap()
             .chat_id = 3;
-        assert!(app
-            .handle_network(NetworkEvent::MessageLoaded {
+        assert!(
+            app.handle_network(NetworkEvent::MessageLoaded {
                 chat_id: 1,
                 message_id: 99,
                 request_id: 2,
                 message: message(99, 2, "stale beta", false),
             })
-            .is_empty());
+            .is_empty()
+        );
         assert_eq!(app.active_chat_id, Some(1));
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|status| status.contains("target changed")));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("target changed"))
+        );
 
         // A fresh request records peer 3 and must reject the same message ID
         // returned from peer 2.
@@ -4703,14 +4952,16 @@ mod tests {
             message: message(99, 2, "wrong peer", false),
         });
         assert_eq!(app.active_chat_id, Some(1));
-        assert!(app
-            .status_message
-            .as_deref()
-            .is_some_and(|status| status.contains("wrong reply target")));
-        assert!(!app
-            .messages
-            .get(&2)
-            .is_some_and(|messages| messages.iter().any(|message| message.id == 99)));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|status| status.contains("wrong reply target"))
+        );
+        assert!(
+            !app.messages
+                .get(&2)
+                .is_some_and(|messages| messages.iter().any(|message| message.id == 99))
+        );
 
         // Leaving the source conversation while a valid request is in flight
         // must not let its eventual response hijack the active chat.
@@ -4724,10 +4975,11 @@ mod tests {
             message: message(99, 3, "late target", false),
         });
         assert_eq!(app.active_chat_id, Some(2));
-        assert!(!app
-            .messages
-            .get(&3)
-            .is_some_and(|messages| messages.iter().any(|message| message.id == 99)));
+        assert!(
+            !app.messages
+                .get(&3)
+                .is_some_and(|messages| messages.iter().any(|message| message.id == 99))
+        );
     }
 
     #[test]
@@ -4888,35 +5140,78 @@ mod tests {
     }
 
     #[test]
-    fn clicking_an_attachment_row_requests_lazy_download() {
+    fn inline_media_downloads_are_bounded_and_ignore_superseded_messages() {
         let mut app = ready_app();
         open_first(&mut app);
-        let mut photo = message(21, 1, "", false);
-        photo.attachment = Some(Attachment {
-            kind: AttachmentKind::Photo,
-            file_name: Some("photo.jpg".to_owned()),
-            mime_type: Some("image/jpeg".to_owned()),
-            size: Some(42),
-            fallback_emoji: None,
-        });
-        app.handle_network(NetworkEvent::NewMessage(photo));
-        app.set_message_hit_regions(vec![(10, 70, 8, (21, Some(0)))]);
-
-        let commands = app.update(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 20,
-            row: 8,
-            modifiers: KeyModifiers::NONE,
-        }));
-        assert_eq!(
-            commands,
-            vec![TelegramCommand::DownloadAttachment {
+        for id in 21..=23 {
+            let mut photo = message(id, 1, "caption", false);
+            photo.attachment = Some(Attachment {
+                kind: AttachmentKind::Sticker,
+                file_name: Some("sticker.tgs".to_owned()),
+                mime_type: Some("application/x-tgsticker".to_owned()),
+                size: None,
+                fallback_emoji: Some("🙂".to_owned()),
+            });
+            app.handle_network(NetworkEvent::NewMessage(photo));
+            app.media_slots.push(crate::media::MediaSlot {
                 chat_id: 1,
-                message_id: 21
-            }]
+                message_id: id,
+                viewport: ratatui::layout::Rect::new(0, 0, 24, 30),
+                offset: 0,
+                size: ratatui::layout::Size::new(24, 6),
+            });
+        }
+        let requests = app.request_visible_media();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|c| matches!(
+            c,
+            TelegramCommand::DownloadPreview {
+                thumbnail: true,
+                ..
+            }
+        )));
+        assert!(app.request_visible_media().is_empty());
+        app.handle_action(KeyAction::Character('i'));
+        assert_eq!(app.mode, Mode::Compose);
+        let mut edited = app.messages[&1]
+            .iter()
+            .find(|m| m.id == 21)
+            .unwrap()
+            .clone();
+        edited.text = "new caption".to_owned();
+        app.handle_network(NetworkEvent::MessageUpdated(edited));
+        assert_eq!(app.request_visible_media().len(), 1);
+        app.handle_network(NetworkEvent::PreviewDownloaded {
+            chat_id: 1,
+            message_id: 21,
+            request_id: 1,
+            path: "stale.webp".into(),
+        });
+        assert!(app.media_previews[&(1, 21)].path.is_none());
+        app.handle_network(NetworkEvent::PreviewDownloaded {
+            chat_id: 1,
+            message_id: 21,
+            request_id: 3,
+            path: "current.webp".into(),
+        });
+        assert!(
+            app.media_previews[&(1, 21)]
+                .status
+                .contains("static preview")
         );
-        assert_eq!(app.selected_message, Some(21));
-        assert_eq!(app.attachment_state(1, 21), AttachmentState::Downloading);
+        assert!(!app.downloaded_attachments.contains_key(&(1, 21)));
+        app.handle_network(NetworkEvent::MessagesDeleted {
+            channel_id: None,
+            message_ids: vec![21, 22, 23],
+        });
+        app.handle_network(NetworkEvent::PreviewDownloaded {
+            chat_id: 1,
+            message_id: 22,
+            request_id: 2,
+            path: "deleted.webp".into(),
+        });
+        assert!(app.media_previews.is_empty());
+        assert!(app.request_visible_media().is_empty());
     }
 
     #[test]
@@ -4925,14 +5220,15 @@ mod tests {
         open_first(&mut app);
         app.set_message_hit_regions(vec![(10, 70, 8, (20, None))]);
 
-        assert!(app
-            .update(AppEvent::Mouse(MouseEvent {
+        assert!(
+            app.update(AppEvent::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Right),
                 column: 20,
                 row: 8,
-                modifiers: KeyModifiers::NONE,
+                modifiers: Modifiers::empty(),
             }))
-            .is_empty());
+            .is_empty()
+        );
         assert_eq!(app.mode, Mode::Compose);
         assert_eq!(app.selected_message, Some(20));
         assert_eq!(
@@ -4948,7 +5244,7 @@ mod tests {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column,
                 row,
-                modifiers: KeyModifiers::NONE,
+                modifiers: Modifiers::empty(),
             })
         };
 
@@ -4990,7 +5286,7 @@ mod tests {
             kind: MouseEventKind::ScrollUp,
             column: 10,
             row: 5,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::empty(),
         });
         assert_eq!(app.focus, Focus::Chats);
         assert_eq!(app.selected_chat, 0);
@@ -4999,7 +5295,7 @@ mod tests {
             kind: MouseEventKind::ScrollUp,
             column: 50,
             row: 5,
-            modifiers: KeyModifiers::NONE,
+            modifiers: Modifiers::empty(),
         });
         assert_eq!(app.focus, Focus::Conversation);
     }

@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod event;
 pub mod input;
+pub mod media;
 pub mod model;
 pub mod telegram;
 pub mod terminal;
@@ -21,8 +22,10 @@ mod tests {
     fn version_has_three_numeric_components() {
         let components = super::VERSION.split('.').collect::<Vec<_>>();
         assert_eq!(components.len(), 3);
-        assert!(components
-            .iter()
-            .all(|component| component.parse::<u64>().is_ok()));
+        assert!(
+            components
+                .iter()
+                .all(|component| component.parse::<u64>().is_ok())
+        );
     }
 }

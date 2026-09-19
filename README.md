@@ -15,7 +15,8 @@ The first release deliberately does less:
 - drag-and-drop upload of photos and arbitrary files;
 - lazy download and opening of incoming photos, files, video, audio, and stickers;
 - in-app navigation for supported Telegram chat and message links;
-- sticker and custom-emoji Unicode fallbacks;
+- terminal previews for photos, image documents, and stickers;
+- Unicode fallbacks for stickers and custom emoji;
 - optional terminal mouse input for chats, media, scrolling, settings, and accounts;
 - wide split-pane and narrow single-pane layouts;
 - chat filtering, contextual help, connection/error states, and safe terminal cleanup.
@@ -126,7 +127,7 @@ For a source build:
    cargo run --release
    ```
 
-Termgram uses Rust 1.88, installed automatically by `rustup` from the pinned
+Termgram uses Rust 1.98, installed automatically by `rustup` from the pinned
 `rust-toolchain.toml`. The session database defaults to the operating system's
 application-data directory. It is effectively an account credential; keep it
 private and never commit or share it. Set `TERMGRAM_SESSION` to override its
@@ -159,10 +160,45 @@ only into trusted default-branch builds, never pull-request builds.
 
 ## Lightweight by design
 
-Termgram uses one async runtime thread, has no idle animation wake-up while the
-interface is static, renders only visible rows, and bounds message histories,
-queues, and network caches. It still keeps a private SQLite session so login
-credentials and Telegram update state survive restarts.
+Termgram uses one async runtime thread plus Yazi's platform input reader. It has
+no idle animation wake-up while the interface is static and bounds message
+histories, outgoing commands, and network caches. It still keeps a private
+SQLite session so login credentials and Telegram update state survive restarts.
+
+## Terminal integration
+
+Terminal input, protocol parsing, capability detection, and platform restoration
+come from Yazi crates pinned to one upstream revision. Ratatui draws through the
+same Yazi TTY writer. There is one terminal input reader; Crossterm is used only
+as Ratatui's output backend.
+
+The terminal layer consumes capability replies separately from user input. It
+detects graphics protocols, terminal identity, colors, and cell pixel size for
+media previews. Detection runs alongside input and times out when a
+terminal does not answer. Yazi chooses the graphics protocol; `ratatui-image`
+provides multiple inline images and row-by-row clipping during timeline scrolling.
+Ghostty/Kitty use Kitty graphics, iTerm2/WezTerm use inline images, and supported
+terminals use Sixel. Other terminals use Unicode half-blocks without external
+helpers. Decoding retains Yazi's ICC color conversion and applies EXIF orientation.
+Decoding and encoding run off the UI thread, and only visible images are retained
+in the encoded cache. Help, settings, account changes, resizing, and shutdown
+clear or redraw the affected image areas.
+
+Yazi's enhanced keyboard handling supports shifted keys and associated Unicode
+text from keyboard layouts. `Ctrl+J` remains a newline fallback on terminals
+that cannot distinguish `Shift+Enter`. Paste, focus, mouse, resize, and keyboard
+events feed the existing application state machine. Normal exit, initialization
+failure, and the panic hook restore terminal modes.
+
+For tmux, `TERMGRAM_TMUX_PASSTHROUGH=1 tg` opts into Yazi's second-stage terminal
+probe. This runs the upstream tmux setup, which sets the pane's
+`allow-passthrough=all` and the server's `input-buffer-size=104857600`; those tmux
+options persist after exit. Without the opt-in, Termgram uses the capabilities
+reported by tmux itself and does not change these options. Set this in the shell
+environment before launch, not in the Telegram credentials `.env` file.
+
+See [vendor/README.md](vendor/README.md) for the pinned revision, the small
+`yazi-term` access patch, and the upstream files used by the integration.
 
 ## Keyboard
 
@@ -174,6 +210,7 @@ credentials and Telegram update state survive restarts.
 | Accounts | `a` open picker, `↑`/`↓` select, `Enter` switch/add, `1`–`8` direct |
 | Conversation | `PgUp`/`PgDn` scroll, `Home` oldest loaded, `End`/`G` latest |
 | Message actions | click or use `o`/`O` to select each action; `Enter` activates media, links, and supported bot buttons; `l` follows the selected/first link |
+| Media preview | photos and stickers appear inline automatically; click/`Enter` retries a failed preview; `Ctrl+L` redraws |
 | Message cursor | `[`/`]` select older/newer loaded messages, starting at the latest |
 | Replies | `R` replies to the selected/latest message; right-click replies under the pointer; select an existing reply with `o`/`O`, then `r` jumps to its target |
 | Wide layout | `Tab` switch pane |
@@ -210,10 +247,17 @@ phone numbers are never written to settings or logs.
 Drag one or more files from the desktop into an open conversation and drop them
 on the terminal. Text already in the composer becomes the first file's caption,
 including when replying. JPG, JPEG, PNG, and WebP files are sent as compressed
-Telegram photos; other inputs are preserved as documents. Incoming media downloads only
-when activated. Termgram saves it in a private per-process temporary directory
-and sanitizes remote filenames. Activate the row again to reveal the file in
-the operating system's file manager—Termgram never executes downloaded files.
+Telegram photos; other inputs are preserved as documents. Photos, image documents,
+and stickers appear directly in the chat timeline with no preview popup. Visible
+media downloads automatically, with at most two preview downloads in progress;
+scrolling away does not download the rest of the conversation. Files are saved in
+a private per-process temporary directory with sanitized remote filenames.
+Animated TGS/WebM stickers use Telegram's raster thumbnail and are labeled as
+static previews; animation playback is not implemented. A missing thumbnail or
+decoding failure leaves a retryable message in the timeline. Edits, deletes, and
+account switches invalidate stale results. Other attachments download only when
+activated and retain their second-activation reveal behavior in the operating
+system's file manager; Termgram never executes downloaded files.
 Downloads remain available for the current session and are left to the operating
 system's normal temporary-file cleanup.
 
@@ -251,6 +295,10 @@ chat creation, edits/deletes/forwarding, message search, group
 administration, notifications, polls, and secret chats.
 
 ## Development
+
+Follow [AGENTS.md](AGENTS.md): prefer upstream implementations, design and
+implement before testing, and keep only minimal durable regression tests.
+Remove temporary test scaffolding once validation is complete.
 
 ```sh
 cargo fmt --all -- --check

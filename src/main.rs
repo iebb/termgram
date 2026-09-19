@@ -3,18 +3,18 @@ use std::io;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use crossterm::event::{Event, EventStream};
-use futures_util::StreamExt;
+use anyhow::{Context, Result, bail};
 use termgram::app::{AppState, Screen};
 use termgram::config::{Config, ReleaseChannel, Settings};
 use termgram::event::{AppEvent, ConnectionStatus, NetworkEvent, TelegramCommand};
+use termgram::media::PreviewRenderer;
 use termgram::telegram::{self, TelegramHandle};
-use termgram::terminal::{install_panic_restore_hook, TerminalGuard};
+use termgram::terminal::{TerminalGuard, install_panic_restore_hook};
 use termgram::ui;
 use termgram::update::{self, UpdateOutcome, UpdateStatus};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
+use yazi_term::event::Event;
 
 enum RuntimeEvent {
     Terminal(Option<io::Result<Event>>),
@@ -24,6 +24,7 @@ enum RuntimeEvent {
         result: UpdateCheckResult,
     },
     ShutdownSignal(io::Result<()>),
+    Preview(Result<Vec<termgram::media::MediaFailure>>),
     Tick,
 }
 
@@ -78,6 +79,7 @@ async fn main() -> Result<()> {
 
     install_panic_restore_hook();
     let mut terminal = TerminalGuard::enter().context("failed to initialize the terminal")?;
+    let mut preview = PreviewRenderer::new();
     let (mut app, settings) = load_app_settings();
     let mut startup_warning = replacement_warning;
     if let Some(warning) = &startup_warning {
@@ -107,42 +109,42 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mut input = EventStream::new();
     let mut shutdown_signal = Box::pin(wait_for_shutdown_signal());
     let mut pending_commands = VecDeque::new();
     let mut redraw = true;
     let mut runtime_error: Option<anyhow::Error> = None;
 
     loop {
-        if redraw {
-            if app.take_force_redraw() {
-                if let Err(error) = terminal
-                    .terminal_mut()
-                    .clear()
-                    .context("failed to redraw the terminal")
-                {
-                    runtime_error = Some(error);
-                    break;
-                }
-            }
-            if let Err(error) = terminal
-                .terminal_mut()
-                .draw(|frame| ui::render(frame, &mut app))
-                .context("failed to draw the interface")
-            {
-                runtime_error = Some(error);
-                break;
-            }
+        if redraw && let Err(error) = draw_interface(&mut terminal, &mut preview, &mut app) {
+            runtime_error = Some(error);
+            break;
         }
 
         if app.should_quit {
             break;
         }
 
+        let missing_previews = app
+            .media_slots
+            .iter()
+            .map(|slot| (slot.chat_id, slot.message_id))
+            .filter(|key| !app.media_previews.contains_key(key))
+            .collect::<Vec<_>>();
+        let outgoing = app.request_visible_media();
+        dispatch(&mut app, &mut commands, &mut pending_commands, outgoing);
+        if missing_previews
+            .iter()
+            .any(|key| app.media_previews.contains_key(key))
+        {
+            redraw = true;
+            continue;
+        }
+
         let animation_tick = wait_for_animation_tick(app.needs_animation());
         let runtime_event = if let Some(network) = events.as_mut() {
             tokio::select! {
-                event = input.next() => RuntimeEvent::Terminal(event),
+                event = terminal.next_event() => RuntimeEvent::Terminal(event),
+                result = preview.finished() => RuntimeEvent::Preview(result),
                 event = network.recv() => RuntimeEvent::Network(Box::new(event)),
                 (channel, result) = wait_for_update_check(&mut update_check) => RuntimeEvent::UpdateCheck { channel, result },
                 result = &mut shutdown_signal => RuntimeEvent::ShutdownSignal(result),
@@ -150,7 +152,8 @@ async fn main() -> Result<()> {
             }
         } else {
             tokio::select! {
-                event = input.next() => RuntimeEvent::Terminal(event),
+                event = terminal.next_event() => RuntimeEvent::Terminal(event),
+                result = preview.finished() => RuntimeEvent::Preview(result),
                 (channel, result) = wait_for_update_check(&mut update_check) => RuntimeEvent::UpdateCheck { channel, result },
                 result = &mut shutdown_signal => RuntimeEvent::ShutdownSignal(result),
                 () = animation_tick => RuntimeEvent::Tick,
@@ -166,11 +169,15 @@ async fn main() -> Result<()> {
             RuntimeEvent::Terminal(Some(Ok(Event::Paste(text)))) => {
                 app.update(AppEvent::Paste(text))
             }
-            RuntimeEvent::Terminal(Some(Ok(Event::FocusGained))) => {
+            RuntimeEvent::Terminal(Some(Ok(Event::FocusIn))) => {
                 app.update(AppEvent::TerminalFocus(true))
             }
-            RuntimeEvent::Terminal(Some(Ok(Event::FocusLost))) => {
+            RuntimeEvent::Terminal(Some(Ok(Event::FocusOut))) => {
                 app.update(AppEvent::TerminalFocus(false))
+            }
+            RuntimeEvent::Terminal(Some(Ok(Event::Resize(_)))) => {
+                preview.invalidate();
+                app.handle_action(termgram::input::KeyAction::Redraw)
             }
             RuntimeEvent::Terminal(Some(Ok(_))) => Vec::new(),
             RuntimeEvent::Terminal(Some(Err(error))) => {
@@ -189,10 +196,8 @@ async fn main() -> Result<()> {
                         if let Some(warning) = startup_warning.take() {
                             app.handle_network(NetworkEvent::Error(warning));
                         }
-                    } else if refreshes_startup_warning {
-                        if let Some(warning) = &startup_warning {
-                            app.handle_network(NetworkEvent::Error(warning.clone()));
-                        }
+                    } else if refreshes_startup_warning && let Some(warning) = &startup_warning {
+                        app.handle_network(NetworkEvent::Error(warning.clone()));
                     }
                     outgoing
                 } else {
@@ -234,14 +239,23 @@ async fn main() -> Result<()> {
                 );
                 app.handle_action(termgram::input::KeyAction::Quit)
             }
+            RuntimeEvent::Preview(result) => {
+                match result {
+                    Ok(failures) => {
+                        for (chat_id, message_id, error) in failures {
+                            app.media_preview_failed(chat_id, message_id, &error);
+                        }
+                    }
+                    Err(error) => app.status_message = Some(format!("{error:#}")),
+                }
+                Vec::new()
+            }
             RuntimeEvent::Tick => app.update(AppEvent::Tick),
         };
 
         let account_switch = dispatch(&mut app, &mut commands, &mut pending_commands, outgoing);
         if let Some(account) = account_switch {
-            if let Err(error) = terminal
-                .terminal_mut()
-                .draw(|frame| ui::render(frame, &mut app))
+            if let Err(error) = draw_interface(&mut terminal, &mut preview, &mut app)
                 .context("failed to draw account-switch feedback")
             {
                 runtime_error = Some(error);
@@ -271,19 +285,39 @@ async fn main() -> Result<()> {
         synchronize_update_preferences(&mut app, &mut update_preferences, &mut update_check);
     }
 
+    drop(preview);
     drop(terminal);
     drop(commands.take());
     // Stop back-pressuring a worker that may be trying to report its final
     // status while the UI is no longer consuming network events.
     drop(events.take());
-    if let Some(mut task) = worker.take() {
-        if timeout(Duration::from_secs(2), &mut task).await.is_err() {
-            task.abort();
-            drop(task.await);
-        }
+    if let Some(mut task) = worker.take()
+        && timeout(Duration::from_secs(2), &mut task).await.is_err()
+    {
+        task.abort();
+        drop(task.await);
     }
 
     runtime_error.map_or(Ok(()), Err)
+}
+
+// Polling previews and drawing frames both stay on the main event-loop thread.
+fn draw_interface(
+    terminal: &mut TerminalGuard,
+    preview: &mut PreviewRenderer,
+    app: &mut AppState,
+) -> Result<()> {
+    // Terminal::clear queries the cursor through Crossterm and would compete
+    // with Yazi for input. Force cell updates without starting a second reader.
+    let force = app.take_force_redraw();
+    if force {
+        preview.invalidate();
+    }
+    terminal.terminal_mut().draw(|frame| {
+        ui::render(frame, app);
+        preview.render(frame, app, force);
+    })?;
+    Ok(())
 }
 
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<CommandLine> {
@@ -536,6 +570,17 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
             message_id,
             error: "Telegram command queue is busy".to_owned(),
         },
+        TelegramCommand::DownloadPreview {
+            chat_id,
+            message_id,
+            request_id,
+            ..
+        } => NetworkEvent::PreviewDownloadFailed {
+            chat_id,
+            message_id,
+            request_id,
+            error: "Telegram command queue is busy".to_owned(),
+        },
         TelegramCommand::ResolveTelegramLink { url } => NetworkEvent::LinkFailed {
             url,
             error: "Telegram command queue is busy".to_owned(),
@@ -600,11 +645,11 @@ async fn restart_telegram_worker(
         drop(sender.try_send(TelegramCommand::Shutdown));
     }
     drop(events.take());
-    if let Some(mut task) = worker.take() {
-        if timeout(Duration::from_secs(2), &mut task).await.is_err() {
-            task.abort();
-            drop(task.await);
-        }
+    if let Some(mut task) = worker.take()
+        && timeout(Duration::from_secs(2), &mut task).await.is_err()
+    {
+        task.abort();
+        drop(task.await);
     }
 
     let selected = base_config.for_account(account)?;
@@ -641,7 +686,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::{
-        dispatch, parse_arguments, synchronize_update_preferences, CommandLine, UpdateCheck,
+        CommandLine, UpdateCheck, dispatch, parse_arguments, synchronize_update_preferences,
     };
     use termgram::{
         app::AppState,

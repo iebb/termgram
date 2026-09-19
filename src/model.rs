@@ -45,6 +45,26 @@ pub enum AttachmentKind {
 }
 
 impl Attachment {
+    /// Media that can be shown in the terminal without opening an external app.
+    #[must_use]
+    pub fn supports_preview(&self) -> bool {
+        matches!(self.kind, AttachmentKind::Photo | AttachmentKind::Sticker)
+            || self
+                .mime_type
+                .as_deref()
+                .is_some_and(|mime| mime.starts_with("image/"))
+    }
+
+    /// Telegram supplies raster thumbnails for animated/vector stickers.
+    #[must_use]
+    pub fn preview_uses_thumbnail(&self) -> bool {
+        self.kind == AttachmentKind::Sticker
+            && matches!(
+                self.mime_type.as_deref(),
+                Some("application/x-tgsticker" | "video/webm")
+            )
+    }
+
     /// A safe display name and download-file hint.
     #[must_use]
     pub fn display_name(&self) -> &str {
@@ -205,7 +225,7 @@ pub fn sanitize_terminal_line(value: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use super::{sanitize_terminal_line, sanitize_terminal_text, Attachment};
+    use super::{Attachment, sanitize_terminal_line, sanitize_terminal_text};
 
     #[test]
     fn strips_terminal_control_characters() {

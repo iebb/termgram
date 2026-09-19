@@ -1,0 +1,36 @@
+[package]
+name                   = "yazi-term"
+description            = "Cross-platform virtual terminal"
+version = "26.9.1"
+edition = "2024"
+license = "MIT"
+authors = ["sxyazi <sxyazi@gmail.com>"]
+homepage = "https://yazi-rs.github.io"
+repository = "https://github.com/sxyazi/yazi"
+rust-version = "1.98.0"
+
+
+[dependencies]
+yazi-macro = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
+yazi-shim = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
+yazi-tty = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
+
+# External dependencies
+anyhow = "1.0.104"
+base64 = "0.23.1"
+bitflags = { version = "2.13.2", features = ["serde"] }
+compact_str = { version = "0.10.0", features = ["serde"] }
+futures = "0.3.34"
+mlua = { version = "0.12.1", features = ["anyhow", "async", "error-send", "lua55", "macros", "serde"] }
+parking_lot = "0.12.5"
+serde = { version = "1.0.229", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.4"
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "mm", "shm", "stdio", "termios", "event", "process", "system"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [ "Win32_Globalization", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading" ] }

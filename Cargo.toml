@@ -12,6 +12,8 @@ name = "tg"
 path = "src/main.rs"
 
 [dependencies]
+anstream = "=1.0.0"
+anstyle = "=1.0.14"
 anyhow = "1.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 directories = "6.0"
@@ -26,6 +28,9 @@ sha2 = "=0.11.0"
 tokio = { version = "1.52", default-features = false, features = ["macros", "rt", "signal", "sync", "time"] }
 unicode-segmentation = "=1.12.0"
 unicode-width = "=0.2.2"
+
+[build-dependencies]
+vergen-gitcl = "=10.0.3"
 
 [profile.release]
 codegen-units = 1

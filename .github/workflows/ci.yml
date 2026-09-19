@@ -188,6 +188,7 @@ jobs:
       - name: Build and package every pushed commit
         shell: bash
         env:
+          VERGEN_GIT_BRANCH: ${{ github.head_ref || github.ref_name }}
           TERMGRAM_EMBEDDED_API_ID: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && secrets.TELEGRAM_API_ID || '' }}
           TERMGRAM_EMBEDDED_API_HASH: ${{ github.event_name == 'push' && github.ref_name == github.event.repository.default_branch && secrets.TELEGRAM_API_HASH || '' }}
         run: |
@@ -204,7 +205,14 @@ jobs:
             if [[ "$RUNNER_OS" == Windows ]]; then
               binary+=".exe"
             fi
-            test "$("$binary" --version)" = "tg $version"
+            version_output="$("$binary" --version)"
+            version_line="${version_output%%$'\n'*}"
+            version_line="${version_line%$'\r'}"
+            # The release plan may include historical commits with one-line output.
+            case "$version_line" in
+              "version  $version" | "tg $version" | "tg $version($(git rev-parse --short HEAD)) $VERGEN_GIT_BRANCH" | "tg $version ($(git rev-parse --short HEAD)) · $VERGEN_GIT_BRANCH") ;;
+              *) echo "Unexpected version output: $version_output" >&2; exit 1 ;;
+            esac
             if [[ "$RUNNER_OS" == Linux ]]; then
               if readelf -d "$binary" | grep -q '(NEEDED)'; then
                 echo "Linux release unexpectedly has dynamic dependencies" >&2

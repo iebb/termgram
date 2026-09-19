@@ -12,6 +12,8 @@ name = "tg"
 path = "src/main.rs"
 
 [dependencies]
+anstream = "=1.0.0"
+anstyle = "=1.0.14"
 anyhow = "1.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 directories = "6.0"
@@ -34,6 +36,9 @@ yazi-adapter = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab
 yazi-emulator = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
 yazi-term = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
 yazi-tty = { git = "https://github.com/sxyazi/yazi", rev = "9203fd2604f867ab5ec18f24203b918975c4c00a" }
+
+[build-dependencies]
+vergen-gitcl = "=10.0.3"
 
 [profile.release]
 codegen-units = 1

@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     );
     match command_line {
         CommandLine::Version => {
-            println!("tg {}", termgram::VERSION);
+            anstream::println!("{}", termgram::version_description(true));
             return Ok(());
         }
         CommandLine::Help => {

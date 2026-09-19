@@ -152,7 +152,25 @@ version and platform/architecture, for example
 `termgram-0.1.42-macos-x86_64.tar.gz`. The legacy `linux`, `macos`, and `windows`
 asset names remain the x86_64 Linux, Apple-silicon macOS, and x64 Windows builds
 so existing auto-updaters remain compatible. Run `tg --version` to inspect a
-binary's version.
+binary's version and build identity:
+
+```text
+version  0.1.0
+commit   abcdef12*
+branch   feat/yazi-terminal-backend
+os       macOS
+arch     arm64
+build    26
+```
+
+Labels are bold cyan in a color-capable terminal; values use its default text
+color. Columns use spaces so they align independently of terminal tab stops.
+Piped output is plain text by default; `NO_COLOR=1` and `TERM=dumb` also disable
+styling. A `*` after the commit hash means the build included tracked modifications
+or untracked files (Git-ignored files do not count). The build number is the first-parent commit count, matching release
+versioning. Builds from a detached checkout report `HEAD` unless
+`VERGEN_GIT_BRANCH` supplies the branch name, as it does in CI. Source archives
+without Git metadata report `unknown` for unavailable fields.
 
 The public repository stores only the `TELEGRAM_API_ID` and
 `TELEGRAM_API_HASH` secret names. GitHub encrypts their values and injects them

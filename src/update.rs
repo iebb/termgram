@@ -24,7 +24,7 @@ const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_hours(24);
 #[cfg(windows)]
 const FAILED_REPLACEMENT_WARNING: &str =
     "A previous Termgram update could not replace tg; close other tg processes, then run `tg update` again";

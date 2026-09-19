@@ -888,8 +888,8 @@ fn qr_login_url(token: &[u8]) -> String {
 fn base64_url_no_pad(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, remainder) = bytes.as_chunks::<3>();
+    for chunk in chunks {
         encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
         encoded.push(char::from(
             ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
@@ -899,7 +899,7 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
         ));
         encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
     }
-    match chunks.remainder() {
+    match remainder {
         [first] => {
             encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
             encoded.push(char::from(ALPHABET[usize::from((first & 0x03) << 4)]));

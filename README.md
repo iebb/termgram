@@ -126,7 +126,7 @@ For a source build:
    cargo run --release
    ```
 
-Termgram uses Rust 1.88, installed automatically by `rustup` from the pinned
+Termgram uses Rust 1.98, installed automatically by `rustup` from the pinned
 `rust-toolchain.toml`. The session database defaults to the operating system's
 application-data directory. It is effectively an account credential; keep it
 private and never commit or share it. Set `TERMGRAM_SESSION` to override its

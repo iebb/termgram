@@ -2,7 +2,7 @@
 name = "termgram"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.98"
 description = "A focused, keyboard-first Telegram client for the terminal"
 license = "MIT"
 repository = "https://github.com/iebb/termgram"

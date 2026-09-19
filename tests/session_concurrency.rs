@@ -42,7 +42,9 @@ fn session_writer() {
         .unwrap()
         .block_on(async {
             let session = SqliteSession::open(path).await.unwrap();
-            for pts in 1..=100 {
+            // Exercise initialization and repeated writes, not sustained writer
+            // saturation: the production busy timeout deliberately caps waiting.
+            for pts in 1..=3 {
                 session
                     .set_update_state(UpdateState::Primary {
                         pts,

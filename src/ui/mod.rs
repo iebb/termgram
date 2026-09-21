@@ -2,6 +2,7 @@ mod appearance;
 mod chat_info;
 mod chats;
 mod commands;
+mod completion;
 mod deletion;
 mod editing;
 mod entities;
@@ -432,6 +433,7 @@ const fn qr_pair_symbol(top: QrColor, bottom: QrColor) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let narrow = area.width < crate::sidebar::MIN_SPLIT_WIDTH;
     let conversation_only =
@@ -470,6 +472,9 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         render_conversation(frame, content[0], app);
     }
     render_composer(frame, content[1], app, conversation_only || !narrow);
+    if app.mode == Mode::Compose {
+        completion::render(frame, app);
+    }
     if let Some(message) = &app.status_message {
         render_notice(frame, rows[1], message, WARNING);
     }

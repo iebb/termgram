@@ -6,6 +6,7 @@ pub mod chat_discovery;
 pub mod chat_info;
 pub mod cloud_search;
 pub mod commands;
+pub mod completion;
 pub mod config;
 pub mod deletion;
 pub mod drafts;

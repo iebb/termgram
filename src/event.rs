@@ -64,6 +64,11 @@ pub enum TelegramCommand {
         chat_id: ChatId,
         request_id: u64,
     },
+    /// One-shot member/bot-command fetch backing composer completion.
+    LoadMembers {
+        chat_id: ChatId,
+        request_id: u64,
+    },
     PreviewInvite {
         hash: String,
         request_id: u64,
@@ -335,6 +340,14 @@ impl TelegramCommand {
                 chat_id,
                 request_id,
             } => NetworkEvent::ChatInfoReady {
+                chat_id,
+                request_id,
+                result: Err(error),
+            },
+            Self::LoadMembers {
+                chat_id,
+                request_id,
+            } => NetworkEvent::MembersLoaded {
                 chat_id,
                 request_id,
                 result: Err(error),
@@ -676,6 +689,14 @@ impl fmt::Debug for TelegramCommand {
                 request_id,
             } => formatter
                 .debug_struct("LoadChatInfo")
+                .field("chat_id", chat_id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::LoadMembers {
+                chat_id,
+                request_id,
+            } => formatter
+                .debug_struct("LoadMembers")
                 .field("chat_id", chat_id)
                 .field("request_id", request_id)
                 .finish(),
@@ -1098,6 +1119,11 @@ pub enum NetworkEvent {
         chat_id: ChatId,
         request_id: u64,
         result: Result<crate::chat_info::Info, String>,
+    },
+    MembersLoaded {
+        chat_id: ChatId,
+        request_id: u64,
+        result: Result<crate::completion::ChatCompletion, String>,
     },
     ChatInfoInvalidated {
         chat_id: ChatId,

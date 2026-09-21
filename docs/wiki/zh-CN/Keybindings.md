@@ -68,9 +68,11 @@
 | 大图预览 | Esc 或 q / i / O | 关闭 / 回复 / 显示原始文件 |
 | 导航 | g i / Ctrl-R | 显示聊天和文件夹 ID / 刷新列表 |
 | 导航 | ? / s / a / q | 帮助 / 设置 / 账号 / 退出 |
-| 输入框 | Enter | 发送 |
+| 输入框 | Enter | 发送；候选弹窗打开时接受高亮项 |
 | 输入框 | Shift-Enter 或 Ctrl-J | 换行 |
-| 输入框 | Esc | 先取消回复，再退出输入并保留草稿 |
+| 输入框 | Esc | 先关闭候选弹窗或取消回复，再退出输入并保留草稿 |
+| 输入框候选 | Tab / Shift-Tab 或 Ctrl-N/Ctrl-P、Up/Down | 循环并应用 @成员 与 /命令 候选 |
+| 输入框候选 | 点击 | 接受该候选 |
 | 编辑器 | Left/Right、Home/End、Ctrl-A/Ctrl-E | 移动光标 |
 | 编辑器 | Backspace/Delete、Ctrl-W、Ctrl-U | 删字符 / 前一个词 / 清空 |
 | 聊天过滤 | Enter / Esc | 打开匹配聊天 / 清空并退出过滤 |

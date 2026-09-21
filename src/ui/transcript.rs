@@ -74,7 +74,7 @@ pub(super) fn render(message: &Message, width: usize, app: &AppState) -> Rendere
         }
     }
     if let Some(attachment) = &message.attachment
-        && !(message.id > 0 && attachment.supports_preview())
+        && !(message.id > 0 && attachment.supports_preview() && app.keymap.messages.images.inline())
     {
         let label = attachment_label(attachment, icons);
         let current =

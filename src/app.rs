@@ -5,6 +5,7 @@ mod appearance;
 mod attachments;
 pub(crate) mod chat_info;
 mod commands;
+mod completion;
 mod composition;
 pub(crate) mod configuration;
 mod deletion;
@@ -261,6 +262,15 @@ pub struct App {
     pub filter: TextInput,
     pub search: search::State,
     pub commands: commands::State,
+    /// Active `@`/`/` completion popup in the composer.
+    completion: Option<completion::Popup>,
+    /// Per-chat member/command data loaded on first use.
+    chat_completion: BTreeMap<ChatId, crate::completion::ChatCompletion>,
+    /// Chats whose member fetch was already queued this session.
+    completion_requested: BTreeSet<ChatId>,
+    /// Rendered popup rows: x start/end, y, candidate index.
+    pub completion_hit_regions: Vec<(u16, u16, u16, usize)>,
+    next_completion_request_id: u64,
     pub attachment_draft: staging::State,
     pub editing: editing::State,
     pub deletion: deletion::State,
@@ -386,6 +396,11 @@ impl Default for App {
             filter: TextInput::new(),
             search: search::State::default(),
             commands: commands::State::default(),
+            completion: None,
+            chat_completion: BTreeMap::new(),
+            completion_requested: BTreeSet::new(),
+            completion_hit_regions: Vec::new(),
+            next_completion_request_id: 1,
             attachment_draft: staging::State::default(),
             editing: editing::State::default(),
             deletion: deletion::State::default(),
@@ -586,6 +601,7 @@ impl App {
         self.settings_hit_regions.clear();
         self.account_hit_regions.clear();
         self.commands.hit_regions.clear();
+        self.completion_hit_regions.clear();
         self.invites.hit_regions.clear();
         self.attachment_draft.hit_regions.clear();
         self.chat_pane_region = None;
@@ -896,7 +912,17 @@ impl App {
             }
             Action::Compose => return self.compose_or_reply(),
             Action::Preview => return self.preview_selected_media(),
+            Action::CompleteNext | Action::CompletePrevious if self.mode == Mode::Compose => {
+                self.move_completion(*run == Action::CompleteNext);
+                return Vec::new();
+            }
             Action::Send => {
+                // While the completion popup is up, Enter accepts the
+                // highlighted row instead of sending — like official clients.
+                if self.mode == Mode::Compose && self.accept_completion() {
+                    return Vec::new();
+                }
+                self.completion = None;
                 return self
                     .active_chat_id
                     .map_or_else(Vec::new, |id| self.send_draft(id));
@@ -1149,6 +1175,14 @@ impl App {
             {
                 self.click_command(index);
             }
+            return Vec::new();
+        }
+        if self.mode == Mode::Compose
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(index) =
+                pointer_row_hit(&self.completion_hit_regions, mouse.column, mouse.row)
+        {
+            self.click_completion(index);
             return Vec::new();
         }
         if matches!(
@@ -1484,6 +1518,18 @@ impl App {
             } => {
                 self.finish_chat_mute(chat_id, request_id, result);
                 Vec::new()
+            }
+            NetworkEvent::MembersLoaded {
+                chat_id,
+                request_id: _,
+                result,
+            } => {
+                // A failed fetch keeps `completion_requested` set so typing
+                // cannot loop requests; transcript senders still complete.
+                if let Ok(data) = result {
+                    self.chat_completion.insert(chat_id, data);
+                }
+                self.refresh_completion(chat_id)
             }
             NetworkEvent::SearchFailed { request_id, error } => {
                 self.finish_search(request_id, Err(error));
@@ -2233,6 +2279,11 @@ impl App {
         self.composer_region = Some(region);
     }
 
+    #[must_use]
+    pub const fn composer_region(&self) -> Option<(u16, u16, u16, u16)> {
+        self.composer_region
+    }
+
     pub const fn set_conversation_pane_region(&mut self, region: (u16, u16, u16, u16)) {
         self.conversation_pane_region = Some(region);
     }
@@ -2319,6 +2370,7 @@ impl App {
             Screen::Main if self.mode == Mode::Compose => {
                 if let Some(chat_id) = self.active_chat_id {
                     self.draft_data_mut(chat_id).input.insert_str(&normalized);
+                    return self.refresh_completion(chat_id);
                 }
             }
             Screen::Main if self.mode == Mode::Search && self.search.editing => {
@@ -2587,15 +2639,23 @@ impl App {
             return Vec::new();
         };
         if action == KeyAction::Escape {
+            if self.dismiss_completion() {
+                return Vec::new();
+            }
             if self.draft_data_mut(chat_id).reply.take().is_some() {
                 self.selected_message = None;
                 self.status_message = Some("Reply cancelled · draft kept".to_owned());
                 return Vec::new();
             }
             self.mode = Mode::Navigate;
+            self.completion = None;
             return Vec::new();
         }
         if action == KeyAction::Enter {
+            if self.accept_completion() {
+                return Vec::new();
+            }
+            self.completion = None;
             return self.send_draft(chat_id);
         }
         let draft = &mut self.draft_data_mut(chat_id).input;
@@ -2613,7 +2673,7 @@ impl App {
             KeyAction::Redraw => self.force_redraw = true,
             _ => {}
         }
-        Vec::new()
+        self.refresh_completion(chat_id)
     }
 
     fn handle_filter(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
@@ -3708,6 +3768,7 @@ impl App {
         };
         self.pending_telegram_link = None;
         self.active_chat_id = Some(chat_id);
+        self.completion = None;
         self.remember_chat(chat_id);
         self.selected_message = None;
         self.focus = Focus::Conversation;
@@ -6172,6 +6233,93 @@ mod tests {
         let pending = app.active_messages().last().unwrap();
         assert_eq!(pending.delivery, Delivery::Pending);
         assert_eq!(app.mode, Mode::Compose);
+    }
+
+    #[test]
+    fn composer_completion_mentions_commands_and_dismissal() {
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.handle_action(KeyAction::Character('i'));
+        // Entering compose prefetches member data once for this chat.
+        assert!(app.completion_popup().is_none());
+        app.handle_network(NetworkEvent::MembersLoaded {
+            chat_id: 1,
+            request_id: 1,
+            result: Ok(crate::completion::ChatCompletion {
+                members: vec![
+                    crate::completion::Member {
+                        name: "Alice".to_owned(),
+                        username: "alice".to_owned(),
+                        bot: false,
+                    },
+                    crate::completion::Member {
+                        name: "Robo".to_owned(),
+                        username: "robo_bot".to_owned(),
+                        bot: true,
+                    },
+                ],
+                commands: vec![crate::completion::BotCommand {
+                    bot: Some("robo_bot".to_owned()),
+                    command: "roll".to_owned(),
+                    description: "Roll a die".to_owned(),
+                }],
+            }),
+        });
+
+        // '@' opens the popup and queues no second fetch.
+        assert!(app.handle_action(KeyAction::Character('@')).is_empty());
+        assert_eq!(app.completion_popup().unwrap().candidates.len(), 2);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Mention"));
+        assert!(text.contains("@alice"));
+        assert!(text.contains("@robo_bot"));
+        app.handle_action(KeyAction::Character('r'));
+        let popup = app.completion_popup().unwrap();
+        assert_eq!(popup.candidates.len(), 1);
+        assert_eq!(popup.candidates[0].insert, "@robo_bot");
+        // Esc only dismisses the popup; the draft and mode are unchanged.
+        app.handle_action(KeyAction::Escape);
+        assert!(app.completion_popup().is_none());
+        assert_eq!(app.mode, Mode::Compose);
+        assert_eq!(app.active_draft().unwrap().value(), "@r");
+        // A different token reopens completion; Tab applies in place.
+        app.handle_action(KeyAction::Backspace);
+        app.handle_action(KeyAction::Backspace);
+        app.handle_action(KeyAction::Character('@'));
+        app.run_binding("complete_next", 1);
+        assert_eq!(app.active_draft().unwrap().value(), "@alice");
+        app.run_binding("complete_next", 1);
+        assert_eq!(app.active_draft().unwrap().value(), "@robo_bot");
+        // Enter accepts the highlighted row instead of sending.
+        assert!(app.handle_action(KeyAction::Enter).is_empty());
+        assert_eq!(app.active_draft().unwrap().value(), "@robo_bot ");
+        assert!(app.completion_popup().is_none());
+
+        // '/' at the start offers bot commands; Enter inserts and closes.
+        app.draft_data_mut(1).input.clear();
+        app.handle_action(KeyAction::Character('/'));
+        app.handle_action(KeyAction::Character('r'));
+        let popup = app.completion_popup().unwrap();
+        assert_eq!(popup.candidates[0].insert, "/roll");
+        assert!(app.handle_action(KeyAction::Enter).is_empty());
+        assert_eq!(app.active_draft().unwrap().value(), "/roll ");
+        // With no token and no popup, Enter sends normally again.
+        let commands = app.handle_action(KeyAction::Enter);
+        assert!(matches!(
+            commands.as_slice(),
+            [TelegramCommand::SendMessage { text, .. }] if text == "/roll "
+        ));
     }
 
     #[test]

@@ -3,6 +3,25 @@ use crate::appearance::TerminalColor;
 use ratatui::style::Color;
 use serde::Deserialize;
 
+/// How image attachments appear in the transcript.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Images {
+    /// Download and render supported images inline (default).
+    #[default]
+    Inline,
+    /// Show the regular `[photo]`/`[sticker]` placeholder row only; the
+    /// preview key still opens the image explicitly.
+    Placeholder,
+}
+
+impl Images {
+    #[must_use]
+    pub const fn inline(self) -> bool {
+        matches!(self, Self::Inline)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Configuration {
@@ -10,6 +29,7 @@ pub struct Configuration {
     pub alternating: bool,
     /// None blends with the background reported by the existing Yazi reader.
     pub alternate_background: Option<TerminalColor>,
+    pub images: Images,
 }
 
 impl Default for Configuration {
@@ -18,6 +38,7 @@ impl Default for Configuration {
             spacing: 0,
             alternating: true,
             alternate_background: None,
+            images: Images::Inline,
         }
     }
 }

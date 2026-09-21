@@ -7,6 +7,7 @@ mod forwarding;
 mod invites;
 mod local;
 mod media_cache;
+mod members;
 mod message_actions;
 mod notifications;
 mod pins;
@@ -1519,6 +1520,7 @@ async fn handle_command(
             }
         }
         command @ (TelegramCommand::LoadChatInfo { .. }
+        | TelegramCommand::LoadMembers { .. }
         | TelegramCommand::PreviewInvite { .. }
         | TelegramCommand::JoinInvite { .. }
         | TelegramCommand::LoadReactions { .. }

@@ -90,6 +90,7 @@ messages = {
   spacing = 0, -- 0–2 blank rows
   alternating = true,
   -- alternate_background = "dark_gray", -- omit for automatic theme shading
+  -- images = "placeholder", -- show a label row; `o` opens the preview explicitly
 },
 ```
 
@@ -107,7 +108,9 @@ selected message; the current reply, attachment or link action also gains emphas
 Body, action rows and inline media share a small two-column gutter. Inline images
 do not repeat a `photo` or `sticker` filename above the preview. While an image is
 not available, a small placeholder preserves its target; preview status appears
-in the bottom bar. `o` expands selected media, `O` reveals its original in the
+in the bottom bar. Set `messages.images = "placeholder"` to skip inline rendering
+entirely: image messages keep their label row and `o` still expands the preview on
+demand, so no media downloads or image protocol output run while scrolling. `o` expands selected media, `O` reveals its original in the
 system file manager, `i` replies, and `g n` / `g p` move among actions.
 
 Resizing and sidebar toggles retain the anchored message. If reflow removes the

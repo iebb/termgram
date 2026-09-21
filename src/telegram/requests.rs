@@ -94,6 +94,7 @@ enum Response {
     ChatInfo(crate::chat_info::Info),
     Invite(crate::invites::Preview, Option<PeerRef>),
     Joined(crate::invites::Outcome, Option<PeerRef>),
+    Members(crate::completion::ChatCompletion),
     Reactions(crate::reactions::Review),
     Poll(crate::polls::Poll),
     Search(super::search::Page),
@@ -132,6 +133,7 @@ pub(super) fn spawn(
         TelegramCommand::ResolveAlertSettings { key, .. } => Some(key.chat),
         TelegramCommand::SearchCloud(request) => Some(request.chat_id),
         TelegramCommand::LoadChatInfo { chat_id, .. }
+        | TelegramCommand::LoadMembers { chat_id, .. }
         | TelegramCommand::LoadReactions { chat_id, .. }
         | TelegramCommand::ChangeReaction { chat_id, .. }
         | TelegramCommand::RefreshReactions { chat_id, .. }
@@ -245,6 +247,14 @@ async fn execute(
             )
             .await
             .context("Chat information timed out")??,
+        )),
+        TelegramCommand::LoadMembers { .. } => Ok(Response::Members(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                super::members::load(client, peer()?, self_id),
+            )
+            .await
+            .context("Member lookup timed out")??,
         )),
         TelegramCommand::PreviewInvite { hash, .. } => {
             let (preview, peer) = tokio::time::timeout(
@@ -684,6 +694,17 @@ pub(super) async fn complete(
             chat_id,
             request_id,
             result: Ok(info),
+        },
+        (
+            TelegramCommand::LoadMembers {
+                chat_id,
+                request_id,
+            },
+            Response::Members(data),
+        ) => NetworkEvent::MembersLoaded {
+            chat_id,
+            request_id,
+            result: Ok(data),
         },
         (TelegramCommand::PreviewInvite { request_id, .. }, Response::Invite(preview, peer)) => {
             if let (Some(chat), Some(peer)) = (&preview.joined, peer) {

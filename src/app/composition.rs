@@ -107,6 +107,9 @@ impl App {
         self.focus = Focus::Conversation;
         self.narrow_conversation = true;
         self.selected_message = None;
+        // Warm the member cache so `@` and `/` complete on the first keystroke.
+        commands.extend(self.request_completion_data(chat_id));
+        commands.extend(self.refresh_completion(chat_id));
         commands
     }
 }

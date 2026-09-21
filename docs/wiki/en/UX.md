@@ -84,7 +84,10 @@ current conversation, or restores the last chat for this Telegram account after
 restart. If it is unavailable, the highlighted chat is used; an empty list shows
 a synchronization hint. The composer shows a configurable ghost hint when empty,
 without a second permanent row repeating the send key. Enter sends; Shift-Enter
-or Ctrl-J inserts a newline. Bot commands are typed here, including their `/`.
+or Ctrl-J inserts a newline. Bot commands are typed here, including their `/`;
+typing `/` at the start of a draft or `@` after whitespace opens a suggestion
+popup listing the chat's bot commands and members. Tab and the arrow keys cycle
+candidates, Enter accepts the highlighted row, and Esc dismisses the popup.
 Each chat has its own local draft, including its text, reply target and cursor.
 Esc, account switches and normal restarts preserve it. Drafts are keyed by the
 Telegram user identity, so reusing a local account slot does not expose another

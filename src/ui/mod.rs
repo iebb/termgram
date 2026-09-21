@@ -2,6 +2,7 @@ mod appearance;
 mod chat_info;
 mod chats;
 mod commands;
+mod completion;
 mod deletion;
 mod editing;
 mod entities;
@@ -432,6 +433,7 @@ const fn qr_pair_symbol(top: QrColor, bottom: QrColor) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
     let narrow = area.width < crate::sidebar::MIN_SPLIT_WIDTH;
     let conversation_only =
@@ -470,6 +472,9 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         render_conversation(frame, content[0], app);
     }
     render_composer(frame, content[1], app, conversation_only || !narrow);
+    if app.mode == Mode::Compose {
+        completion::render(frame, app);
+    }
     if let Some(message) = &app.status_message {
         render_notice(frame, rows[1], message, WARNING);
     }
@@ -635,6 +640,7 @@ fn render_conversation(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         );
         lines.extend(rendered.lines);
         if message.id > 0
+            && app.keymap.messages.images.inline()
             && let Some(attachment) = message.attachment.as_ref().filter(|a| a.supports_preview())
         {
             let height = inner
@@ -2460,6 +2466,45 @@ mod tests {
         app.mode = Mode::Navigate;
         render_text_mut(&mut app, 30, 8);
         assert!(app.media_slots.is_empty());
+    }
+
+    #[test]
+    fn image_placeholder_mode_shows_labels_and_no_media_slots() {
+        use crate::transcript::Images;
+        let mut app = populated_app();
+        app.keymap.messages.images = Images::Placeholder;
+        app.messages.get_mut(&7).unwrap().push(Message {
+            reactions: None,
+            poll: None,
+            entities: Vec::new(),
+            notification: None,
+            mention: None,
+            edited_at: None,
+            pinned: false,
+            id: 12,
+            chat_id: 7,
+            sender_username: None,
+            sender: "Alice".to_owned(),
+            reply_to: None,
+            text: String::new(),
+            timestamp: Utc::now(),
+            outgoing: false,
+            delivery: Delivery::Read,
+            attachment: Some(Attachment {
+                source_id: None,
+                kind: AttachmentKind::Photo,
+                file_name: Some("image.jpg".to_owned()),
+                mime_type: Some("image/jpeg".to_owned()),
+                size: Some(2048),
+                fallback_emoji: None,
+            }),
+            links: Vec::new(),
+            buttons: Vec::new(),
+        });
+        let output = render_text_mut(&mut app, 120, 36);
+        assert!(output.contains("[photo] image.jpg"));
+        assert!(app.media_slots.is_empty());
+        assert!(app.request_visible_media().is_empty());
     }
 
     #[test]

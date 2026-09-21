@@ -9,6 +9,7 @@ return {
   nerd_font = false, -- true when the terminal uses a Nerd Font Mono (v3+)
   sidebar = { width = 30, time_color = "cyan", unread_color = "yellow" },
   messages = { spacing = 0, alternating = true }, -- automatic terminal background shading
+  -- messages.images = "placeholder" renders a label instead of inline media; `o` still opens it
   statusline = {
     enabled = true,
     left = { "mode", "app", "account", "message", "context" },

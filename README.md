@@ -30,6 +30,19 @@ followed by `brew upgrade iebb/termgram/termgram`; uninstall with
 `brew uninstall termgram`. If you previously installed `tg` manually, check
 `which tg`: a copy in `~/bin` or `~/.local/bin` may take precedence in `PATH`.
 
+Scoop (64-bit / ARM64 Windows):
+
+```powershell
+scoop bucket add termgram https://github.com/iebb/termgram.git
+scoop install termgram
+```
+
+The [Scoop manifest](bucket/termgram.json) lives in this repository and installs
+the prebuilt stable release for your Windows architecture with SHA-256
+verification. No separate bucket repository or Rust compiler is needed. Update
+with `scoop update` followed by `scoop update termgram`; uninstall with
+`scoop uninstall termgram`.
+
 Standalone installer (Linux / macOS):
 
 ```sh
@@ -53,8 +66,9 @@ cargo +1.98.0 install --locked --git https://github.com/iebb/termgram --bin tg t
 Run `tg`, sign in with your phone or press Tab for QR login. Open a chat with
 Enter, press `i` to compose, and `?` for help. Repeat the Cargo command to update
 a source install; use `tg update` for standalone release binaries. Use
-`brew upgrade iebb/termgram/termgram` for Homebrew installations so Homebrew
-can track the installed version.
+`brew upgrade iebb/termgram/termgram` for Homebrew installations and
+`scoop update termgram` for Scoop installations so the package manager can
+track the installed version.
 
 Releases support Linux x86_64/ARM64, macOS Intel/Apple silicon, and Windows
 x64/ARM64. See [installation and source builds](docs/wiki/en/Getting-Started.md)
@@ -78,23 +92,3 @@ See [development and architecture](docs/wiki/en/Development.md),
 The [Wiki source](docs/wiki/README.md) is reviewed alongside code changes and
 provides English and Simplified Chinese pages. Local working plans live in the
 Git-ignored `dev-notes/` directory.
-
-### Maintaining Homebrew
-
-After publishing a stable release, update the version, all four archive URLs,
-and their SHA-256 values in `Formula/termgram.rb` from the release's
-`SHA256SUMS`. The unqualified `macos` archive is Apple silicon; `linux` is
-x86_64. Commit the formula update here so `brew update` can pick it up. The
-release workflow does not update the formula automatically, and Homebrew
-follows the stable version pinned in the formula rather than prereleases.
-
-Run `brew style Formula/termgram.rb`. To test local edits, copy the formula to
-`$(brew --repository iebb/termgram)/Formula/termgram.rb`, then run:
-
-```sh
-brew reinstall iebb/termgram/termgram
-brew test iebb/termgram/termgram
-```
-
-The formula tests version output, help, and invalid-argument handling without
-signing in to Telegram.

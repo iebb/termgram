@@ -347,3 +347,22 @@ jobs:
               -F draft=false -F prerelease="$prerelease" \
               -f make_latest="$latest" -f name="$title" >/dev/null
           done < metadata/release-plan.tsv
+
+      # Reconcile even when this CI plan contains only prereleases or is empty:
+      # a previous publisher may have released successfully before its push failed.
+      - name: Update package metadata from the latest published stable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TERMGRAM_RELEASE_SSH_KEY: ${{ secrets.TERMGRAM_RELEASE_SSH_KEY }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key_path="$(mktemp)"
+          known_hosts="$(mktemp)"
+          trap 'rm -f -- "$key_path" "$known_hosts"' EXIT
+          printf '%s\n' "$TERMGRAM_RELEASE_SSH_KEY" > "$key_path"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$known_hosts"
+          bash scripts/publish-package-metadata.sh

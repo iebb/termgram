@@ -102,6 +102,8 @@ jobs:
       - name: Check installer scripts
         shell: bash
         run: bash -n scripts/install.sh
+      - name: Verify package metadata publishing
+        run: python3 scripts/test-package-metadata.py
       - name: Validate bilingual Wiki sources
         run: python3 scripts/export-wiki.py --check
       - name: Parse PowerShell installer

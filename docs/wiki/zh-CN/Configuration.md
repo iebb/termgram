@@ -23,7 +23,7 @@ return {
 }
 ```
 
-上下文包括 `global`、`chats`、`conversation`、`compose`、`edit`、`forward`、`poll`、`reactions`、`attachments`、`command`、`input`（登录、聊天过滤和帮助搜索）
+上下文包括 `global`、`chats`、`conversation`、`compose`、`edit`、`forward`、`poll`、`reactions`、`stickers`、`attachments`、`command`、`input`（登录、聊天过滤和帮助搜索）
 、`help`、`overlay`、`preview`、`pins` 和 `search`。具体上下文优先于全局绑定。同一上下文中配置相同按键会替换默认绑定；
 `run = "noop"` 删除绑定。组合键用独立按键列表表示，例如 `{ "g", "w" }`。
 配置会检查前缀冲突。组合键一秒后过期，Escape 可以取消尚未完成的组合键。
@@ -43,7 +43,7 @@ return {
 范围 1–9999，支持 `up`、`down`、`message_up`、`message_down`、`page_up`、`page_down`。
 输入的数字前缀会乘以配置值，最终限制在 9999；其他动作不接受数量参数。
 
-输入框占位提示中的 `{send}`、`{newline}`、`{cancel}` 会替换为实际快捷键。
+输入框占位提示中的 `{send}`、`{newline}`、`{cancel}`、`{stickers}` 会替换为实际快捷键。
 `ghost_text = ""` 隐藏提示。应用内偏好单独保存，不会改写 Lua 文件。
 
 按 `g i` 显示当前聊天 ID，可用来配置别名。
@@ -164,6 +164,7 @@ Lua 源码限制 64 KiB、VM 内存 8 MiB、约一百万条指令。未知字段
 | `remove_attachment`、`attachment_format` | 在附件列表中移除文件或切换照片/原文件格式 |
 | `poll`、`toggle_poll_answer`、`retract_vote` | 打开投票、选择答案或准备撤回 |
 | `reactions`、`clear_reactions` | 打开 emoji 回应或在选择器中移除本人的选择 |
+| `stickers`、`sticker_set_next`、`sticker_set_previous` | 打开贴纸面板或切换其分区 |
 | `spoilers`、`expand_quote` | 在会话中揭示/隐藏剧透、展开/收起引用 |
 | `preview` | 展开所选图片或贴纸；大图通过 `preview` 上下文配置按键 |
 | `home`、`end`、`left`、`right`、`backspace`、`delete`、`clear`、`delete_word` | 编辑器 |
@@ -215,6 +216,8 @@ Lua 源码限制 64 KiB、VM 内存 8 MiB、约一百万条指令。未知字段
 投票面板快捷键使用 `poll` 上下文，见[投票与测验](Polls.md)。
 
 回应选择器使用 `reactions` 上下文，见[消息回应](Reactions.md)。
+
+贴纸面板快捷键使用 `stickers` 上下文，见[贴纸](Stickers.md)。
 
 
 ## 运行中重载

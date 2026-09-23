@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use grammers_client::peer::Dialog;
+use grammers_client::tl;
 use grammers_client::{
     Client,
     message::{InputMessage, Message as TelegramMessage},
@@ -112,6 +113,8 @@ enum Response {
     Folders(Vec<crate::folders::Folder>),
     History(Vec<TelegramMessage>),
     ReplyPreviews(Vec<TelegramMessage>, Vec<i32>),
+    Stickers(crate::model::StickerOverview),
+    StickerSet(i64, Vec<crate::model::StickerRef>),
     Message(Box<TelegramMessage>),
     Link(Chat, PeerRef, Option<Box<TelegramMessage>>),
     Button(Option<String>, Option<String>),
@@ -160,6 +163,7 @@ pub(super) fn spawn(
         | TelegramCommand::LoadMessage { chat_id, .. }
         | TelegramCommand::LoadReplyPreviews { chat_id, .. }
         | TelegramCommand::SendMessage { chat_id, .. }
+        | TelegramCommand::SendSticker { chat_id, .. }
         | TelegramCommand::ActivateButton { chat_id, .. }
         | TelegramCommand::MarkRead { chat_id, .. }
         | TelegramCommand::SetChatUnread { chat_id, .. }
@@ -573,6 +577,34 @@ async fn execute(
             let message = Box::pin(client.send_message(peer()?, input)).await?;
             Ok(Response::Message(Box::new(message)))
         }
+        TelegramCommand::LoadStickers { .. } => {
+            Ok(Response::Stickers(super::stickers::overview(client).await?))
+        }
+        TelegramCommand::LoadStickerSet { set, .. } => Ok(Response::StickerSet(
+            set.id,
+            super::stickers::documents(client, set).await?,
+        )),
+        TelegramCommand::SendSticker {
+            sticker, reply_to, ..
+        } => {
+            let input = InputMessage::new()
+                .media(tl::types::InputMediaDocument {
+                    spoiler: false,
+                    id: tl::types::InputDocument {
+                        id: sticker.id,
+                        access_hash: sticker.access_hash,
+                        file_reference: sticker.file_reference.clone(),
+                    }
+                    .into(),
+                    ttl_seconds: None,
+                    query: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                })
+                .reply_to(*reply_to);
+            let message = Box::pin(client.send_message(peer()?, input)).await?;
+            Ok(Response::Message(Box::new(message)))
+        }
         TelegramCommand::ResolveTelegramLink { url } => {
             let (chat, peer, message) = tokio::time::timeout(
                 std::time::Duration::from_secs(15),
@@ -671,7 +703,9 @@ pub(super) async fn complete(
         Err(error) => {
             let detail = if matches!(
                 command,
-                TelegramCommand::SendMessage { .. } | TelegramCommand::ForwardMessage { .. }
+                TelegramCommand::SendMessage { .. }
+                    | TelegramCommand::SendSticker { .. }
+                    | TelegramCommand::ForwardMessage { .. }
             ) {
                 super::chat_info::send_error(&error)
             } else {
@@ -1208,6 +1242,9 @@ pub(super) async fn complete(
         (
             TelegramCommand::SendMessage {
                 chat_id, local_id, ..
+            }
+            | TelegramCommand::SendSticker {
+                chat_id, local_id, ..
             },
             Response::Message(raw),
         ) => {
@@ -1220,6 +1257,20 @@ pub(super) async fn complete(
                 }
             }
         }
+        (TelegramCommand::LoadStickers { request_id }, Response::Stickers(overview)) => {
+            NetworkEvent::StickersLoaded {
+                request_id,
+                result: Ok(overview),
+            }
+        }
+        (
+            TelegramCommand::LoadStickerSet { request_id, .. },
+            Response::StickerSet(set_id, stickers),
+        ) => NetworkEvent::StickerSetLoaded {
+            request_id,
+            set_id,
+            result: Ok(stickers),
+        },
         (TelegramCommand::ResolveTelegramLink { url }, Response::Link(chat, peer, raw)) => {
             cache.peers.insert(chat.id, peer);
             cache.linked_peers.insert(chat.id);

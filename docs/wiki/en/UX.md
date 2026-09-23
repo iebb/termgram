@@ -88,6 +88,8 @@ or Ctrl-J inserts a newline. Bot commands are typed here, including their `/`;
 typing `/` at the start of a draft or `@` after whitespace opens a suggestion
 popup listing the chat's bot commands and members. Tab and the arrow keys cycle
 candidates, Enter accepts the highlighted row, and Esc dismisses the popup.
+Ctrl-T opens the [sticker panel](Stickers.md) for Recent, Favorites and
+installed sets; sending a sticker keeps the draft text and honors the reply.
 Each chat has its own local draft, including its text, reply target and cursor.
 Esc, account switches and normal restarts preserve it. Drafts are keyed by the
 Telegram user identity, so reusing a local account slot does not expose another

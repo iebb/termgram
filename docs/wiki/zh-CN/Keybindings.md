@@ -70,7 +70,11 @@
 | 导航 | ? / s / a / q | 帮助 / 设置 / 账号 / 退出 |
 | 输入框 | Enter | 发送；候选弹窗打开时接受高亮项 |
 | 输入框 | Shift-Enter 或 Ctrl-J | 换行 |
+| 输入框 | Ctrl-T | 打开[贴纸面板](Stickers.md) |
 | 输入框 | Esc | 先关闭候选弹窗或取消回复，再退出输入并保留草稿 |
+| 贴纸面板 | hjkl 或方向键 / Tab 或 Shift-Tab | 在网格中移动 / 切换分区 |
+| 贴纸面板 | Enter 或 Space / 点击已选中的贴纸 | 发送所选贴纸 |
+| 贴纸面板 | Ctrl-R / Esc 或 q | 重新获取列表 / 关闭 |
 | 输入框候选 | Tab / Shift-Tab 或 Ctrl-N/Ctrl-P、Up/Down | 循环并应用 @成员 与 /命令 候选 |
 | 输入框候选 | 点击 | 接受该候选 |
 | 编辑器 | Left/Right、Home/End、Ctrl-A/Ctrl-E | 移动光标 |
@@ -111,6 +115,6 @@ Lua 解析之后不再有另一套硬编码按键兜底。
 导航模式按 `:` 打开[冒号命令](Commands.md)。Tab/Shift-Tab 或 Ctrl-N/Ctrl-P
 补全前后候选；Up/Down 召回匹配前缀的历史；Enter 执行；Esc/Ctrl-C 取消。
 
-输入框 Ctrl-O 打开附件列表，其中 a/p/d/o/O/i 分别添加、切换照片或文件、移除、预览、定位和编辑说明，见[附件](Attachments.md)。
+输入框 Ctrl-O 打开附件列表，其中 a/p/d/o/O/i 分别添加、切换照片或文件、移除、预览、定位和编辑说明，见[附件](Attachments.md)。输入框 Ctrl-T 打开[贴纸面板](Stickers.md)，可选最近使用、收藏和已安装贴纸包。
 
 会话、输入框和附件列表中的 Cmd-V / Ctrl-V / Alt-V / Ctrl-Alt-V 粘贴原生剪贴板的文件、图片或文字；也可用 `:paste`，不会自动发送。

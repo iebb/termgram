@@ -5,7 +5,7 @@ return {
   chats = {
     -- work = -1001234567890, -- stable Telegram chat ID
   },
-  ghost_text = "{send} to send",
+  ghost_text = "{send} to send · {stickers} for stickers",
   nerd_font = false, -- true when the terminal uses a Nerd Font Mono (v3+)
   sidebar = { width = 30, time_color = "cyan", unread_color = "yellow" },
   messages = { spacing = 0, alternating = true }, -- automatic terminal background shading

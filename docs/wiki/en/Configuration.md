@@ -25,7 +25,7 @@ return {
 }
 ```
 
-Contexts are `global`, `chats`, `conversation`, `compose`, `edit`, `forward`, `poll`, `reactions`, `attachments`, `command`, `input` (login and chat
+Contexts are `global`, `chats`, `conversation`, `compose`, `edit`, `forward`, `poll`, `reactions`, `stickers`, `attachments`, `command`, `input` (login and chat
 filter and help search), `help`, `overlay`, `preview`, `pins`, and `search`. A context takes precedence over global bindings. Rebinding
 an existing key replaces that binding. Use `run = "noop"` to remove a binding.
 A chord is a list of individual keys, such as `{ "g", "w" }`; ambiguous prefixes
@@ -50,8 +50,8 @@ messages. The optional count defaults to 1 and accepts 1–9999 for `up`, `down`
 `message_up`, `message_down`, `page_up`, and `page_down`. A typed prefix multiplies
 the configured count, capped at 9999. Other actions do not accept a count.
 
-Composer placeholders use the effective `{send}`, `{newline}` and `{cancel}`
-bindings. Set `ghost_text = ""` to hide them. Managed in-app preferences remain
+Composer placeholders use the effective `{send}`, `{newline}`, `{cancel}` and
+`{stickers}` bindings. Set `ghost_text = ""` to hide them. Managed in-app preferences remain
 in their own file; Termgram does not rewrite your Lua configuration.
 
 Press `g i` to show the current chat ID for an alias.
@@ -190,6 +190,7 @@ binding can become visible again.
 | `remove_attachment`, `attachment_format` | Remove a draft file or switch photo/original format in attachment review |
 | `poll`, `toggle_poll_answer`, `retract_vote` | Open a poll, choose answers, or prepare vote retraction |
 | `reactions`, `clear_reactions` | Open emoji reactions or remove your choices in the picker |
+| `stickers`, `sticker_set_next`, `sticker_set_previous` | Open the sticker panel or switch its sections |
 | `spoilers`, `expand_quote` | Reveal/hide spoilers and expand/collapse quotes in the conversation |
 | `preview` | Expand a selected image or sticker; `preview` context controls the expanded view |
 | `home`, `end`, `left`, `right`, `backspace`, `delete`, `clear`, `delete_word` | Editors |
@@ -246,6 +247,8 @@ for backends, previews, quiet delivery and grouping. This is separate from the
 Poll panel keys use the `poll` context; see [Polls](Polls.md).
 
 Reaction picker keys use the `reactions` context; see [Reactions](Reactions.md).
+
+Sticker panel keys use the `stickers` context; see [Stickers](Stickers.md).
 
 
 ## Reload while running

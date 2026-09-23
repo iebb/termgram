@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
             .filter(|key| !app.media_previews.contains_key(key))
             .collect::<Vec<_>>();
         let mut outgoing = app.request_visible_media();
+        outgoing.extend(app.request_sticker_thumbs());
         outgoing.extend(app.request_visible_replies());
         outgoing.extend(app.request_visible_read());
         outgoing.extend(app.request_visible_polls());

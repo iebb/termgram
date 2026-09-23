@@ -26,6 +26,7 @@ mod replies;
 pub(crate) mod search;
 mod sharing;
 mod staging;
+pub(crate) mod stickers;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -186,6 +187,7 @@ pub enum Mode {
     ForwardPrompt,
     Poll,
     Reactions,
+    Stickers,
     Command,
     Status,
     Attachments,
@@ -248,6 +250,7 @@ pub struct App {
     pub message_pins: message_pins::State,
     pub polls: polls::State,
     pub reactions: reactions::State,
+    pub stickers: stickers::State,
     replies: replies::State,
     /// Position in the filtered chat list, never a persistent model identity.
     pub selected_chat: usize,
@@ -386,6 +389,7 @@ impl Default for App {
             message_pins: message_pins::State::default(),
             polls: polls::State::default(),
             reactions: reactions::State::default(),
+            stickers: stickers::State::default(),
             replies: replies::State::default(),
             selected_chat: 0,
             active_chat_id: None,
@@ -604,6 +608,8 @@ impl App {
         self.completion_hit_regions.clear();
         self.invites.hit_regions.clear();
         self.attachment_draft.hit_regions.clear();
+        self.stickers.hit_rows.clear();
+        self.stickers.hit_cells.clear();
         self.chat_pane_region = None;
         self.composer_region = None;
         self.conversation_pane_region = None;
@@ -630,6 +636,7 @@ impl App {
                 Mode::ForwardPrompt => Context::Forward,
                 Mode::Poll => Context::Poll,
                 Mode::Reactions => Context::Reactions,
+                Mode::Stickers => Context::Stickers,
                 Mode::Command => Context::Command,
                 Mode::Help if self.help.editing => Context::Input,
                 Mode::Help => Context::Help,
@@ -655,6 +662,7 @@ impl App {
                 if ((self.mode == Mode::Invite && run == Action::Open)
                     || (self.mode == Mode::Reactions
                         && matches!(run, Action::Open | Action::Send | Action::ClearReactions))
+                    || (self.mode == Mode::Stickers && matches!(run, Action::Open | Action::Send))
                     || matches!(
                         run,
                         Action::Reveal | Action::ToggleSidebar | Action::PasteClipboard
@@ -713,6 +721,9 @@ impl App {
             return commands;
         }
         if let Some(commands) = self.reaction_binding(run, count) {
+            return commands;
+        }
+        if let Some(commands) = self.sticker_binding(run, count) {
             return commands;
         }
         if let Some(commands) = self.poll_binding(run, count) {
@@ -1123,6 +1134,40 @@ impl App {
             }
             return Vec::new();
         }
+        if self.mode == Mode::Stickers {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(index) =
+                        pointer_row_hit(&self.stickers.hit_rows, mouse.column, mouse.row)
+                    {
+                        return self.select_sticker_section(index);
+                    }
+                    if let Some(index) = self
+                        .stickers
+                        .hit_cells
+                        .iter()
+                        .rev()
+                        .find(|&&(left, right, top, bottom, _)| {
+                            (left..right).contains(&mouse.column)
+                                && (top..bottom).contains(&mouse.row)
+                        })
+                        .map(|&(_, _, _, _, index)| index)
+                    {
+                        return self.click_sticker_cell(index);
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let action = if mouse.kind == MouseEventKind::ScrollUp {
+                        Action::Up
+                    } else {
+                        Action::Down
+                    };
+                    return self.sticker_binding(&action, 3).unwrap_or_default();
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
         if self.mode == Mode::Poll {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -1357,6 +1402,9 @@ impl App {
             return commands;
         }
         if let Some(commands) = self.observe_polls(&event) {
+            return commands;
+        }
+        if let Some(commands) = self.observe_stickers(&event) {
             return commands;
         }
         self.observe_alerts(&event);
@@ -1647,6 +1695,10 @@ impl App {
             | NetworkEvent::ReactionsLoading { .. }
             | NetworkEvent::ReactionsLoaded { .. }
             | NetworkEvent::ReactionsFinished { .. }
+            | NetworkEvent::StickersLoaded { .. }
+            | NetworkEvent::StickerSetLoaded { .. }
+            | NetworkEvent::StickerThumbDownloaded { .. }
+            | NetworkEvent::StickerSendFailed { .. }
             | NetworkEvent::PollChanged(_)
             | NetworkEvent::PollLoading { .. }
             | NetworkEvent::PollLoaded { .. }
@@ -2317,6 +2369,11 @@ impl App {
             Screen::Main => {
                 self.loading_history
                     || self.search.loading
+                    || self
+                        .stickers
+                        .panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.loading.is_some())
                     || self.media_previews.values().any(|preview| preview.loading)
                     || matches!(
                         self.connection,
@@ -2523,7 +2580,8 @@ impl App {
             | Mode::DeletePrompt
             | Mode::ForwardPrompt
             | Mode::Poll
-            | Mode::Reactions => Vec::new(),
+            | Mode::Reactions
+            | Mode::Stickers => Vec::new(),
             Mode::Colors => self.handle_colors(action),
             Mode::Help => self.handle_help(action),
             Mode::Settings => self.handle_settings(action),
@@ -5238,6 +5296,227 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn sticker_panel_navigates_loads_lazily_and_sends_with_reply() {
+        fn sticker(id: i64, emoji: &str) -> crate::model::StickerRef {
+            crate::model::StickerRef {
+                id,
+                access_hash: id.saturating_mul(7),
+                file_reference: vec![1, 2, 3],
+                emoji: emoji.to_owned(),
+                mime_type: "image/webp".to_owned(),
+                thumb_size: Some("m".to_owned()),
+            }
+        }
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.connection = crate::event::ConnectionStatus::Online;
+        assert!(
+            app.run_binding("stickers", 1).is_empty(),
+            "the panel opens from the composer only"
+        );
+        app.run_binding("compose", 1);
+        app.draft_data_mut(1).input.set_value("draft text");
+        app.draft_data_mut(1).reply = Some(ReplyInfo {
+            message_id: 7,
+            chat_id: 1,
+            sender: None,
+        });
+        let commands = app.run_binding("stickers", 1);
+        let [TelegramCommand::LoadStickers { request_id }] = commands.as_slice() else {
+            panic!("every open refetches the lists")
+        };
+        assert_eq!(app.mode, Mode::Stickers);
+        app.handle_network(NetworkEvent::StickersLoaded {
+            request_id: *request_id,
+            result: Ok(crate::model::StickerOverview {
+                recent: (1..=12).map(|id| sticker(id, "😀")).collect(),
+                favorites: Vec::new(),
+                sets: vec![crate::model::StickerSetRef {
+                    id: 99,
+                    access_hash: 3,
+                    title: "Pack".to_owned(),
+                }],
+            }),
+        });
+        assert_eq!(app.stickers.section_count(), 3);
+        // Grid movement follows the rendered column count.
+        let panel = app.stickers.panel.as_mut().unwrap();
+        panel.grid_cols = 4;
+        panel.grid_rows = 2;
+        app.run_binding("down", 1);
+        assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 4);
+        app.run_binding("up", 1);
+        app.run_binding("right", 1);
+        assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 1);
+        app.run_binding("page_down", 1);
+        assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 9);
+        app.run_binding("home", 1);
+        assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 0);
+        // Set sections load lazily on entry.
+        app.run_binding("sticker_set_next", 1);
+        assert_eq!(app.stickers.panel.as_ref().unwrap().section, 1);
+        let commands = app.run_binding("sticker_set_next", 1);
+        let [TelegramCommand::LoadStickerSet { set, request_id }] = commands.as_slice() else {
+            panic!("lazy set load")
+        };
+        assert_eq!(set.id, 99);
+        app.handle_network(NetworkEvent::StickerSetLoaded {
+            request_id: *request_id,
+            set_id: 99,
+            result: Ok(vec![sticker(50, "🦊")]),
+        });
+        assert!(app.run_binding("sticker_set_previous", 1).is_empty());
+        assert!(app.run_binding("sticker_set_previous", 1).is_empty());
+        assert_eq!(app.stickers.panel.as_ref().unwrap().section, 0);
+        // Render the overlay to expose rows and cells to the mouse.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(text.contains("Recent"));
+        assert!(text.contains("Favorites"));
+        assert!(text.contains("Pack"));
+        assert!(text.contains("😀"), "cells without thumbnails show emoji");
+        // Visible cells queue their thumbnails under a small download budget.
+        let commands = app.request_sticker_thumbs();
+        assert_eq!(commands.len(), 4);
+        assert!(
+            commands
+                .iter()
+                .all(|command| matches!(command, TelegramCommand::DownloadStickerThumb { .. }))
+        );
+        assert!(
+            app.request_sticker_thumbs().is_empty(),
+            "the budget caps in-flight downloads"
+        );
+        app.handle_network(NetworkEvent::StickerThumbDownloaded {
+            request_id: 0,
+            document_id: 1,
+            result: Ok(std::path::PathBuf::from("/tmp/sticker_1.jpg")),
+        });
+        let commands = app.request_sticker_thumbs();
+        assert_eq!(commands.len(), 1, "a finished transfer frees its slot");
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert_eq!(app.media_slots.len(), 1);
+        assert!(
+            matches!(
+                &app.media_slots[0].source,
+                crate::media::MediaSource::File(path) if path == std::path::Path::new("/tmp/sticker_1.jpg")
+            ),
+            "a ready thumbnail registers an inline image"
+        );
+        let (x, _, y, section) = app.stickers.hit_rows[1];
+        assert_eq!(section, 1);
+        assert!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: Modifiers::empty()
+            })
+            .is_empty()
+        );
+        assert_eq!(app.stickers.panel.as_ref().unwrap().section, 1);
+        let (x, _, y, _) = app.stickers.hit_rows[0];
+        assert!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: Modifiers::empty()
+            })
+            .is_empty()
+        );
+        assert_eq!(app.stickers.panel.as_ref().unwrap().section, 0);
+        // A click selects; clicking the selection sends without re-uploading.
+        let (left, _, top, _, index) = app.stickers.hit_cells[1];
+        assert_eq!(index, 1);
+        assert!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: left,
+                row: top,
+                modifiers: Modifiers::empty()
+            })
+            .is_empty(),
+            "first click selects"
+        );
+        assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 1);
+        let commands = app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left,
+            row: top,
+            modifiers: Modifiers::empty(),
+        });
+        let [
+            TelegramCommand::SendSticker {
+                chat_id,
+                local_id,
+                sticker,
+                reply_to,
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("second click sends")
+        };
+        assert_eq!(
+            (*chat_id, *local_id, sticker.id, *reply_to),
+            (1, -1, 2, Some(7))
+        );
+        assert_eq!(app.mode, Mode::Compose);
+        let pending = app
+            .messages
+            .get(&1)
+            .unwrap()
+            .iter()
+            .find(|message| message.id == *local_id)
+            .unwrap();
+        assert_eq!(pending.delivery, Delivery::Pending);
+        let attachment = pending.attachment.as_ref().unwrap();
+        assert_eq!(attachment.kind, AttachmentKind::Sticker);
+        assert_eq!(attachment.fallback_emoji.as_deref(), Some("😀"));
+        assert_eq!(pending.reply_to.as_ref().unwrap().message_id, 7);
+        assert_eq!(app.draft_data(1).unwrap().input.value(), "draft text");
+        assert!(app.draft_data(1).unwrap().reply.is_none());
+        // A failed send marks only the optimistic message; the draft is untouched.
+        app.handle_network(NetworkEvent::StickerSendFailed {
+            chat_id: 1,
+            local_id: *local_id,
+            error: "Timeout".to_owned(),
+        });
+        let pending = app
+            .messages
+            .get(&1)
+            .unwrap()
+            .iter()
+            .find(|message| message.id == *local_id)
+            .unwrap();
+        assert_eq!(pending.delivery, Delivery::Failed);
+        assert!(app.status_message.as_ref().unwrap().contains("Timeout"));
+        assert_eq!(app.draft_data(1).unwrap().input.value(), "draft text");
+        // Cancel closes back to the composer.
+        let commands = app.run_binding("stickers", 1);
+        let [TelegramCommand::LoadStickers { .. }] = commands.as_slice() else {
+            panic!("reopen refetches")
+        };
+        assert_eq!(app.mode, Mode::Stickers);
+        app.run_binding("cancel", 1);
+        assert_eq!(app.mode, Mode::Compose);
+        assert!(app.stickers.panel.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn poll_review_requires_explicit_submission_and_keeps_errors_readable() {
         let mut app = ready_app();
         open_first(&mut app);
@@ -7388,7 +7667,10 @@ mod tests {
         .unwrap();
         let error = crate::keymap::Keymap::reload(&path).unwrap_err();
         app.configuration_failed(&error.to_string());
-        assert_eq!(app.keymap.ghost_text, "{send} to send");
+        assert_eq!(
+            app.keymap.ghost_text,
+            "{send} to send · {stickers} for stickers"
+        );
         fs::write(&path, "return {nerd_font=true, ghost_text='new', statusline={right={'dc'}}, notifications={enabled=false}}").unwrap();
         app.install_configuration(crate::keymap::Keymap::reload(&path).unwrap());
         assert!(app.keymap.nerd_font);

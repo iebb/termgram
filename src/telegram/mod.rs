@@ -17,6 +17,7 @@ mod reads;
 mod requests;
 mod search;
 mod sharing;
+mod stickers;
 mod telemetry;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -170,6 +171,11 @@ enum TransferCompletion {
         chat_id: ChatId,
         message_id: i32,
         request_id: u64,
+        result: Result<PathBuf, String>,
+    },
+    StickerThumb {
+        request_id: u64,
+        document_id: i64,
         result: Result<PathBuf, String>,
     },
     Download {
@@ -1547,7 +1553,10 @@ async fn handle_command(
         | TelegramCommand::LoadHistory { .. }
         | TelegramCommand::LoadMessage { .. }
         | TelegramCommand::LoadReplyPreviews { .. }
+        | TelegramCommand::LoadStickers { .. }
+        | TelegramCommand::LoadStickerSet { .. }
         | TelegramCommand::SendMessage { .. }
+        | TelegramCommand::SendSticker { .. }
         | TelegramCommand::ResolveTelegramLink { .. }
         | TelegramCommand::ActivateButton { .. }
         | TelegramCommand::SetChatUnread { .. }
@@ -1787,6 +1796,51 @@ async fn handle_command(
                 }
             }
         }
+        TelegramCommand::DownloadStickerThumb {
+            request_id,
+            sticker,
+        } => {
+            let preparation = async {
+                if transfers.len() >= MAX_PENDING_TRANSFERS {
+                    bail!("Telegram transfer queue is full; close and retry");
+                }
+                let directory = ensure_download_dir(cache).await?;
+                Ok::<_, anyhow::Error>(directory)
+            }
+            .await;
+            match preparation {
+                Ok(directory) => {
+                    let client = client.clone();
+                    let cache_owner = cache.cache_owner.clone();
+                    let document_id = sticker.id;
+                    transfers.spawn(async move {
+                        let _permit = slots
+                            .acquire_owned()
+                            .await
+                            .expect("transfer queue is never closed");
+                        let _cache_owner = cache_owner.clone();
+                        let result =
+                            stickers::download_thumb(&client, &sticker, directory, cache_owner)
+                                .await
+                                .map_err(|error| format!("{error:#}"));
+                        TransferCompletion::StickerThumb {
+                            request_id,
+                            document_id,
+                            result,
+                        }
+                    });
+                }
+                Err(error) => {
+                    events
+                        .send(NetworkEvent::StickerThumbDownloaded {
+                            request_id,
+                            document_id: sticker.id,
+                            result: Err(format!("{error:#}")),
+                        })
+                        .await?;
+                }
+            }
+        }
         TelegramCommand::DownloadAttachment {
             chat_id,
             message_id,
@@ -1958,6 +2012,7 @@ async fn upload_attachment(
         .map_err(anyhow::Error::from)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_transfer_completion(
     completion: TransferCompletion,
     cache: &mut WorkerCache,
@@ -1984,6 +2039,19 @@ async fn process_transfer_completion(
                         request_id,
                         error,
                     },
+                })
+                .await?;
+        }
+        TransferCompletion::StickerThumb {
+            request_id,
+            document_id,
+            result,
+        } => {
+            events
+                .send(NetworkEvent::StickerThumbDownloaded {
+                    request_id,
+                    document_id,
+                    result,
                 })
                 .await?;
         }

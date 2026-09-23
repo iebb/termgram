@@ -76,7 +76,11 @@ pane or overlay, so ordinary letters in an editor remain text.
 | Commands | Enter / Esc or Ctrl-C | Execute / cancel |
 | Composer | Enter | Send |
 | Composer | Shift-Enter or Ctrl-J | Newline |
+| Composer | Ctrl-T | Open the [sticker panel](Stickers.md) |
 | Composer | Esc | Cancel reply first; then leave with draft kept |
+| Sticker panel | hjkl or arrows / Tab or Shift-Tab | Move in the grid / switch section |
+| Sticker panel | Enter or Space / click the selection | Send the selected sticker |
+| Sticker panel | Ctrl-R / Esc or q | Refetch the lists / close |
 | Editors | Left/Right, Home/End, Ctrl-A/Ctrl-E | Move cursor |
 | Editors | Backspace/Delete, Ctrl-W, Ctrl-U | Delete character / previous word / clear |
 | Chat filter | Enter / Esc | Open match / clear filter and leave |
@@ -114,6 +118,6 @@ Click a reply quote to jump to its original. For a selected reply, Enter opens
 that target by default; use `g n` / `g p` for its other actions. Media clicks select
 the attachment, so Enter then activates that media action.
 
-Composer Ctrl-O opens attachment review. Its a/p/d/o/O/i keys add, choose photo or file, remove, preview, reveal and edit the caption. See [Attachments](Attachments.md).
+Composer Ctrl-O opens attachment review. Its a/p/d/o/O/i keys add, choose photo or file, remove, preview, reveal and edit the caption. See [Attachments](Attachments.md). Composer Ctrl-T opens the [sticker panel](Stickers.md) for Recent, Favorites and installed sets.
 
 Cmd-V / Ctrl-V / Alt-V / Ctrl-Alt-V paste native clipboard files, images or text in the conversation, composer and attachment review. `:paste` is the command equivalent; no paste sends automatically.

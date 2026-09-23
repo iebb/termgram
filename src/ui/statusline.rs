@@ -108,6 +108,7 @@ fn segment(item: Item, right: bool, app: &AppState, narrow: bool) -> Option<Segm
                 Mode::ForwardPrompt => " FORWARD ",
                 Mode::Poll => " POLL ",
                 Mode::Reactions => " REACT ",
+                Mode::Stickers => " STICKER ",
                 Mode::DeletePrompt => " DELETE ",
                 Mode::Command => " COMMAND ",
                 Mode::Filter | Mode::Search => " SEARCH ",
@@ -282,6 +283,21 @@ fn context(app: &AppState, narrow: bool) -> String {
         );
     }
 
+    if app.mode == Mode::Stickers {
+        let hint = |action| app.keymap.hint(Context::Stickers, action);
+        if narrow {
+            return format!("{} send · {} close", hint("open"), hint("cancel"));
+        }
+        return format!(
+            "{} send · {}/{} sets · {} refresh · {} close",
+            hint("open"),
+            hint("sticker_set_previous"),
+            hint("sticker_set_next"),
+            hint("refresh"),
+            hint("cancel")
+        );
+    }
+
     if app.mode == Mode::Poll {
         let hint = |action| app.keymap.hint(Context::Poll, action);
         if narrow {
@@ -381,6 +397,15 @@ fn context(app: &AppState, narrow: bool) -> String {
     }
     if app.status_message.is_some() {
         return String::new();
+    }
+    if app.mode == Mode::Compose {
+        let hint = |action| app.keymap.hint(Context::Compose, action);
+        return format!(
+            "{} send · {} stickers · {} close",
+            hint("send"),
+            hint("stickers"),
+            hint("cancel")
+        );
     }
     if let Some(hint) = selected_context(app) {
         return hint;

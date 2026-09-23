@@ -147,10 +147,29 @@ pub enum TelegramCommand {
         message_ids: Vec<i32>,
         request_id: u64,
     },
+    /// Refetch recent/favorite stickers and the installed set list. Sticker
+    /// file references are short-lived, so every panel open reloads them.
+    LoadStickers {
+        request_id: u64,
+    },
+    /// Lazily fetch one installed set's documents; cached for the app session.
+    LoadStickerSet {
+        set: crate::model::StickerSetRef,
+        request_id: u64,
+    },
     SendMessage {
         chat_id: ChatId,
         local_id: i32,
         text: String,
+        /// Positive message identifier in this conversation when composing a
+        /// native Telegram reply.
+        reply_to: Option<i32>,
+    },
+    /// Send an existing sticker document without re-uploading it.
+    SendSticker {
+        chat_id: ChatId,
+        local_id: i32,
+        sticker: crate::model::StickerRef,
         /// Positive message identifier in this conversation when composing a
         /// native Telegram reply.
         reply_to: Option<i32>,
@@ -229,6 +248,11 @@ pub enum TelegramCommand {
         message_id: i32,
         request_id: u64,
         thumbnail: bool,
+    },
+    /// Download a sticker's static raster thumbnail for the sticker panel.
+    DownloadStickerThumb {
+        request_id: u64,
+        sticker: crate::model::StickerRef,
     },
     /// Resolve a Telegram public/private message URL to an in-app target.
     ResolveTelegramLink {
@@ -552,6 +576,30 @@ impl TelegramCommand {
                 text,
                 reply_to,
                 error,
+            },
+            TelegramCommand::LoadStickers { request_id } => NetworkEvent::StickersLoaded {
+                request_id,
+                result: Err(error),
+            },
+            TelegramCommand::LoadStickerSet { set, request_id } => NetworkEvent::StickerSetLoaded {
+                request_id,
+                set_id: set.id,
+                result: Err(error),
+            },
+            TelegramCommand::SendSticker {
+                chat_id, local_id, ..
+            } => NetworkEvent::StickerSendFailed {
+                chat_id,
+                local_id,
+                error,
+            },
+            TelegramCommand::DownloadStickerThumb {
+                request_id,
+                sticker,
+            } => NetworkEvent::StickerThumbDownloaded {
+                request_id,
+                document_id: sticker.id,
+                result: Err(error),
             },
             TelegramCommand::SendAttachment {
                 chat_id,
@@ -924,6 +972,35 @@ impl fmt::Debug for TelegramCommand {
                 .field("local_id", local_id)
                 .field("text", text)
                 .field("reply_to", reply_to)
+                .finish(),
+            Self::LoadStickers { request_id } => formatter
+                .debug_struct("LoadStickers")
+                .field("request_id", request_id)
+                .finish(),
+            Self::LoadStickerSet { set, request_id } => formatter
+                .debug_struct("LoadStickerSet")
+                .field("set_id", &set.id)
+                .field("request_id", request_id)
+                .finish(),
+            Self::SendSticker {
+                chat_id,
+                local_id,
+                sticker,
+                reply_to,
+            } => formatter
+                .debug_struct("SendSticker")
+                .field("chat_id", chat_id)
+                .field("local_id", local_id)
+                .field("sticker_id", &sticker.id)
+                .field("reply_to", reply_to)
+                .finish(),
+            Self::DownloadStickerThumb {
+                request_id,
+                sticker,
+            } => formatter
+                .debug_struct("DownloadStickerThumb")
+                .field("request_id", request_id)
+                .field("sticker_id", &sticker.id)
                 .finish(),
             Self::PrepareAttachments(request) => formatter
                 .debug_tuple("PrepareAttachments")
@@ -1419,6 +1496,27 @@ pub enum NetworkEvent {
     MessageSent {
         local_id: i32,
         message: Message,
+    },
+    StickersLoaded {
+        request_id: u64,
+        result: Result<crate::model::StickerOverview, String>,
+    },
+    StickerSetLoaded {
+        request_id: u64,
+        set_id: i64,
+        result: Result<Vec<crate::model::StickerRef>, String>,
+    },
+    StickerThumbDownloaded {
+        request_id: u64,
+        document_id: i64,
+        result: Result<PathBuf, String>,
+    },
+    /// A sticker send failed. Unlike text, nothing returns to the composer;
+    /// the draft is untouched and only the optimistic message is marked failed.
+    StickerSendFailed {
+        chat_id: ChatId,
+        local_id: i32,
+        error: String,
     },
     /// Telegram accepted a send but did not return the final message object.
     /// The matching live update will reconcile the optimistic entry later.

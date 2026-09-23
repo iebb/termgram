@@ -17,6 +17,7 @@ mod reactions;
 mod search;
 mod staging;
 mod statusline;
+mod stickers;
 mod transcript;
 mod wrapping;
 use chrono::Local;
@@ -490,6 +491,8 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, app: &mut AppState) {
         deletion::render(frame, area, app);
     } else if app.mode == Mode::Reactions {
         reactions::render(frame, area, app);
+    } else if app.mode == Mode::Stickers {
+        stickers::render(frame, area, app);
     } else if app.mode == Mode::Poll {
         polls::render(frame, area, app);
     } else if app.mode == Mode::Edit {
@@ -931,6 +934,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &mut AppState, enable
                 .replace("{send}", &app.keymap.hint(Context::Compose, "send"))
                 .replace("{newline}", &app.keymap.hint(Context::Compose, "newline"))
                 .replace("{cancel}", &app.keymap.hint(Context::Compose, "cancel"))
+                .replace("{stickers}", &app.keymap.hint(Context::Compose, "stickers"))
         } else if app.focus == Focus::Chats {
             format!("{} to compose", app.keymap.hint(Context::Chats, "compose"))
         } else if app.selected_message.is_some() {

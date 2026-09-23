@@ -109,6 +109,36 @@ pub struct Mention {
     pub requires_playback: bool,
 }
 
+/// A sendable sticker reference, valid while the Telegram worker keeps the
+/// document's file reference alive. Fetched fresh on every panel open instead
+/// of being persisted like [`Attachment`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StickerRef {
+    pub id: i64,
+    pub access_hash: i64,
+    pub file_reference: Vec<u8>,
+    pub emoji: String,
+    pub mime_type: String,
+    /// Telegram's static raster thumbnail size label, when the document has one.
+    pub thumb_size: Option<String>,
+}
+
+/// An installed sticker set listed in the panel's sidebar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StickerSetRef {
+    pub id: i64,
+    pub access_hash: i64,
+    pub title: String,
+}
+
+/// Recent and favorite stickers plus the installed set list, refetched together.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StickerOverview {
+    pub recent: Vec<StickerRef>,
+    pub favorites: Vec<StickerRef>,
+    pub sets: Vec<StickerSetRef>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Message {
     #[serde(default)]

@@ -30,6 +30,10 @@ with SHA-256 verification. For the latest published prerelease instead:
 brew install iebb/termgram/termgram-pre
 ```
 
+On macOS, the prerelease is also available as the cask
+`brew install iebb/termgram/termgram@pre`, which installs the same `tg`
+executable and conflicts with the formulae.
+
 The [Homebrew formula](Formula/termgram.rb) lives in this repository. No
 separate tap repository or Rust compiler is needed. Update with `brew update`
 followed by `brew upgrade iebb/termgram/termgram`; uninstall with

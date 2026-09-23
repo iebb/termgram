@@ -54,7 +54,7 @@ if [[ -n "$prerelease_tag" ]]; then
   python3 "$script_dir/update-package-metadata.py" \
     "${prerelease_tag#v}" "$metadata_dir/prerelease/SHA256SUMS" \
     --prerelease --output-dir "$metadata_dir/generated/prerelease"
-  paths+=("Formula/termgram-pre.rb")
+  paths+=("Formula/termgram-pre.rb" "Casks/termgram@pre.rb")
   tags+=("$prerelease_tag")
 fi
 
@@ -73,6 +73,8 @@ for attempt in 1 2 3; do
   fi
   if [[ -n "$prerelease_tag" ]]; then
     cp "$metadata_dir/generated/prerelease/Formula/termgram-pre.rb" "$metadata_dir/checkout/Formula/termgram-pre.rb"
+    mkdir -p "$metadata_dir/checkout/Casks"
+    cp "$metadata_dir/generated/prerelease/Casks/termgram@pre.rb" "$metadata_dir/checkout/Casks/termgram@pre.rb"
   fi
   git -C "$metadata_dir/checkout" add "${paths[@]}"
   if git -C "$metadata_dir/checkout" diff --cached --quiet; then

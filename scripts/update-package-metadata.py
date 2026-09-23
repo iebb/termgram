@@ -136,6 +136,33 @@ end
 '''
 
 
+def cask(version: str, checksums: dict[str, str]) -> str:
+    def sha256(key: str) -> str:
+        target, extension = TARGETS[key]
+        return checksums[asset_name(version, target, extension)]
+
+    return f'''cask "termgram@pre" do
+  arch arm: "macos", intel: "macos-x86_64"
+
+  version "{version}"
+  sha256 arm:   "{sha256("mac_arm")}",
+         intel: "{sha256("mac_intel")}"
+
+  url "{REPOSITORY}/releases/download/v#{{version}}/termgram-#{{version}}-#{{arch}}.tar.gz"
+  name "Termgram"
+  desc "{DESCRIPTION} (prerelease)"
+  homepage "{REPOSITORY}"
+
+  binary "tg"
+
+  caveats <<~EOS
+    termgram@pre installs the same tg executable as the termgram and
+    termgram-pre formulae; unlink those before linking this cask.
+  EOS
+end
+'''
+
+
 def checksum_extractor(version: str, target: str, extension: str) -> dict[str, object]:
     asset = asset_name(version, target, extension)
     return {
@@ -201,6 +228,7 @@ def main() -> None:
 
     (args.output_dir / "Formula").mkdir(parents=True, exist_ok=True)
     if args.prerelease:
+        (args.output_dir / "Casks").mkdir(parents=True, exist_ok=True)
         (args.output_dir / "Formula/termgram-pre.rb").write_text(
             formula(
                 "TermgramPre",
@@ -210,6 +238,7 @@ def main() -> None:
                 conflicts="termgram",
             )
         )
+        (args.output_dir / "Casks/termgram@pre.rb").write_text(cask(version, checksums))
         return
     (args.output_dir / "bucket").mkdir(exist_ok=True)
     (args.output_dir / "Formula/termgram.rb").write_text(

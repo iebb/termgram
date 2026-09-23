@@ -100,6 +100,12 @@ else:
         self.assertIn('conflicts_with "termgram", because: "both install the tg binary"', pre)
         self.assertIn('version "0.1.30"', pre)
         self.assertIn(self.pre_hashes["termgram-0.1.30-macos.tar.gz"], pre)
+        cask = self.remote_file("Casks/termgram@pre.rb")
+        self.assertIn('cask "termgram@pre" do', cask)
+        self.assertIn('version "0.1.30"', cask)
+        self.assertIn(self.pre_hashes["termgram-0.1.30-macos.tar.gz"], cask)
+        self.assertIn(self.pre_hashes["termgram-0.1.30-macos-x86_64.tar.gz"], cask)
+        self.assertIn('binary "tg"', cask)
         self.assertEqual(
             self.run_command("git", "--git-dir", str(self.remote), "log", "-1", "--format=%s", "main"),
             "chore(release): Update package metadata for v0.1.21 and v0.1.30")
@@ -152,6 +158,9 @@ if not marker.exists():
         pre = self.remote_file("Formula/termgram-pre.rb")
         self.assertIn('version "0.1.30"', pre)
         self.assertIn(self.pre_hashes["termgram-0.1.30-linux.tar.gz"], pre)
+        cask = self.remote_file("Casks/termgram@pre.rb")
+        self.assertIn('version "0.1.30"', cask)
+        self.assertIn(self.pre_hashes["termgram-0.1.30-macos.tar.gz"], cask)
         self.assertEqual(
             self.run_command("git", "--git-dir", str(self.remote), "ls-tree", "main", "--", "Formula/termgram.rb"),
             "")

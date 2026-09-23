@@ -29,7 +29,8 @@ Homebrew users can install the same latest prerelease as
 `brew install iebb/termgram/termgram-pre` from the in-repository tap (see the
 [README](../../../README.md)); the `termgram-pre` formula is regenerated
 automatically after each prerelease and conflicts with `termgram` because both
-install `tg`.
+install `tg`. On macOS, `brew install iebb/termgram/termgram@pre` installs the
+same prerelease as a cask instead.
 
 Windows PowerShell:
 

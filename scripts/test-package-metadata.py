@@ -42,6 +42,12 @@ class PackageMetadataTests(unittest.TestCase):
                        for platform in PLATFORMS}
         checksums = "".join(f"{digest}  {name}\n" for name, digest in self.hashes.items())
         (self.root / "SHA256SUMS").write_text(checksums)
+        # The prerelease track carries its own published checksums.
+        self.pre_hashes = {
+            f"termgram-0.1.30-{platform}": hashlib.sha256(f"pre-{platform}".encode()).hexdigest()
+            for platform in PLATFORMS}
+        (self.root / "SHA256SUMS-0.1.30").write_text(
+            "".join(f"{digest}  {name}\n" for name, digest in self.pre_hashes.items()))
         rebuilt = self.repo / "prepared/0.1.21"
         rebuilt.mkdir(parents=True)
         (rebuilt / "SHA256SUMS").write_text("".join(f"{'0' * 64}  {name}\n" for name in self.hashes))
@@ -64,6 +70,9 @@ if args[0] == "api":
 elif args[:3] == ["release", "download", "v0.1.21"]:
     assert args[args.index("--pattern") + 1] == "SHA256SUMS"
     shutil.copyfile(root / "SHA256SUMS", pathlib.Path(args[args.index("--dir") + 1]) / "SHA256SUMS")
+elif args[:3] == ["release", "download", "v0.1.30"]:
+    assert args[args.index("--pattern") + 1] == "SHA256SUMS"
+    shutil.copyfile(root / "SHA256SUMS-0.1.30", pathlib.Path(args[args.index("--dir") + 1]) / "SHA256SUMS")
 else:
     raise SystemExit(f"unexpected gh call: {args}")
 ''')
@@ -86,6 +95,14 @@ else:
         self.assertEqual(manifest["architecture"]["64bit"]["hash"], self.hashes["termgram-0.1.21-windows.zip"])
         formula = self.remote_file("Formula/termgram.rb")
         self.assertIn(self.hashes["termgram-0.1.21-linux.tar.gz"], formula)
+        pre = self.remote_file("Formula/termgram@pre.rb")
+        self.assertIn("class TermgramATPre < Formula", pre)
+        self.assertIn('conflicts_with "termgram", because: "both install the tg binary"', pre)
+        self.assertIn('version "0.1.30"', pre)
+        self.assertIn(self.pre_hashes["termgram-0.1.30-macos.tar.gz"], pre)
+        self.assertEqual(
+            self.run_command("git", "--git-dir", str(self.remote), "log", "-1", "--format=%s", "main"),
+            "chore(release): Update package metadata for v0.1.21 and v0.1.30")
         first_head = self.remote_head()
         # A rerun still starts at the tested source SHA, before the metadata commit.
         self.assertEqual(self.run_command("git", "rev-parse", "HEAD"), self.source_sha)
@@ -126,6 +143,24 @@ if not marker.exists():
         self.releases.write_text("[]")
         self.run_command("bash", str(SCRIPT))
         self.assertEqual(self.remote_head(), self.source_sha)
+
+    def test_prerelease_only_commits_only_the_prerelease_formula(self):
+        self.releases.write_text(json.dumps([
+            {"tag_name": "v0.1.30", "draft": False, "prerelease": True},
+        ]))
+        self.run_command("bash", str(SCRIPT))
+        pre = self.remote_file("Formula/termgram@pre.rb")
+        self.assertIn('version "0.1.30"', pre)
+        self.assertIn(self.pre_hashes["termgram-0.1.30-linux.tar.gz"], pre)
+        self.assertEqual(
+            self.run_command("git", "--git-dir", str(self.remote), "ls-tree", "main", "--", "Formula/termgram.rb"),
+            "")
+        self.assertEqual(
+            self.run_command("git", "--git-dir", str(self.remote), "ls-tree", "main", "--", "bucket/termgram.json"),
+            "")
+        self.assertEqual(
+            self.run_command("git", "--git-dir", str(self.remote), "log", "-1", "--format=%s", "main"),
+            "chore(release): Update package metadata for v0.1.30")
 
 
 if __name__ == "__main__":

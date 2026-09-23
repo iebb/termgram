@@ -43,7 +43,10 @@ builds receive application API credentials from the `TELEGRAM_API_ID` and
 `TELEGRAM_API_HASH` Actions secrets; PR builds do not receive them.
 
 Every successful default-branch commit is published as `0.1.Z`, where `Z` is its
-first-parent height. Ordinary commits produce prereleases. A subject beginning
+first-parent height. Ordinary commits produce prereleases. Package-metadata
+commits (subjects beginning with `chore(release):`) are not published; they only
+retarget the in-repository Homebrew and Scoop files at the latest stable release
+and the latest prerelease. A subject beginning
 with `release:` produces a stable release; for example:
 
 ```sh

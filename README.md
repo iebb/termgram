@@ -23,12 +23,21 @@ brew tap iebb/termgram https://github.com/iebb/termgram.git
 brew install iebb/termgram/termgram
 ```
 
-The [Homebrew formula](Formula/termgram.rb) lives in this repository and installs
-the prebuilt stable release for your platform with SHA-256 verification. No
+This installs the prebuilt stable release for your platform as the `tg` command
+with SHA-256 verification. For the latest published prerelease instead:
+
+```sh
+brew install iebb/termgram/termgram@pre
+```
+
+The [Homebrew formula](Formula/termgram.rb) lives in this repository. No
 separate tap repository or Rust compiler is needed. Update with `brew update`
 followed by `brew upgrade iebb/termgram/termgram`; uninstall with
 `brew uninstall termgram`. If you previously installed `tg` manually, check
 `which tg`: a copy in `~/bin` or `~/.local/bin` may take precedence in `PATH`.
+`termgram` and `termgram@pre` conflict because both install the `tg` executable.
+`termgram@pre` is regenerated automatically after each prerelease; upgrade it
+with `brew upgrade termgram@pre` instead of `tg update`.
 
 Scoop (64-bit / ARM64 Windows):
 
@@ -38,10 +47,10 @@ scoop install termgram
 ```
 
 The [Scoop manifest](bucket/termgram.json) lives in this repository and installs
-the prebuilt stable release for your Windows architecture with SHA-256
-verification. No separate bucket repository or Rust compiler is needed. Update
-with `scoop update` followed by `scoop update termgram`; uninstall with
-`scoop uninstall termgram`.
+the prebuilt stable release for your Windows architecture as the `tg` command
+with SHA-256 verification. No separate bucket repository or Rust compiler is
+needed. Update with `scoop update` followed by `scoop update termgram`;
+uninstall with `scoop uninstall termgram`.
 
 Standalone installer (Linux / macOS):
 
@@ -50,12 +59,18 @@ curl --proto '=https' --tlsv1.2 -sSfL \
   https://github.com/iebb/termgram/releases/latest/download/install.sh | bash
 ```
 
+It verifies the release checksums and installs the `tg` executable into
+`~/.local/bin` by default.
+
 Windows PowerShell:
 
 ```powershell
 $installer = Invoke-RestMethod 'https://github.com/iebb/termgram/releases/latest/download/install.ps1'
 & ([scriptblock]::Create([string]$installer))
 ```
+
+It verifies the release checksums and installs the `tg` executable
+(`tg.exe`) under `%LOCALAPPDATA%\Programs\Termgram\bin` by default.
 
 From source on any supported platform, with Rust 1.98.0 and native build tools:
 
@@ -66,7 +81,8 @@ cargo +1.98.0 install --locked --git https://github.com/iebb/termgram --bin tg t
 Run `tg`, sign in with your phone or press Tab for QR login. Open a chat with
 Enter, press `i` to compose, and `?` for help. Repeat the Cargo command to update
 a source install; use `tg update` for standalone release binaries. Use
-`brew upgrade iebb/termgram/termgram` for Homebrew installations and
+`brew upgrade iebb/termgram/termgram` (or `termgram@pre` for prereleases) for
+Homebrew installations and
 `scoop update termgram` for Scoop installations so the package manager can
 track the installed version.
 

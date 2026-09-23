@@ -13,7 +13,7 @@ curl --proto '=https' --tlsv1.2 -sSfL \
   https://github.com/iebb/termgram/releases/latest/download/install.sh | bash
 ```
 
-默认安装到 `~/.local/bin`。如果希望先审阅脚本，可把相同 URL 下载为文件，阅读后执行
+默认安装到 `~/.local/bin`，安装后的命令为 `tg`。如果希望先审阅脚本，可把相同 URL 下载为文件，阅读后执行
 `bash install.sh`。选择预发布版或更改目录：
 
 ```sh
@@ -21,6 +21,10 @@ curl --proto '=https' --tlsv1.2 -sSfL \
   https://github.com/iebb/termgram/releases/latest/download/install.sh \
   | CHANNEL=prerelease INSTALL_DIR="$HOME/bin" bash
 ```
+
+Homebrew 用户也可以通过仓库内置 tap 安装相同的最新预发布版：
+`brew install iebb/termgram/termgram@pre`（见 [README](../../../README.md)）。
+`termgram@pre` formula 在每次预发布后自动重新生成，与 `termgram` 冲突，因为两者都安装 `tg`。
 
 Windows PowerShell：
 
@@ -31,7 +35,7 @@ $installer = Invoke-RestMethod 'https://github.com/iebb/termgram/releases/latest
 & ([scriptblock]::Create([string]$installer)) -Channel prerelease -BinDir "$HOME\bin"
 ```
 
-Windows 默认目录为 `%LOCALAPPDATA%\Programs\Termgram\bin`，也可先查看 `$installer`
+Windows 默认目录为 `%LOCALAPPDATA%\Programs\Termgram\bin`，安装后的命令为 `tg`（`tg.exe`），也可先查看 `$installer`
 内容。安装器会校验发行版 `SHA256SUMS`、选择原生架构，并在需要时提示加入 PATH 的目录；
 不会提权或自行修改 PATH。版本选择与升级规则见[更新](Updates.md)。
 

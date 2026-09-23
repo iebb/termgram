@@ -350,7 +350,7 @@ jobs:
 
       # Reconcile even when this CI plan contains only prereleases or is empty:
       # a previous publisher may have released successfully before its push failed.
-      - name: Update package metadata from the latest published stable release
+      - name: Update package metadata from the latest published releases
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

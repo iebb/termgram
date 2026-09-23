@@ -35,7 +35,9 @@ macOS Intel/Apple silicon、Windows x64/ARM64。默认分支构建从 Actions �
 `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` secrets 获取应用凭据，PR 构建不会获取它们。
 
 每个成功的默认分支提交发布为 `0.1.Z`，`Z` 是 first-parent 提交高度。
-普通提交为预发布版，标题以 `release:` 开头则发布稳定版，例如：
+普通提交为预发布版；包元数据提交（标题以 `chore(release):` 开头）不会发布，
+它们只把仓库内的 Homebrew 和 Scoop 文件指向最新的稳定版与预发布版。
+标题以 `release:` 开头则发布稳定版，例如：
 
 ```sh
 git commit --allow-empty -m "release: stable"

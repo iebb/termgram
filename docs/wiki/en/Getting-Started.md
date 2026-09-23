@@ -14,7 +14,8 @@ curl --proto '=https' --tlsv1.2 -sSfL \
   https://github.com/iebb/termgram/releases/latest/download/install.sh | bash
 ```
 
-The default destination is `~/.local/bin`. To inspect the installer before
+The default destination is `~/.local/bin`, and the installed command is `tg`.
+To inspect the installer before
 running it, save the same URL to a file, read it, then run `bash install.sh`.
 For a prerelease or another destination:
 
@@ -23,6 +24,12 @@ curl --proto '=https' --tlsv1.2 -sSfL \
   https://github.com/iebb/termgram/releases/latest/download/install.sh \
   | CHANNEL=prerelease INSTALL_DIR="$HOME/bin" bash
 ```
+
+Homebrew users can install the same latest prerelease as
+`brew install iebb/termgram/termgram@pre` from the in-repository tap (see the
+[README](../../../README.md)); the `termgram@pre` formula is regenerated
+automatically after each prerelease and conflicts with `termgram` because both
+install `tg`.
 
 Windows PowerShell:
 
@@ -33,7 +40,8 @@ $installer = Invoke-RestMethod 'https://github.com/iebb/termgram/releases/latest
 & ([scriptblock]::Create([string]$installer)) -Channel prerelease -BinDir "$HOME\bin"
 ```
 
-The Windows default is `%LOCALAPPDATA%\Programs\Termgram\bin`. Inspect `$installer`
+The Windows default is `%LOCALAPPDATA%\Programs\Termgram\bin`, and the installed
+command is `tg` (`tg.exe`). Inspect `$installer`
 first if desired. Installers verify the release's `SHA256SUMS`, select the native
 architecture, and print the destination to add to PATH when needed. They do not
 request elevation or edit PATH. Release selection and updates are described in

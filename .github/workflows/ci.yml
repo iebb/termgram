@@ -43,6 +43,14 @@ jobs:
             height=0
             while IFS= read -r sha; do
               height=$((height + 1))
+              # Package-metadata commits only point Homebrew/Scoop files at
+              # already-published releases. Releasing one would make it the
+              # newest prerelease and restart the metadata cycle, so they
+              # never enter the plan. Heights still count them, keeping
+              # versions aligned with first-parent height.
+              if [[ "$(git log -1 --format=%s "$sha")" == "chore(release):"* ]]; then
+                continue
+              fi
               # Automatic publishing began at height 2. Older source did not
               # yet contain the build-version entry point.
               if ((height < 2)); then

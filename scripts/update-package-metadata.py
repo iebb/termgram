@@ -3,7 +3,8 @@
 
 Use the SHA256SUMS downloaded from the published release, never a local rebuild.
 The generated files must match the formats reviewed in the repository;
-a stable release is required because Homebrew and Scoop follow stable versions.
+a stable release is required because Homebrew stable and Scoop follow stable versions.
+With --prerelease, only the termgram@pre formula for the latest prerelease is written.
 """
 
 from __future__ import annotations
@@ -25,6 +26,18 @@ TARGETS = {
     "windows_intel": ("windows", "zip"),
     "windows_arm": ("windows-aarch64", "zip"),
 }
+
+STABLE_FORMULA_CAVEATS = (
+    "Run `tg` to launch Termgram.",
+    "Update this installation with `brew upgrade termgram` instead of `tg update`",
+    "so Homebrew can track the installed version.",
+)
+
+PRERELEASE_FORMULA_CAVEATS = (
+    "termgram@pre tracks the latest published prerelease.",
+    "Run `tg` to launch Termgram.",
+    "Update this installation with `brew upgrade termgram@pre` instead of `tg update`.",
+)
 
 
 def asset_name(version: str, target: str, extension: str) -> str:
@@ -54,7 +67,13 @@ def release_url(version: str, target: str, extension: str) -> str:
     return f"{REPOSITORY}/releases/download/v{version}/{asset}"
 
 
-def formula(version: str, checksums: dict[str, str]) -> str:
+def formula(
+    class_name: str,
+    version: str,
+    checksums: dict[str, str],
+    caveats: tuple[str, ...],
+    conflicts: str | None = None,
+) -> str:
     def source(key: str) -> tuple[str, str]:
         target, extension = TARGETS[key]
         asset = asset_name(version, target, extension)
@@ -64,12 +83,18 @@ def formula(version: str, checksums: dict[str, str]) -> str:
     mac_intel_url, mac_intel_sha = source("mac_intel")
     linux_arm_url, linux_arm_sha = source("linux_arm")
     linux_intel_url, linux_intel_sha = source("linux_intel")
-    return f'''class Termgram < Formula
+    conflict = (
+        f'\n  conflicts_with "{conflicts}", because: "both install the tg binary"\n'
+        if conflicts
+        else ""
+    )
+    caveats_text = "\n".join(f"      {line}" for line in caveats)
+    return f'''class {class_name} < Formula
   desc "{DESCRIPTION}"
   homepage "{REPOSITORY}"
   version "{version}"
   license "MIT"
-
+{conflict}
   on_macos do
     on_arm do
       url "{mac_arm_url}"
@@ -98,9 +123,7 @@ def formula(version: str, checksums: dict[str, str]) -> str:
 
   def caveats
     <<~EOS
-      Run `tg` to launch Termgram.
-      Update this installation with `brew upgrade termgram` instead of `tg update`
-      so Homebrew can track the installed version.
+{caveats_text}
     EOS
   end
 
@@ -165,6 +188,11 @@ def main() -> None:
     parser.add_argument("version")
     parser.add_argument("checksums", type=Path)
     parser.add_argument("--output-dir", type=Path, default=ROOT)
+    parser.add_argument(
+        "--prerelease",
+        action="store_true",
+        help="write only the termgram@pre formula tracking the latest prerelease",
+    )
     args = parser.parse_args()
     version = args.version
     if not re.fullmatch(r"\d+\.\d+\.\d+", version):
@@ -172,8 +200,21 @@ def main() -> None:
     checksums = read_checksums(version, args.checksums)
 
     (args.output_dir / "Formula").mkdir(parents=True, exist_ok=True)
+    if args.prerelease:
+        (args.output_dir / "Formula/termgram@pre.rb").write_text(
+            formula(
+                "TermgramATPre",
+                version,
+                checksums,
+                PRERELEASE_FORMULA_CAVEATS,
+                conflicts="termgram",
+            )
+        )
+        return
     (args.output_dir / "bucket").mkdir(exist_ok=True)
-    (args.output_dir / "Formula/termgram.rb").write_text(formula(version, checksums))
+    (args.output_dir / "Formula/termgram.rb").write_text(
+        formula("Termgram", version, checksums, STABLE_FORMULA_CAVEATS)
+    )
     (args.output_dir / "bucket/termgram.json").write_text(
         json.dumps(scoop_manifest(version, checksums), indent=4) + "\n"
     )

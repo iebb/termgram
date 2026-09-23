@@ -195,7 +195,7 @@ Lua 源码限制 64 KiB、VM 内存 8 MiB、约一百万条指令。未知字段
 
 `attachments.terminal_clipboard = true` 在检测到支持时开启 OSC 5522 MIME 粘贴。SSH 快捷键用它读取终端所在主机的剪贴板，本机快捷键优先读系统剪贴板。设为 `false` 关闭此终端模式，使用原生剪贴板。见[终端](Terminal.md)。
 
-消息编辑使用 `edit` 上下文。会话中的 `edit_message` 打开/继续本地编辑，`discard_edit` 丢弃编辑；`edit` 中支持 `send`、`cancel`、`newline` 和常规输入动作。底栏显示 EDIT，所选消息的编辑时间也显示在底栏。
+消息编辑使用 `edit` 上下文。会话中的 `edit_message` 编辑所选消息，或继续该消息保存的本地编辑，`discard_edit` 丢弃编辑；`edit` 中支持 `send`、`cancel`、`newline` 和常规输入动作。底栏显示 EDIT，所选消息的编辑时间也显示在底栏。
 
 会话动作 `delete_message` 打开删除确认；它与编辑器中删除下一个字符的 `delete`
 不同。确认框使用 `overlay` 上下文中的 `up`、`down`、`open` 和 `cancel`；

@@ -91,7 +91,7 @@ pane or overlay, so ordinary letters in an editor remain text.
 | Search | Tab / Ctrl-F | Change scope / edit query |
 | Search | Ctrl-N / Ctrl-P | Next / previous result page |
 | Search | Up/Down, PageUp/PageDown | Select result / move ten results |
-| Conversation | e | Edit selected message or resume local edit |
+| Conversation | e | Edit selected message, resuming its saved local edit |
 | Conversation | d | Review deletion for the selected delivered message |
 | Conversation | y / Y | Copy message text or caption / copy Telegram message link |
 | Conversation | f / g S | Choose a forward destination / prepare a forward to Saved Messages |

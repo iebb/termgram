@@ -9840,6 +9840,77 @@ mod tests {
         assert_eq!(app.mode, Mode::Navigate);
         assert!(app.message_edit().is_none());
     }
+
+    #[test]
+    fn edit_message_follows_the_selection_and_protects_a_modified_edit() {
+        fn source(message_id: i32, text: &str) -> crate::editing::Source {
+            crate::editing::Source {
+                message_id,
+                text: text.to_owned(),
+                revision: [1; 32],
+                caption: false,
+            }
+        }
+        let mut app = ready_app();
+        open_first(&mut app);
+        app.selected_message = Some(20);
+        let commands = app.run_binding("edit_message", 1);
+        let [TelegramCommand::LoadEdit { request_id, .. }] = commands.as_slice() else {
+            panic!("load")
+        };
+        app.handle_network(NetworkEvent::EditLoaded {
+            chat_id: 1,
+            request_id: *request_id,
+            result: Ok(source(20, "original 20")),
+        });
+        app.draft_data_mut(1)
+            .edit
+            .as_mut()
+            .unwrap()
+            .input
+            .set_value("changed 20");
+        app.run_binding("cancel", 1);
+        assert_eq!(app.mode, Mode::Navigate);
+        // A modified edit survives: pressing e on another message refuses.
+        app.selected_message = Some(21);
+        assert!(app.run_binding("edit_message", 1).is_empty());
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(app.message_edit().unwrap().source.message_id, 20);
+        assert_eq!(app.message_edit().unwrap().input.value(), "changed 20");
+        // Resuming still works from the edited message's own selection.
+        app.selected_message = Some(20);
+        assert!(app.run_binding("edit_message", 1).is_empty());
+        assert_eq!(app.mode, Mode::Edit);
+        app.run_binding("cancel", 1);
+        // An untouched edit may be replaced by editing another message.
+        app.draft_data_mut(1)
+            .edit
+            .as_mut()
+            .unwrap()
+            .input
+            .set_value("original 20");
+        app.selected_message = Some(21);
+        let commands = app.run_binding("edit_message", 1);
+        let [
+            TelegramCommand::LoadEdit {
+                message_id: 21,
+                request_id,
+                ..
+            },
+        ] = commands.as_slice()
+        else {
+            panic!("load the selected message")
+        };
+        app.handle_network(NetworkEvent::EditLoaded {
+            chat_id: 1,
+            request_id: *request_id,
+            result: Ok(source(21, "original 21")),
+        });
+        assert_eq!(app.mode, Mode::Edit);
+        assert_eq!(app.message_edit().unwrap().source.message_id, 21);
+        assert_eq!(app.message_edit().unwrap().input.value(), "original 21");
+    }
+
     #[test]
     fn deletion_requires_explicit_scope_and_preserves_messages_until_synced() {
         use crate::deletion::{Plan, Scope};

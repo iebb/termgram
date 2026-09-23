@@ -37,10 +37,24 @@ impl App {
         let Some(chat_id) = self.active_chat_id else {
             return Vec::new();
         };
-        if self.message_edit().is_some() {
-            self.mode = Mode::Edit;
-            self.status_message = None;
-            return Vec::new();
+        if let Some(edit) = self.message_edit() {
+            let selected = self.selected_message.filter(|id| *id > 0);
+            let resume = selected.is_none_or(|id| id == edit.source.message_id);
+            let modified = edit.input.value() != edit.source.text;
+            if resume {
+                self.mode = Mode::Edit;
+                self.status_message = None;
+                return Vec::new();
+            }
+            if modified {
+                self.status_message = Some(
+                    "An edit is kept for another message · select it to resume or discard it"
+                        .to_owned(),
+                );
+                return Vec::new();
+            }
+            // The kept edit was never modified, so loading the selected
+            // message's original may replace it below.
         }
         let Some(message_id) = self.selected_message.filter(|id| *id > 0) else {
             self.status_message = Some("Select a delivered message to edit".to_owned());

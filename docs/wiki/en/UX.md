@@ -117,8 +117,10 @@ reason in the footer. The server remains authoritative about chat permissions.
 
 The editor identifies the chat and message, and the footer shows EDIT plus the
 effective keys. Enter saves; Shift-Enter or Ctrl-J adds a newline. Esc/Ctrl-C
-closes the editor while keeping the edit. `e` or `:edit` resumes that chat's
-saved edit; Ctrl-D in the editor or `:edit-discard` discards it. One edit is kept
+closes the editor while keeping the edit. `e` or `:edit` resumes the saved edit
+when the selection is on its message; on another message it edits that message
+instead, replacing an untouched saved edit, while a modified one is kept and
+reported. Ctrl-D in the editor or `:edit-discard` discards it. One edit is kept
 per chat alongside its normal draft, reply and files. It survives account
 switches and normal restarts, using the same local draft save lifecycle.
 

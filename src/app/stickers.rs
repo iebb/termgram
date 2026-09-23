@@ -1,7 +1,7 @@
 use super::{App, Mode, Screen};
 use crate::{
     actions::Action,
-    event::{ConnectionStatus, NetworkEvent, TelegramCommand},
+    event::{NetworkEvent, TelegramCommand},
     model::{
         Attachment, AttachmentKind, Delivery, Message, StickerOverview, StickerRef, StickerSetRef,
         sanitize_terminal_line,
@@ -63,6 +63,8 @@ impl Panel {
 #[derive(Clone)]
 enum SetDocuments {
     Loading(u64),
+    /// Cached documents on display while Telegram revalidates the row.
+    Validating(u64, Vec<StickerRef>),
     Loaded(Vec<StickerRef>),
     Failed(String),
 }
@@ -109,7 +111,9 @@ impl State {
                 .get(index.saturating_sub(2))
                 .and_then(|set| self.documents.get(&set.id))
             {
-                Some(SetDocuments::Loaded(stickers)) => SectionView::Ready(stickers),
+                Some(SetDocuments::Loaded(stickers) | SetDocuments::Validating(_, stickers)) => {
+                    SectionView::Ready(stickers)
+                }
                 Some(SetDocuments::Failed(error)) => SectionView::Failed(error),
                 _ => SectionView::Loading,
             },
@@ -179,13 +183,12 @@ impl App {
         if panel.loading.is_some() {
             return Vec::new();
         }
-        if self.connection != ConnectionStatus::Online {
-            panel.error = Some("Connect to Telegram to load stickers".to_owned());
-            return Vec::new();
-        }
         panel.loading = Some(request_id);
         panel.error = None;
-        vec![TelegramCommand::LoadStickers { request_id }]
+        vec![TelegramCommand::LoadStickers {
+            request_id,
+            cached: None,
+        }]
     }
 
     fn ensure_sticker_section(&mut self) -> Vec<TelegramCommand> {
@@ -202,22 +205,19 @@ impl App {
         };
         if matches!(
             self.stickers.documents.get(&set.id),
-            Some(SetDocuments::Loading(_) | SetDocuments::Loaded(_))
+            Some(SetDocuments::Loading(_) | SetDocuments::Validating(..) | SetDocuments::Loaded(_))
         ) {
-            return Vec::new();
-        }
-        if self.connection != ConnectionStatus::Online {
-            self.stickers.documents.insert(
-                set.id,
-                SetDocuments::Failed("Connect to Telegram to load this sticker set".to_owned()),
-            );
             return Vec::new();
         }
         let request_id = self.next_sticker_request();
         self.stickers
             .documents
             .insert(set.id, SetDocuments::Loading(request_id));
-        vec![TelegramCommand::LoadStickerSet { set, request_id }]
+        vec![TelegramCommand::LoadStickerSet {
+            set,
+            request_id,
+            cached: None,
+        }]
     }
 
     pub(super) fn sticker_binding(
@@ -420,58 +420,18 @@ impl App {
         event: &NetworkEvent,
     ) -> Option<Vec<TelegramCommand>> {
         match event {
-            NetworkEvent::StickersLoaded { request_id, result } => {
-                if self
-                    .stickers
-                    .panel
-                    .as_ref()
-                    .is_none_or(|panel| panel.loading != Some(*request_id))
-                {
-                    return Some(Vec::new());
-                }
-                match result {
-                    Ok(overview) => {
-                        let StickerOverview {
-                            recent,
-                            favorites,
-                            sets,
-                        } = overview;
-                        self.stickers.recent.clone_from(recent);
-                        self.stickers.favorites.clone_from(favorites);
-                        self.stickers.sets.clone_from(sets);
-                        if let Some(panel) = &mut self.stickers.panel {
-                            panel.loading = None;
-                            panel.error = None;
-                        }
-                        self.clamp_sticker_selection();
-                        return Some(self.ensure_sticker_section());
-                    }
-                    Err(error) => {
-                        if let Some(panel) = &mut self.stickers.panel {
-                            panel.loading = None;
-                            panel.error = Some(sanitize_terminal_line(error));
-                        }
-                    }
-                }
-                Some(Vec::new())
-            }
+            NetworkEvent::StickersLoaded {
+                request_id,
+                validated,
+                result,
+            } => Some(self.stickers_loaded(*request_id, *validated, result)),
             NetworkEvent::StickerSetLoaded {
                 request_id,
                 set_id,
+                validated,
                 result,
             } => {
-                if !matches!(
-                    self.stickers.documents.get(set_id),
-                    Some(SetDocuments::Loading(current)) if current == request_id
-                ) {
-                    return Some(Vec::new());
-                }
-                let state = match result {
-                    Ok(stickers) => SetDocuments::Loaded(stickers.clone()),
-                    Err(error) => SetDocuments::Failed(sanitize_terminal_line(error)),
-                };
-                self.stickers.documents.insert(*set_id, state);
-                self.clamp_sticker_selection();
+                self.sticker_set_loaded(*request_id, *set_id, *validated, result);
                 Some(Vec::new())
             }
             NetworkEvent::StickerThumbDownloaded {
@@ -509,6 +469,79 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    fn stickers_loaded(
+        &mut self,
+        request_id: u64,
+        validated: bool,
+        result: &Result<StickerOverview, String>,
+    ) -> Vec<TelegramCommand> {
+        if self
+            .stickers
+            .panel
+            .as_ref()
+            .is_none_or(|panel| panel.loading != Some(request_id))
+        {
+            return Vec::new();
+        }
+        match result {
+            Ok(overview) => {
+                self.stickers.recent.clone_from(&overview.recent.items);
+                self.stickers
+                    .favorites
+                    .clone_from(&overview.favorites.items);
+                self.stickers.sets.clone_from(&overview.sets.items);
+                if validated && let Some(panel) = &mut self.stickers.panel {
+                    panel.loading = None;
+                    panel.error = None;
+                }
+                self.clamp_sticker_selection();
+                self.ensure_sticker_section()
+            }
+            Err(error) => {
+                // Revalidation failed; cached sections stay on display and the
+                // footer carries the error instead.
+                if let Some(panel) = &mut self.stickers.panel {
+                    panel.loading = None;
+                    panel.error = Some(sanitize_terminal_line(error));
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn sticker_set_loaded(
+        &mut self,
+        request_id: u64,
+        set_id: i64,
+        validated: bool,
+        result: &Result<crate::model::StickerSection<StickerRef>, String>,
+    ) {
+        let cached = match self.stickers.documents.get(&set_id) {
+            Some(SetDocuments::Loading(current)) if *current == request_id => None,
+            Some(SetDocuments::Validating(current, documents)) if *current == request_id => {
+                Some(documents.clone())
+            }
+            _ => return,
+        };
+        let state = match result {
+            Ok(section) if !validated => {
+                SetDocuments::Validating(request_id, section.items.clone())
+            }
+            Ok(section) => SetDocuments::Loaded(section.items.clone()),
+            Err(error) => match cached {
+                Some(documents) => {
+                    if let Some(panel) = &mut self.stickers.panel {
+                        panel.error = Some(sanitize_terminal_line(error));
+                    }
+                    SetDocuments::Loaded(documents)
+                }
+                None => SetDocuments::Failed(sanitize_terminal_line(error)),
+            },
+        };
+        self.stickers.documents.insert(set_id, state);
+        self.clamp_sticker_selection();
     }
 
     /// Called after drawing: visible cells queue their thumbnails, and a small

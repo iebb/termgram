@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use grammers_client::peer::Dialog;
 use grammers_client::tl;
 use grammers_client::{
-    Client,
+    Client, InvocationError,
     message::{InputMessage, Message as TelegramMessage},
 };
 use grammers_session::types::{PeerKind, PeerRef};
@@ -114,8 +114,12 @@ enum Response {
     History(Vec<TelegramMessage>),
     ReplyPreviews(Vec<TelegramMessage>, Vec<i32>),
     Stickers(crate::model::StickerOverview),
-    StickerSet(i64, Vec<crate::model::StickerRef>),
+    StickerSet(i64, crate::model::StickerSection<crate::model::StickerRef>),
     Message(Box<TelegramMessage>),
+    StickerMessage(
+        Box<TelegramMessage>,
+        Option<(i64, crate::model::StickerSection<crate::model::StickerRef>)>,
+    ),
     Link(Chat, PeerRef, Option<Box<TelegramMessage>>),
     Button(Option<String>, Option<String>),
     Applied,
@@ -231,6 +235,49 @@ pub(super) fn spawn(
     if let Some(id) = search_id {
         cache.cloud_search = Some((id, handle));
     }
+}
+
+/// Cached file references expire after some days. Every sticker names its set,
+/// so one fresh `GetStickerSet` both repairs the send and the local cache row.
+async fn refresh_expired_sticker(
+    client: &Client,
+    sticker: &crate::model::StickerRef,
+    error: &InvocationError,
+) -> Result<
+    Option<(
+        i64,
+        crate::model::StickerSection<crate::model::StickerRef>,
+        crate::model::StickerRef,
+    )>,
+> {
+    let InvocationError::Rpc(rpc) = error else {
+        return Ok(None);
+    };
+    if rpc.name != "FILE_REFERENCE_EXPIRED" {
+        return Ok(None);
+    }
+    let (Some(set_id), Some(access_hash)) = (sticker.set_id, sticker.set_access_hash) else {
+        return Ok(None);
+    };
+    let section = super::stickers::documents(
+        client,
+        &crate::model::StickerSetRef {
+            id: set_id,
+            access_hash,
+            title: String::new(),
+        },
+        None,
+    )
+    .await?;
+    let Some(fresh) = section
+        .items
+        .iter()
+        .find(|item| item.id == sticker.id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    Ok(Some((set_id, section, fresh)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -577,33 +624,49 @@ async fn execute(
             let message = Box::pin(client.send_message(peer()?, input)).await?;
             Ok(Response::Message(Box::new(message)))
         }
-        TelegramCommand::LoadStickers { .. } => {
-            Ok(Response::Stickers(super::stickers::overview(client).await?))
-        }
-        TelegramCommand::LoadStickerSet { set, .. } => Ok(Response::StickerSet(
+        TelegramCommand::LoadStickers { cached, .. } => Ok(Response::Stickers(
+            super::stickers::overview(client, cached.clone()).await?,
+        )),
+        TelegramCommand::LoadStickerSet { set, cached, .. } => Ok(Response::StickerSet(
             set.id,
-            super::stickers::documents(client, set).await?,
+            super::stickers::documents(client, set, cached.clone()).await?,
         )),
         TelegramCommand::SendSticker {
             sticker, reply_to, ..
         } => {
-            let input = InputMessage::new()
-                .media(tl::types::InputMediaDocument {
-                    spoiler: false,
-                    id: tl::types::InputDocument {
-                        id: sticker.id,
-                        access_hash: sticker.access_hash,
-                        file_reference: sticker.file_reference.clone(),
-                    }
-                    .into(),
-                    ttl_seconds: None,
-                    query: None,
-                    video_cover: None,
-                    video_timestamp: None,
-                })
-                .reply_to(*reply_to);
-            let message = Box::pin(client.send_message(peer()?, input)).await?;
-            Ok(Response::Message(Box::new(message)))
+            let peer = peer()?;
+            let input = |sticker: &crate::model::StickerRef| {
+                InputMessage::new()
+                    .media(tl::types::InputMediaDocument {
+                        spoiler: false,
+                        id: tl::types::InputDocument {
+                            id: sticker.id,
+                            access_hash: sticker.access_hash,
+                            file_reference: sticker.file_reference.clone(),
+                        }
+                        .into(),
+                        ttl_seconds: None,
+                        query: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                    })
+                    .reply_to(*reply_to)
+            };
+            match Box::pin(client.send_message(peer, input(sticker))).await {
+                Ok(message) => Ok(Response::StickerMessage(Box::new(message), None)),
+                Err(error) => {
+                    let Some(refreshed) = refresh_expired_sticker(client, sticker, &error).await?
+                    else {
+                        return Err(error.into());
+                    };
+                    let (set_id, section, fresh) = refreshed;
+                    let message = Box::pin(client.send_message(peer, input(&fresh))).await?;
+                    Ok(Response::StickerMessage(
+                        Box::new(message),
+                        Some((set_id, section)),
+                    ))
+                }
+            }
         }
         TelegramCommand::ResolveTelegramLink { url } => {
             let (chat, peer, message) = tokio::time::timeout(
@@ -1242,9 +1305,6 @@ pub(super) async fn complete(
         (
             TelegramCommand::SendMessage {
                 chat_id, local_id, ..
-            }
-            | TelegramCommand::SendSticker {
-                chat_id, local_id, ..
             },
             Response::Message(raw),
         ) => {
@@ -1257,19 +1317,46 @@ pub(super) async fn complete(
                 }
             }
         }
-        (TelegramCommand::LoadStickers { request_id }, Response::Stickers(overview)) => {
+        (
+            TelegramCommand::SendSticker {
+                chat_id, local_id, ..
+            },
+            Response::StickerMessage(raw, refreshed),
+        ) => {
+            if let Some((set_id, section)) = refreshed {
+                events
+                    .send(NetworkEvent::StickerSetLoaded {
+                        request_id: 0,
+                        set_id,
+                        validated: true,
+                        result: Ok(section),
+                    })
+                    .await?;
+            }
+            if raw.id() <= 0 {
+                NetworkEvent::MessageAccepted { chat_id, local_id }
+            } else {
+                NetworkEvent::MessageSent {
+                    local_id,
+                    message: map_message(&raw, cache)?,
+                }
+            }
+        }
+        (TelegramCommand::LoadStickers { request_id, .. }, Response::Stickers(overview)) => {
             NetworkEvent::StickersLoaded {
                 request_id,
+                validated: true,
                 result: Ok(overview),
             }
         }
         (
             TelegramCommand::LoadStickerSet { request_id, .. },
-            Response::StickerSet(set_id, stickers),
+            Response::StickerSet(set_id, section),
         ) => NetworkEvent::StickerSetLoaded {
             request_id,
             set_id,
-            result: Ok(stickers),
+            validated: true,
+            result: Ok(section),
         },
         (TelegramCommand::ResolveTelegramLink { url }, Response::Link(chat, peer, raw)) => {
             cache.peers.insert(chat.id, peer);

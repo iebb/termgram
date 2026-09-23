@@ -147,15 +147,17 @@ pub enum TelegramCommand {
         message_ids: Vec<i32>,
         request_id: u64,
     },
-    /// Refetch recent/favorite stickers and the installed set list. Sticker
-    /// file references are short-lived, so every panel open reloads them.
+    /// Revalidate recent/favorite stickers and the installed set list against
+    /// the cached rows, which the local store serves first when present.
     LoadStickers {
         request_id: u64,
+        cached: Option<crate::model::StickerOverview>,
     },
-    /// Lazily fetch one installed set's documents; cached for the app session.
+    /// Revalidate one installed set's documents against its cached row.
     LoadStickerSet {
         set: crate::model::StickerSetRef,
         request_id: u64,
+        cached: Option<crate::model::StickerSection<crate::model::StickerRef>>,
     },
     SendMessage {
         chat_id: ChatId,
@@ -577,13 +579,17 @@ impl TelegramCommand {
                 reply_to,
                 error,
             },
-            TelegramCommand::LoadStickers { request_id } => NetworkEvent::StickersLoaded {
+            TelegramCommand::LoadStickers { request_id, .. } => NetworkEvent::StickersLoaded {
                 request_id,
+                validated: true,
                 result: Err(error),
             },
-            TelegramCommand::LoadStickerSet { set, request_id } => NetworkEvent::StickerSetLoaded {
+            TelegramCommand::LoadStickerSet {
+                set, request_id, ..
+            } => NetworkEvent::StickerSetLoaded {
                 request_id,
                 set_id: set.id,
+                validated: true,
                 result: Err(error),
             },
             TelegramCommand::SendSticker {
@@ -973,15 +979,17 @@ impl fmt::Debug for TelegramCommand {
                 .field("text", text)
                 .field("reply_to", reply_to)
                 .finish(),
-            Self::LoadStickers { request_id } => formatter
+            Self::LoadStickers { request_id, .. } => formatter
                 .debug_struct("LoadStickers")
                 .field("request_id", request_id)
-                .finish(),
-            Self::LoadStickerSet { set, request_id } => formatter
+                .finish_non_exhaustive(),
+            Self::LoadStickerSet {
+                set, request_id, ..
+            } => formatter
                 .debug_struct("LoadStickerSet")
                 .field("set_id", &set.id)
                 .field("request_id", request_id)
-                .finish(),
+                .finish_non_exhaustive(),
             Self::SendSticker {
                 chat_id,
                 local_id,
@@ -1499,12 +1507,16 @@ pub enum NetworkEvent {
     },
     StickersLoaded {
         request_id: u64,
+        /// False for the instant local-cache payload; true once Telegram answered.
+        validated: bool,
         result: Result<crate::model::StickerOverview, String>,
     },
     StickerSetLoaded {
         request_id: u64,
         set_id: i64,
-        result: Result<Vec<crate::model::StickerRef>, String>,
+        /// False for the instant local-cache payload; true once Telegram answered.
+        validated: bool,
+        result: Result<crate::model::StickerSection<crate::model::StickerRef>, String>,
     },
     StickerThumbDownloaded {
         request_id: u64,

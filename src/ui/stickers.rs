@@ -243,6 +243,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     .split(area);
     let (controls, failed) = if let Some(error) = &panel.error {
         (format!(" {} · {} retry ", error, hint("refresh")), true)
+    } else if panel.loading.is_some() {
+        (format!(" {} Refreshing… ", spinner(app.tick)), false)
     } else {
         (
             format!(

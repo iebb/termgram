@@ -5305,6 +5305,21 @@ mod tests {
                 emoji: emoji.to_owned(),
                 mime_type: "image/webp".to_owned(),
                 thumb_size: Some("m".to_owned()),
+                set_id: Some(99),
+                set_access_hash: Some(3),
+            }
+        }
+        fn section<T>(hash: i64, items: Vec<T>) -> crate::model::StickerSection<T> {
+            crate::model::StickerSection { hash, items }
+        }
+        fn overview(
+            recent: Vec<crate::model::StickerRef>,
+            sets: Vec<crate::model::StickerSetRef>,
+        ) -> crate::model::StickerOverview {
+            crate::model::StickerOverview {
+                recent: section(11, recent),
+                favorites: crate::model::StickerSection::default(),
+                sets: section(22, sets),
             }
         }
         let mut app = ready_app();
@@ -5322,22 +5337,46 @@ mod tests {
             sender: None,
         });
         let commands = app.run_binding("stickers", 1);
-        let [TelegramCommand::LoadStickers { request_id }] = commands.as_slice() else {
-            panic!("every open refetches the lists")
+        let [TelegramCommand::LoadStickers { request_id, .. }] = commands.as_slice() else {
+            panic!("every open revalidates the lists")
         };
         assert_eq!(app.mode, Mode::Stickers);
+        let pack = crate::model::StickerSetRef {
+            id: 99,
+            access_hash: 3,
+            title: "Pack".to_owned(),
+        };
+        // A stale cached event is ignored before this request exists.
+        app.handle_network(NetworkEvent::StickersLoaded {
+            request_id: request_id.wrapping_add(1),
+            validated: false,
+            result: Ok(overview(vec![sticker(99, "🧯")], Vec::new())),
+        });
+        assert_eq!(app.stickers.section_count(), 2);
+        // The local cache arrives first and keeps the revalidation pending.
         app.handle_network(NetworkEvent::StickersLoaded {
             request_id: *request_id,
-            result: Ok(crate::model::StickerOverview {
-                recent: (1..=12).map(|id| sticker(id, "😀")).collect(),
-                favorites: Vec::new(),
-                sets: vec![crate::model::StickerSetRef {
-                    id: 99,
-                    access_hash: 3,
-                    title: "Pack".to_owned(),
-                }],
-            }),
+            validated: false,
+            result: Ok(overview(
+                (1..=12).map(|id| sticker(id, "😀")).collect(),
+                vec![pack.clone()],
+            )),
         });
+        assert_eq!(app.stickers.section_count(), 3);
+        assert!(
+            app.stickers.panel.as_ref().unwrap().loading.is_some(),
+            "the cached payload keeps the refreshing indication"
+        );
+        // Telegram's validated answer replaces the sections and settles it.
+        app.handle_network(NetworkEvent::StickersLoaded {
+            request_id: *request_id,
+            validated: true,
+            result: Ok(overview(
+                (1..=12).map(|id| sticker(id, "😀")).collect(),
+                vec![pack],
+            )),
+        });
+        assert!(app.stickers.panel.as_ref().unwrap().loading.is_none());
         assert_eq!(app.stickers.section_count(), 3);
         // Grid movement follows the rendered column count.
         let panel = app.stickers.panel.as_mut().unwrap();
@@ -5352,18 +5391,30 @@ mod tests {
         assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 9);
         app.run_binding("home", 1);
         assert_eq!(app.stickers.panel.as_ref().unwrap().selected, 0);
-        // Set sections load lazily on entry.
+        // Set sections load lazily on entry, cached documents first.
         app.run_binding("sticker_set_next", 1);
         assert_eq!(app.stickers.panel.as_ref().unwrap().section, 1);
         let commands = app.run_binding("sticker_set_next", 1);
-        let [TelegramCommand::LoadStickerSet { set, request_id }] = commands.as_slice() else {
+        let [
+            TelegramCommand::LoadStickerSet {
+                set, request_id, ..
+            },
+        ] = commands.as_slice()
+        else {
             panic!("lazy set load")
         };
         assert_eq!(set.id, 99);
         app.handle_network(NetworkEvent::StickerSetLoaded {
             request_id: *request_id,
             set_id: 99,
-            result: Ok(vec![sticker(50, "🦊")]),
+            validated: false,
+            result: Ok(section(5, vec![sticker(50, "🦊")])),
+        });
+        app.handle_network(NetworkEvent::StickerSetLoaded {
+            request_id: *request_id,
+            set_id: 99,
+            validated: true,
+            result: Ok(section(6, vec![sticker(50, "🦊"), sticker(51, "🐻")])),
         });
         assert!(app.run_binding("sticker_set_previous", 1).is_empty());
         assert!(app.run_binding("sticker_set_previous", 1).is_empty());
@@ -5462,7 +5513,7 @@ mod tests {
             TelegramCommand::SendSticker {
                 chat_id,
                 local_id,
-                sticker,
+                sticker: sent,
                 reply_to,
             },
         ] = commands.as_slice()
@@ -5470,7 +5521,7 @@ mod tests {
             panic!("second click sends")
         };
         assert_eq!(
-            (*chat_id, *local_id, sticker.id, *reply_to),
+            (*chat_id, *local_id, sent.id, *reply_to),
             (1, -1, 2, Some(7))
         );
         assert_eq!(app.mode, Mode::Compose);
@@ -5507,12 +5558,44 @@ mod tests {
         // Cancel closes back to the composer.
         let commands = app.run_binding("stickers", 1);
         let [TelegramCommand::LoadStickers { .. }] = commands.as_slice() else {
-            panic!("reopen refetches")
+            panic!("reopen revalidates")
         };
         assert_eq!(app.mode, Mode::Stickers);
         app.run_binding("cancel", 1);
         assert_eq!(app.mode, Mode::Compose);
         assert!(app.stickers.panel.is_none());
+        // A failed revalidation keeps the cached sections on display.
+        let commands = app.run_binding("stickers", 1);
+        let [TelegramCommand::LoadStickers { request_id, .. }] = commands.as_slice() else {
+            panic!("reopen revalidates")
+        };
+        app.handle_network(NetworkEvent::StickersLoaded {
+            request_id: *request_id,
+            validated: false,
+            result: Ok(overview(
+                vec![sticker(1, "😀"), sticker(2, "🦊")],
+                Vec::new(),
+            )),
+        });
+        app.handle_network(NetworkEvent::StickersLoaded {
+            request_id: *request_id,
+            validated: true,
+            result: Err("Timeout".to_owned()),
+        });
+        let panel = app.stickers.panel.as_ref().unwrap();
+        assert!(panel.loading.is_none());
+        assert_eq!(panel.error.as_deref(), Some("Timeout"));
+        assert_eq!(app.stickers.section_count(), 2);
+        match app.stickers.section_view(0) {
+            crate::app::stickers::SectionView::Ready(stickers) => {
+                assert_eq!(
+                    stickers.len(),
+                    2,
+                    "cached sections survive a failed revalidation"
+                );
+            }
+            _ => panic!("cached sections stay ready"),
+        }
     }
 
     #[test]

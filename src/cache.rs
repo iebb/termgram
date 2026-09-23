@@ -278,6 +278,46 @@ impl Store {
             .and_then(|value| value.parse().ok()))
     }
 
+    /// The cached sticker sections, when any row exists. Missing sections load
+    /// fresh (hash 0) while present ones only revalidate.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn sticker_overview(&self) -> Result<Option<crate::model::StickerOverview>> {
+        let recent = self.sticker_section("stickers_recent").await?;
+        let favorites = self.sticker_section("stickers_faved").await?;
+        let sets = self.sticker_section("stickers_sets").await?;
+        if recent.is_none() && favorites.is_none() && sets.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(crate::model::StickerOverview {
+            recent: recent.unwrap_or_default(),
+            favorites: favorites.unwrap_or_default(),
+            sets: sets.unwrap_or_default(),
+        }))
+    }
+
+    /// One set's cached documents with Telegram's revalidation hash.
+    /// # Errors
+    /// Returns database or decoding errors.
+    pub async fn sticker_set(
+        &self,
+        set_id: i64,
+    ) -> Result<Option<crate::model::StickerSection<crate::model::StickerRef>>> {
+        self.sticker_section(&format!("stickers_set_{set_id}"))
+            .await
+    }
+
+    async fn sticker_section<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::model::StickerSection<T>>> {
+        metadata(&self.connection, key)
+            .await?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Read a bounded page without any network dependency.
     /// # Errors
     /// Returns database or decoding errors.
@@ -596,6 +636,43 @@ impl Store {
                 NetworkEvent::DialogPins(pins) => {
                     set_metadata(&transaction, "dialog_pins", &serde_json::to_string(pins)?)
                         .await?;
+                }
+                NetworkEvent::StickersLoaded {
+                    validated: true,
+                    result: Ok(overview),
+                    ..
+                } => {
+                    set_metadata(
+                        &transaction,
+                        "stickers_recent",
+                        &serde_json::to_string(&overview.recent)?,
+                    )
+                    .await?;
+                    set_metadata(
+                        &transaction,
+                        "stickers_faved",
+                        &serde_json::to_string(&overview.favorites)?,
+                    )
+                    .await?;
+                    set_metadata(
+                        &transaction,
+                        "stickers_sets",
+                        &serde_json::to_string(&overview.sets)?,
+                    )
+                    .await?;
+                }
+                NetworkEvent::StickerSetLoaded {
+                    validated: true,
+                    set_id,
+                    result: Ok(section),
+                    ..
+                } => {
+                    set_metadata(
+                        &transaction,
+                        &format!("stickers_set_{set_id}"),
+                        &serde_json::to_string(section)?,
+                    )
+                    .await?;
                 }
                 NetworkEvent::ArchiveChanged { chat_id, archived } => {
                     if let Some((mut chat, _)) = load_chat(&transaction, *chat_id).await? {
@@ -1208,6 +1285,74 @@ mod tests {
                 .sender_username
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn sticker_sections_round_trip_with_their_revalidation_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite3");
+        let sticker = crate::model::StickerRef {
+            id: 7,
+            access_hash: 9,
+            file_reference: vec![1, 2],
+            emoji: "😀".to_owned(),
+            mime_type: "image/webp".to_owned(),
+            thumb_size: Some("m".to_owned()),
+            set_id: Some(3),
+            set_access_hash: Some(4),
+        };
+        let overview = crate::model::StickerOverview {
+            recent: crate::model::StickerSection {
+                hash: 11,
+                items: vec![sticker.clone()],
+            },
+            favorites: crate::model::StickerSection::default(),
+            sets: crate::model::StickerSection {
+                hash: 22,
+                items: vec![crate::model::StickerSetRef {
+                    id: 3,
+                    access_hash: 4,
+                    title: "Pack".to_owned(),
+                }],
+            },
+        };
+        let documents = crate::model::StickerSection {
+            hash: 6,
+            items: vec![sticker],
+        };
+        let mut store = Store::open(&path).await.unwrap();
+        store
+            .apply(&[
+                NetworkEvent::StickersLoaded {
+                    request_id: 1,
+                    validated: true,
+                    result: Ok(overview.clone()),
+                },
+                NetworkEvent::StickerSetLoaded {
+                    request_id: 2,
+                    set_id: 3,
+                    validated: true,
+                    result: Ok(documents.clone()),
+                },
+                // Unvalidated cache payloads never overwrite fresher rows.
+                NetworkEvent::StickersLoaded {
+                    request_id: 3,
+                    validated: false,
+                    result: Ok(crate::model::StickerOverview::default()),
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.sticker_overview().await.unwrap(),
+            Some(overview.clone())
+        );
+        assert_eq!(store.sticker_set(3).await.unwrap(), Some(documents.clone()));
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.sticker_overview().await.unwrap(), Some(overview));
+        assert_eq!(store.sticker_set(3).await.unwrap(), Some(documents));
+        assert_eq!(store.sticker_set(4).await.unwrap(), None);
     }
 
     #[tokio::test]

@@ -92,7 +92,7 @@ pub(super) async fn serve(
             event = preparation.next() => { if let Some(event) = event { events.send(event).await?; } },
             result = search.next(), if search.running() => { if let Some(event) = result { events.send(event).await?; } },
             command = commands.recv() => {
-                let Some(command) = command else { break; };
+                let Some(mut command) = command else { break; };
                 if let TelegramCommand::PrepareAttachments(request) = command {
                     if let Some(event) = preparation.start(request) { events.send(event).await?; }
                     continue;
@@ -105,7 +105,7 @@ pub(super) async fn serve(
                     }
                     if matches!(command, TelegramCommand::CancelSearch) && !ready { continue; }
                 }
-                if serve_cached(&command, &mut store, &mut changes, &events, &mut search).await? { continue; }
+                if serve_cached(&mut command, &mut store, &mut changes, &events, &mut search).await? { continue; }
                 if authentication_command(&command) {
                     pending.push_front(command);
                 } else if pending.len() < COMMAND_QUEUE_CAPACITY {
@@ -163,7 +163,7 @@ pub(super) async fn serve(
 
 #[allow(clippy::too_many_lines)]
 async fn serve_cached(
-    command: &TelegramCommand,
+    command: &mut TelegramCommand,
     store: &mut Store,
     changes: &mut Vec<NetworkEvent>,
     events: &mpsc::Sender<NetworkEvent>,
@@ -177,6 +177,8 @@ async fn serve_cached(
             | TelegramCommand::LoadPinnedContext { .. }
             | TelegramCommand::LoadOlder { .. }
             | TelegramCommand::LoadCachedContext { .. }
+            | TelegramCommand::LoadStickers { .. }
+            | TelegramCommand::LoadStickerSet { .. }
             | TelegramCommand::DownloadAttachment { .. }
             | TelegramCommand::SearchCached(_)
     ) {
@@ -268,6 +270,37 @@ async fn serve_cached(
         TelegramCommand::SearchCached(request) => {
             search.queue(request.clone());
             return Ok(true);
+        }
+        TelegramCommand::LoadStickers { request_id, cached } => {
+            // The cached overview opens the panel instantly, then the network
+            // worker revalidates each section with its stored hash.
+            if let Some(overview) = store.sticker_overview().await? {
+                events
+                    .send(NetworkEvent::StickersLoaded {
+                        request_id: *request_id,
+                        validated: false,
+                        result: Ok(overview.clone()),
+                    })
+                    .await?;
+                *cached = Some(overview);
+            }
+        }
+        TelegramCommand::LoadStickerSet {
+            set,
+            request_id,
+            cached,
+        } => {
+            if let Some(section) = store.sticker_set(set.id).await? {
+                events
+                    .send(NetworkEvent::StickerSetLoaded {
+                        request_id: *request_id,
+                        set_id: set.id,
+                        validated: false,
+                        result: Ok(section.clone()),
+                    })
+                    .await?;
+                *cached = Some(section);
+            }
         }
         TelegramCommand::CancelSearch => search.cancel(),
         TelegramCommand::LoadCachedContext {

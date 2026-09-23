@@ -9,63 +9,98 @@ use grammers_client::media::Downloadable;
 use grammers_client::tl;
 
 use super::media_cache;
-use crate::model::{StickerOverview, StickerRef, StickerSetRef, sanitize_terminal_line};
+use crate::model::{
+    StickerOverview, StickerRef, StickerSection, StickerSetRef, sanitize_terminal_line,
+};
 
-/// Recent and favorite stickers plus the installed set list carry short-lived
-/// file references, so the panel refetches all three on every open.
-pub(super) async fn overview(client: &Client) -> Result<StickerOverview> {
+/// Recent and favorite stickers plus the installed set list, revalidated with
+/// the cached sections' hashes so unchanged sections cost no payload.
+pub(super) async fn overview(
+    client: &Client,
+    cached: Option<StickerOverview>,
+) -> Result<StickerOverview> {
+    let cached = cached.unwrap_or_default();
+    let recent_request = tl::functions::messages::GetRecentStickers {
+        attached: false,
+        hash: cached.recent.hash,
+    };
+    let favorites_request = tl::functions::messages::GetFavedStickers {
+        hash: cached.favorites.hash,
+    };
+    let sets_request = tl::functions::messages::GetAllStickers {
+        hash: cached.sets.hash,
+    };
     let (recent, favorites, sets) = tokio::try_join!(
-        client.invoke(&tl::functions::messages::GetRecentStickers {
-            attached: false,
-            hash: 0,
-        }),
-        client.invoke(&tl::functions::messages::GetFavedStickers { hash: 0 }),
-        client.invoke(&tl::functions::messages::GetAllStickers { hash: 0 }),
+        client.invoke(&recent_request),
+        client.invoke(&favorites_request),
+        client.invoke(&sets_request),
     )?;
     let recent = match recent {
-        tl::enums::messages::RecentStickers::Stickers(stickers) => stickers.stickers,
-        tl::enums::messages::RecentStickers::NotModified => Vec::new(),
+        tl::enums::messages::RecentStickers::Stickers(stickers) => StickerSection {
+            hash: stickers.hash,
+            items: sticker_refs(&stickers.stickers),
+        },
+        tl::enums::messages::RecentStickers::NotModified => cached.recent,
     };
     let favorites = match favorites {
-        tl::enums::messages::FavedStickers::Stickers(stickers) => stickers.stickers,
-        tl::enums::messages::FavedStickers::NotModified => Vec::new(),
+        tl::enums::messages::FavedStickers::Stickers(stickers) => StickerSection {
+            hash: stickers.hash,
+            items: sticker_refs(&stickers.stickers),
+        },
+        tl::enums::messages::FavedStickers::NotModified => cached.favorites,
     };
     let sets = match sets {
-        tl::enums::messages::AllStickers::Stickers(stickers) => stickers.sets,
-        tl::enums::messages::AllStickers::NotModified => Vec::new(),
+        tl::enums::messages::AllStickers::Stickers(stickers) => StickerSection {
+            hash: stickers.hash,
+            items: sticker_set_refs(stickers.sets),
+        },
+        tl::enums::messages::AllStickers::NotModified => cached.sets,
     };
     Ok(StickerOverview {
-        recent: sticker_refs(&recent),
-        favorites: sticker_refs(&favorites),
-        sets: sets
-            .into_iter()
-            .filter_map(|set| match set {
-                tl::enums::StickerSet::Set(set) if !set.archived => Some(StickerSetRef {
-                    id: set.id,
-                    access_hash: set.access_hash,
-                    title: sanitize_terminal_line(&set.title),
-                }),
-                tl::enums::StickerSet::Set(_) => None,
-            })
-            .collect(),
+        recent,
+        favorites,
+        sets,
     })
 }
 
-pub(super) async fn documents(client: &Client, set: &StickerSetRef) -> Result<Vec<StickerRef>> {
+fn sticker_set_refs(sets: Vec<tl::enums::StickerSet>) -> Vec<StickerSetRef> {
+    sets.into_iter()
+        .filter_map(|set| match set {
+            tl::enums::StickerSet::Set(set) if !set.archived => Some(StickerSetRef {
+                id: set.id,
+                access_hash: set.access_hash,
+                title: sanitize_terminal_line(&set.title),
+            }),
+            tl::enums::StickerSet::Set(_) => None,
+        })
+        .collect()
+}
+
+pub(super) async fn documents(
+    client: &Client,
+    set: &StickerSetRef,
+    cached: Option<StickerSection<StickerRef>>,
+) -> Result<StickerSection<StickerRef>> {
+    let hash = cached.as_ref().map_or(0, |cached| cached.hash);
     let result = client
         .invoke(&tl::functions::messages::GetStickerSet {
             stickerset: tl::enums::InputStickerSet::Id(tl::types::InputStickerSetId {
                 id: set.id,
                 access_hash: set.access_hash,
             }),
-            hash: 0,
+            hash: i32::try_from(hash).unwrap_or(0),
         })
         .await?;
-    let documents = match result {
-        tl::enums::messages::StickerSet::Set(loaded) => loaded.documents,
-        tl::enums::messages::StickerSet::NotModified => Vec::new(),
-    };
-    Ok(sticker_refs(&documents))
+    match result {
+        tl::enums::messages::StickerSet::Set(loaded) => {
+            let tl::enums::StickerSet::Set(meta) = &loaded.set;
+            Ok(StickerSection {
+                hash: i64::from(meta.hash),
+                items: sticker_refs(&loaded.documents),
+            })
+        }
+        tl::enums::messages::StickerSet::NotModified => Ok(cached.unwrap_or_default()),
+    }
 }
 
 fn sticker_refs(documents: &[tl::enums::Document]) -> Vec<StickerRef> {
@@ -76,11 +111,17 @@ fn sticker_ref(document: &tl::enums::Document) -> Option<StickerRef> {
     let tl::enums::Document::Document(document) = document else {
         return None;
     };
-    let emoji = document
+    let (emoji, set) = document
         .attributes
         .iter()
         .find_map(|attribute| match attribute {
-            tl::enums::DocumentAttribute::Sticker(sticker) => Some(sticker.alt.clone()),
+            tl::enums::DocumentAttribute::Sticker(sticker) => Some((
+                sticker.alt.clone(),
+                match &sticker.stickerset {
+                    tl::enums::InputStickerSet::Id(set) => Some((set.id, set.access_hash)),
+                    _ => None,
+                },
+            )),
             _ => None,
         })
         .unwrap_or_default();
@@ -101,6 +142,8 @@ fn sticker_ref(document: &tl::enums::Document) -> Option<StickerRef> {
         emoji: sanitize_terminal_line(&emoji),
         mime_type: sanitize_terminal_line(&document.mime_type),
         thumb_size,
+        set_id: set.map(|set| set.0),
+        set_access_hash: set.map(|set| set.1),
     })
 }
 

@@ -109,10 +109,10 @@ pub struct Mention {
     pub requires_playback: bool,
 }
 
-/// A sendable sticker reference, valid while the Telegram worker keeps the
-/// document's file reference alive. Fetched fresh on every panel open instead
-/// of being persisted like [`Attachment`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A sendable sticker reference. File references expire after some days, so
+/// panels revalidate the cached lists against Telegram and a failed send
+/// retries once with a fresh reference instead of persisting them.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct StickerRef {
     pub id: i64,
     pub access_hash: i64,
@@ -121,22 +121,43 @@ pub struct StickerRef {
     pub mime_type: String,
     /// Telegram's static raster thumbnail size label, when the document has one.
     pub thumb_size: Option<String>,
+    /// The sticker's own set, used to refresh an expired file reference.
+    pub set_id: Option<i64>,
+    pub set_access_hash: Option<i64>,
 }
 
 /// An installed sticker set listed in the panel's sidebar.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct StickerSetRef {
     pub id: i64,
     pub access_hash: i64,
     pub title: String,
 }
 
-/// Recent and favorite stickers plus the installed set list, refetched together.
+/// One sticker section with Telegram's revalidation hash. This JSON shape is
+/// also the local cache row format.
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct StickerSection<T> {
+    pub hash: i64,
+    pub items: Vec<T>,
+}
+
+impl<T> Default for StickerSection<T> {
+    fn default() -> Self {
+        Self {
+            hash: 0,
+            items: Vec::new(),
+        }
+    }
+}
+
+/// Recent and favorite stickers plus the installed set list, kept in the local
+/// cache and revalidated with Telegram's hash on every panel open.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StickerOverview {
-    pub recent: Vec<StickerRef>,
-    pub favorites: Vec<StickerRef>,
-    pub sets: Vec<StickerSetRef>,
+    pub recent: StickerSection<StickerRef>,
+    pub favorites: StickerSection<StickerRef>,
+    pub sets: StickerSection<StickerSetRef>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]

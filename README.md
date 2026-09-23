@@ -27,7 +27,7 @@ This installs the prebuilt stable release for your platform as the `tg` command
 with SHA-256 verification. For the latest published prerelease instead:
 
 ```sh
-brew install iebb/termgram/termgram@pre
+brew install iebb/termgram/termgram-pre
 ```
 
 The [Homebrew formula](Formula/termgram.rb) lives in this repository. No
@@ -35,9 +35,9 @@ separate tap repository or Rust compiler is needed. Update with `brew update`
 followed by `brew upgrade iebb/termgram/termgram`; uninstall with
 `brew uninstall termgram`. If you previously installed `tg` manually, check
 `which tg`: a copy in `~/bin` or `~/.local/bin` may take precedence in `PATH`.
-`termgram` and `termgram@pre` conflict because both install the `tg` executable.
-`termgram@pre` is regenerated automatically after each prerelease; upgrade it
-with `brew upgrade termgram@pre` instead of `tg update`.
+`termgram` and `termgram-pre` conflict because both install the `tg` executable.
+`termgram-pre` is regenerated automatically after each prerelease; upgrade it
+with `brew upgrade termgram-pre` instead of `tg update`.
 
 Scoop (64-bit / ARM64 Windows):
 
@@ -81,7 +81,7 @@ cargo +1.98.0 install --locked --git https://github.com/iebb/termgram --bin tg t
 Run `tg`, sign in with your phone or press Tab for QR login. Open a chat with
 Enter, press `i` to compose, and `?` for help. Repeat the Cargo command to update
 a source install; use `tg update` for standalone release binaries. Use
-`brew upgrade iebb/termgram/termgram` (or `termgram@pre` for prereleases) for
+`brew upgrade iebb/termgram/termgram` (or `termgram-pre` for prereleases) for
 Homebrew installations and
 `scoop update termgram` for Scoop installations so the package manager can
 track the installed version.

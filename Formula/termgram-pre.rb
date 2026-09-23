@@ -1,4 +1,4 @@
-class TermgramATPre < Formula
+class TermgramPre < Formula
   desc "Focused, keyboard-first Telegram client for the terminal"
   homepage "https://github.com/iebb/termgram"
   version "0.1.25"
@@ -34,9 +34,9 @@ class TermgramATPre < Formula
 
   def caveats
     <<~EOS
-      termgram@pre tracks the latest published prerelease.
+      termgram-pre tracks the latest published prerelease.
       Run `tg` to launch Termgram.
-      Update this installation with `brew upgrade termgram@pre` instead of `tg update`.
+      Update this installation with `brew upgrade termgram-pre` instead of `tg update`.
     EOS
   end
 

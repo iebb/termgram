@@ -4,7 +4,7 @@
 Use the SHA256SUMS downloaded from the published release, never a local rebuild.
 The generated files must match the formats reviewed in the repository;
 a stable release is required because Homebrew stable and Scoop follow stable versions.
-With --prerelease, only the termgram@pre formula for the latest prerelease is written.
+With --prerelease, only the termgram-pre formula for the latest prerelease is written.
 """
 
 from __future__ import annotations
@@ -34,9 +34,9 @@ STABLE_FORMULA_CAVEATS = (
 )
 
 PRERELEASE_FORMULA_CAVEATS = (
-    "termgram@pre tracks the latest published prerelease.",
+    "termgram-pre tracks the latest published prerelease.",
     "Run `tg` to launch Termgram.",
-    "Update this installation with `brew upgrade termgram@pre` instead of `tg update`.",
+    "Update this installation with `brew upgrade termgram-pre` instead of `tg update`.",
 )
 
 
@@ -191,7 +191,7 @@ def main() -> None:
     parser.add_argument(
         "--prerelease",
         action="store_true",
-        help="write only the termgram@pre formula tracking the latest prerelease",
+        help="write only the termgram-pre formula tracking the latest prerelease",
     )
     args = parser.parse_args()
     version = args.version
@@ -201,9 +201,9 @@ def main() -> None:
 
     (args.output_dir / "Formula").mkdir(parents=True, exist_ok=True)
     if args.prerelease:
-        (args.output_dir / "Formula/termgram@pre.rb").write_text(
+        (args.output_dir / "Formula/termgram-pre.rb").write_text(
             formula(
-                "TermgramATPre",
+                "TermgramPre",
                 version,
                 checksums,
                 PRERELEASE_FORMULA_CAVEATS,

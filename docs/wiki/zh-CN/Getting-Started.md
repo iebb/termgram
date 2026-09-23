@@ -23,8 +23,8 @@ curl --proto '=https' --tlsv1.2 -sSfL \
 ```
 
 Homebrew 用户也可以通过仓库内置 tap 安装相同的最新预发布版：
-`brew install iebb/termgram/termgram@pre`（见 [README](../../../README.md)）。
-`termgram@pre` formula 在每次预发布后自动重新生成，与 `termgram` 冲突，因为两者都安装 `tg`。
+`brew install iebb/termgram/termgram-pre`（见 [README](../../../README.md)）。
+`termgram-pre` formula 在每次预发布后自动重新生成，与 `termgram` 冲突，因为两者都安装 `tg`。
 
 Windows PowerShell：
 

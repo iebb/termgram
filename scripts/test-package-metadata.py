@@ -95,8 +95,8 @@ else:
         self.assertEqual(manifest["architecture"]["64bit"]["hash"], self.hashes["termgram-0.1.21-windows.zip"])
         formula = self.remote_file("Formula/termgram.rb")
         self.assertIn(self.hashes["termgram-0.1.21-linux.tar.gz"], formula)
-        pre = self.remote_file("Formula/termgram@pre.rb")
-        self.assertIn("class TermgramATPre < Formula", pre)
+        pre = self.remote_file("Formula/termgram-pre.rb")
+        self.assertIn("class TermgramPre < Formula", pre)
         self.assertIn('conflicts_with "termgram", because: "both install the tg binary"', pre)
         self.assertIn('version "0.1.30"', pre)
         self.assertIn(self.pre_hashes["termgram-0.1.30-macos.tar.gz"], pre)
@@ -149,7 +149,7 @@ if not marker.exists():
             {"tag_name": "v0.1.30", "draft": False, "prerelease": True},
         ]))
         self.run_command("bash", str(SCRIPT))
-        pre = self.remote_file("Formula/termgram@pre.rb")
+        pre = self.remote_file("Formula/termgram-pre.rb")
         self.assertIn('version "0.1.30"', pre)
         self.assertIn(self.pre_hashes["termgram-0.1.30-linux.tar.gz"], pre)
         self.assertEqual(

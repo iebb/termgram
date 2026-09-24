@@ -73,6 +73,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState) {
         Screen::Main => render_main(frame, area, app),
         Screen::Fatal(message) => render_fatal(frame, area, app, message),
     }
+    if app.proxy_edit().is_some() {
+        render_proxy_dialog(frame, area, app);
+    }
 }
 
 fn account_controls(app: &AppState, context: Context) -> String {
@@ -106,7 +109,7 @@ fn render_connecting(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         Line::from(""),
         Line::from(format!("{spinner}  Connecting to Telegram…")),
         Line::from(Span::styled(
-            account_controls(app, Context::Global),
+            format!("{}, p proxy", account_controls(app, Context::Global)),
             Style::default().fg(MUTED),
         )),
     ];
@@ -121,15 +124,12 @@ fn render_connecting(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
 fn auth_controls(app: &AppState, phase: &AuthPhase) -> String {
     let hint = |action| app.keymap.hint(Context::Input, action);
-    format!(
-        "{} · {}",
-        if matches!(phase, AuthPhase::Phone) {
-            format!("{} QR", hint("focus"))
-        } else {
-            format!("{} starts over", hint("cancel"))
-        },
-        account_controls(app, Context::Input)
-    )
+    let primary = if matches!(phase, AuthPhase::Phone) {
+        format!("{} QR · p proxy", hint("focus"))
+    } else {
+        format!("{} starts over", hint("cancel"))
+    };
+    format!("{primary} · {}", account_controls(app, Context::Input))
 }
 
 fn render_auth(frame: &mut Frame<'_>, area: Rect, app: &AppState, phase: &AuthPhase) {
@@ -1156,9 +1156,9 @@ fn render_fatal(frame: &mut Frame<'_>, area: Rect, app: &AppState, message: &str
             Line::from(""),
             Line::from(Span::styled(
                 format!(
-                    "Account {} · {}",
+                    "Account {} · {} · p proxy",
                     app.active_account(),
-                    account_controls(app, Context::Chats)
+                    account_controls(app, Context::Global)
                 ),
                 Style::default().fg(MUTED),
             )),
@@ -1168,6 +1168,72 @@ fn render_fatal(frame: &mut Frame<'_>, area: Rect, app: &AppState, message: &str
 
 fn wrapped_height(message: &str, width: u16) -> u16 {
     clamp_u16(wrap_cells(message, usize::from(width.max(1))).len())
+}
+
+/// Centered proxy editor shown over any pre-connection screen.
+fn render_proxy_dialog(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
+    let Some(input) = app.proxy_edit() else {
+        return;
+    };
+    let width = area.width.min(64);
+    let text_width = width.saturating_sub(4);
+    let detail = proxy_dialog_detail();
+    let footer = format!(
+        "{} save · {} cancel",
+        app.keymap.hint(Context::Input, "open"),
+        app.keymap.hint(Context::Input, "cancel")
+    );
+    let detail_height = wrapped_height(&detail, text_width).saturating_add(1);
+    let footer_height = wrapped_height(&footer, text_width);
+    let status_height = app
+        .status_message
+        .as_deref()
+        .map_or(1, |message| wrapped_height(message, text_width).max(1));
+    let height = (detail_height + 3 + status_height + footer_height)
+        .saturating_add(2)
+        .min(area.height);
+    let popup = centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(" Termgram · Proxy ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::vertical([
+        Constraint::Length(detail_height),
+        Constraint::Length(3),
+        Constraint::Min(status_height),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled("Proxy", Style::default().bold())),
+            Line::from(Span::styled(detail, Style::default().fg(MUTED))),
+        ])
+        .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+    render_input(frame, chunks[1], input, false, "Enter to save", true);
+    match &app.status_message {
+        Some(message) => render_notice(frame, chunks[2], message, DANGER),
+        None => frame.render_widget(Paragraph::new(""), chunks[2]),
+    }
+    render_notice(frame, chunks[3], &footer, MUTED);
+}
+
+fn proxy_dialog_detail() -> String {
+    let mut detail = "SOCKS5 or HTTP proxy URL, for example socks5://127.0.0.1:9050 or \
+                      http://127.0.0.1:3128. Leave empty to connect directly."
+        .to_owned();
+    if crate::config::proxy_env_override().is_some() {
+        detail.push_str(
+            " TERMGRAM_PROXY overrides this setting and never falls back to a direct connection.",
+        );
+    }
+    detail
 }
 
 // Use the same cell-aware wrapping for measurement and rendering. A bounded
@@ -2201,8 +2267,8 @@ mod tests {
         app.screen = Screen::Fatal(format!("{} END_OF_ERROR", "request failed ".repeat(30)));
         let output = render_text(&app, 40, 24);
         assert!(output.contains("END_OF_ERROR"));
-        assert!(output.contains("q quit"));
-        assert!(output.contains("quit"));
+        assert!(output.contains("<C-c> quit"));
+        assert!(output.contains("p proxy"));
         assert!(render_text(&app, 40, 10).contains("Resize terminal for more"));
     }
 
@@ -2875,5 +2941,35 @@ mod tests {
         });
         render_text_mut(&mut app, 100, 24);
         assert!(app.request_visible_read().is_empty());
+    }
+
+    #[test]
+    fn proxy_dialog_renders_over_the_sign_in_screen() {
+        let mut app = AppState::with_ephemeral_settings(Settings::default());
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('p'));
+
+        let output = render_text(&app, 80, 24);
+        assert!(output.contains("SOCKS5 or HTTP proxy URL"), "{output}");
+        assert!(output.contains("Leave empty"), "{output}");
+        assert!(output.contains("Sign in"), "{output}");
+
+        app.status_message = Some("Invalid proxy: the scheme must be socks5 or http".to_owned());
+        let output = render_text(&app, 80, 24);
+        assert!(output.contains("Invalid proxy"), "{output}");
+
+        app.handle_action(KeyAction::Escape);
+        let output = render_text(&app, 80, 24);
+        assert!(!output.contains("Leave empty"), "{output}");
+        assert!(output.contains("p proxy"), "{output}");
+    }
+
+    #[test]
+    fn proxy_dialog_notes_the_environment_override() {
+        let mut app = AppState::with_ephemeral_settings(Settings::default());
+        app.handle_network(crate::event::NetworkEvent::Auth(AuthPrompt::Phone));
+        app.handle_action(KeyAction::Character('p'));
+        let output = render_text(&app, 80, 24);
+        assert!(!output.contains("TERMGRAM_PROXY"), "{output}");
     }
 }

@@ -24,6 +24,7 @@ dotenvy = "0.15"
 getrandom = "=0.4.3"
 futures-util = { version = "0.3.32", default-features = false }
 grammers-client = { version = "=0.10.0", default-features = false, features = ["fs"] }
+grammers-mtsender = { version = "=0.10.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.10.0", default-features = false, features = ["sqlite-storage"] }
 image = { version = "=0.25.10", default-features = false }
 moxcms = "=0.9.1"

@@ -317,6 +317,9 @@ pub struct App {
     /// Ignore late prompts from an authentication attempt after the user has
     /// explicitly restarted it, until the worker confirms the phone phase.
     auth_restart_pending: bool,
+    /// Open the proxy editor. Keys route to it from any screen until it
+    /// closes, so early screens can reconfigure the connection.
+    proxy_edit: Option<TextInput>,
     drafts: BTreeMap<crate::drafts::Key, crate::drafts::Draft>,
     draft_accounts: BTreeSet<i64>,
     draft_modified_accounts: BTreeSet<i64>,
@@ -438,6 +441,7 @@ impl Default for App {
             auth_progress: None,
             qr_render_mode: QrRenderMode::default(),
             auth_restart_pending: false,
+            proxy_edit: None,
             drafts: BTreeMap::new(),
             draft_accounts: BTreeSet::new(),
             draft_modified_accounts: BTreeSet::new(),
@@ -516,6 +520,12 @@ impl App {
     #[must_use]
     pub const fn settings_selection(&self) -> usize {
         self.settings_selection
+    }
+
+    /// The open proxy editor, when the shortcut opened it.
+    #[must_use]
+    pub fn proxy_edit(&self) -> Option<&TextInput> {
+        self.proxy_edit.as_ref()
     }
 
     #[must_use]
@@ -627,7 +637,11 @@ impl App {
 
     pub fn handle_key(&mut self, key: &KeyEvent) -> Vec<TelegramCommand> {
         use crate::keymap::{Context, Resolution};
-        let context = if matches!(self.screen, Screen::Auth(_)) {
+        // The proxy editor and the pre-connection screens need raw character
+        // input: the editor edits a URL, and `p` is the proxy shortcut there.
+        // Global bindings (quit, accounts) still apply as the fallback
+        // priority, and `q` keeps quitting via the screen dispatch.
+        let context = if self.proxy_edit.is_some() || !matches!(self.screen, Screen::Main) {
             Context::Input
         } else {
             match self.mode {
@@ -1377,6 +1391,9 @@ impl App {
     }
 
     pub fn handle_action(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        if self.proxy_edit.is_some() {
+            return self.handle_proxy_edit(action);
+        }
         if action == KeyAction::Quit
             || (action == KeyAction::Character('q')
                 && matches!(self.screen, Screen::Connecting | Screen::Fatal(_)))
@@ -1389,7 +1406,13 @@ impl App {
             _ => {}
         }
         match self.screen {
-            Screen::Connecting | Screen::Fatal(_) => Vec::new(),
+            Screen::Connecting | Screen::Fatal(_) => {
+                if action == KeyAction::Character('p') {
+                    self.open_proxy_editor()
+                } else {
+                    Vec::new()
+                }
+            }
             Screen::Auth(_) => self.handle_auth(action),
             Screen::Main => self.handle_main(action),
         }
@@ -2486,6 +2509,12 @@ impl App {
             self.force_redraw = true;
             return Vec::new();
         }
+        if action == KeyAction::Character('p')
+            && matches!(self.screen, Screen::Auth(AuthPhase::Phone))
+            && self.auth_progress.is_none()
+        {
+            return self.open_proxy_editor();
+        }
         if self.auth_progress.is_some() {
             if action == KeyAction::Redraw {
                 self.force_redraw = true;
@@ -2507,6 +2536,77 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// Open the proxy editor prefilled with the saved preference.
+    fn open_proxy_editor(&mut self) -> Vec<TelegramCommand> {
+        self.proxy_edit = Some(TextInput::from_value(self.settings.proxy.trim()));
+        self.status_message = None;
+        Vec::new()
+    }
+
+    fn handle_proxy_edit(&mut self, action: KeyAction) -> Vec<TelegramCommand> {
+        let Some(input) = self.proxy_edit.as_mut() else {
+            return Vec::new();
+        };
+        match action {
+            KeyAction::Escape => {
+                self.proxy_edit = None;
+                self.status_message = None;
+            }
+            KeyAction::Character(character) => input.insert(character),
+            KeyAction::Backspace => _ = input.backspace(),
+            KeyAction::Delete => _ = input.delete(),
+            KeyAction::Left => _ = input.move_left(),
+            KeyAction::Right => _ = input.move_right(),
+            KeyAction::Home => input.move_home(),
+            KeyAction::End => input.move_end(),
+            KeyAction::Clear => input.clear(),
+            KeyAction::DeleteWord => _ = input.delete_word_before(),
+            KeyAction::Redraw => self.force_redraw = true,
+            KeyAction::Enter => return self.save_proxy(),
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// Persist the edited proxy and restart the worker so the connection
+    /// picks it up through the same path as account switches.
+    fn save_proxy(&mut self) -> Vec<TelegramCommand> {
+        let value = self
+            .proxy_edit
+            .as_ref()
+            .map_or(String::new(), |input| input.value().trim().to_owned());
+        if !value.is_empty()
+            && let Err(error) = crate::config::validate_proxy(&value)
+        {
+            self.status_message = Some(format!("Invalid proxy: {error}"));
+            return Vec::new();
+        }
+        let previous = self.settings.clone();
+        self.settings.proxy = value;
+        match self.settings_path.as_deref() {
+            Some(path) => {
+                if let Err(error) = self.settings.clone().save_to(path) {
+                    self.settings = previous;
+                    self.status_message = Some(format!(
+                        "Could not save proxy: {}",
+                        sanitize_terminal_line(&error.to_string())
+                    ));
+                    return Vec::new();
+                }
+            }
+            None => self.status_message = Some("Proxy changed for this session".to_owned()),
+        }
+        self.proxy_edit = None;
+        let account = self.active_account();
+        self.reset_for_account_switch(account);
+        self.status_message = Some(if self.settings.proxy.is_empty() {
+            "Proxy cleared; reconnecting directly…".to_owned()
+        } else {
+            "Proxy saved; reconnecting…".to_owned()
+        });
+        vec![TelegramCommand::SwitchAccount { account }]
     }
 
     fn submit_auth(&mut self) -> Vec<TelegramCommand> {
@@ -2936,11 +3036,11 @@ impl App {
             return Vec::new();
         }
 
-        let previous = self.settings;
+        let previous = self.settings.clone();
         self.settings.active_account = account;
         self.settings.account_count = account_count;
         if let Some(path) = self.settings_path.as_deref()
-            && let Err(error) = self.settings.save_to(path)
+            && let Err(error) = self.settings.clone().save_to(path)
         {
             self.settings = previous;
             self.status_message = Some(format!(
@@ -2956,7 +3056,7 @@ impl App {
 
     fn reset_for_account_switch(&mut self, account: u8) {
         self.cancel_alerts();
-        let settings = self.settings;
+        let settings = self.settings.clone();
         let settings_path = self.settings_path.clone();
         let available_update = self.available_update.clone();
         let terminal_focused = self.terminal_focused;
@@ -2999,7 +3099,7 @@ impl App {
     }
 
     fn toggle_selected_setting(&mut self) {
-        let previous = self.settings;
+        let previous = self.settings.clone();
         let previous_available_update = self.available_update.clone();
         match self.settings_selection {
             0 => {
@@ -3023,8 +3123,8 @@ impl App {
             self.status_message = Some("Settings changed for this session".to_owned());
             return;
         };
-        if let Err(error) = self.settings.save_to(path) {
-            self.settings = previous;
+        if let Err(error) = self.settings.clone().save_to(path) {
+            self.settings = previous.clone();
             self.available_update = previous_available_update;
             self.status_message = Some(format!(
                 "Could not save settings: {}",
@@ -10459,5 +10559,119 @@ mod tests {
         assert!(app.search.error.is_some());
         assert!(!app.search.editing);
         assert_eq!(app.run_binding("open", 1), [TelegramCommand::CancelSearch]);
+    }
+
+    #[test]
+    fn proxy_editor_opens_from_the_sign_in_screen() {
+        let settings = Settings {
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let mut app = App::with_ephemeral_settings(settings);
+        app.screen = Screen::Auth(AuthPhase::Phone);
+
+        app.handle_action(KeyAction::Character('p'));
+
+        let input = app.proxy_edit().expect("proxy editor opens");
+        assert_eq!(input.value(), "socks5://127.0.0.1:9050");
+    }
+
+    #[test]
+    fn proxy_editor_opens_from_the_connecting_and_fatal_screens() {
+        let mut app = App::new();
+        app.screen = Screen::Connecting;
+        app.handle_action(KeyAction::Character('p'));
+        assert!(app.proxy_edit().is_some());
+        assert_eq!(
+            app.proxy_edit().map(|input| input.value().to_owned()),
+            Some(String::new())
+        );
+
+        let mut app = App::new();
+        app.screen = Screen::Fatal("connection lost".to_owned());
+        app.handle_action(KeyAction::Character('p'));
+        assert!(app.proxy_edit().is_some());
+    }
+
+    #[test]
+    fn fatal_screen_shortcut_survives_the_keymap_context() {
+        use yazi_term::event::KeyCode;
+
+        let mut app = App::new();
+        app.screen = Screen::Fatal("connection lost".to_owned());
+        app.handle_key(&KeyEvent::new(KeyCode::Char('p'), Modifiers::empty()));
+        assert!(app.proxy_edit().is_some());
+        app.handle_key(&KeyEvent::new(KeyCode::Char('x'), Modifiers::empty()));
+        app.handle_key(&KeyEvent::new(KeyCode::Escape, Modifiers::empty()));
+        assert!(app.proxy_edit().is_none());
+    }
+
+    #[test]
+    fn proxy_editor_escape_closes_without_saving() {
+        let mut app = App::new();
+        app.screen = Screen::Auth(AuthPhase::Phone);
+        app.handle_action(KeyAction::Character('p'));
+        app.handle_action(KeyAction::Character('x'));
+        app.handle_action(KeyAction::Escape);
+        assert!(app.proxy_edit().is_none());
+        assert_eq!(app.settings().proxy, "");
+    }
+
+    #[test]
+    fn saving_a_proxy_persists_it_and_restarts_the_connection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("settings.conf");
+        let mut app = App::with_settings(Settings::default(), path.clone());
+        app.screen = Screen::Auth(AuthPhase::Phone);
+        app.handle_action(KeyAction::Character('p'));
+        for character in "socks5://10.0.0.1:1080".chars() {
+            app.handle_action(KeyAction::Character(character));
+        }
+
+        let commands = app.handle_action(KeyAction::Enter);
+
+        assert_eq!(commands, [TelegramCommand::SwitchAccount { account: 1 }]);
+        assert!(app.proxy_edit().is_none());
+        assert_eq!(app.settings().proxy, "socks5://10.0.0.1:1080");
+        let persisted = crate::config::Settings::load_from(&path).expect("persisted settings");
+        assert_eq!(persisted.proxy, "socks5://10.0.0.1:1080");
+    }
+
+    #[test]
+    fn clearing_the_proxy_persists_an_empty_value_and_restarts() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("settings.conf");
+        let settings = Settings {
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let mut app = App::with_settings(settings, path);
+        app.screen = Screen::Fatal("connection lost".to_owned());
+        app.handle_action(KeyAction::Character('p'));
+        app.handle_action(KeyAction::Clear);
+
+        let commands = app.handle_action(KeyAction::Enter);
+
+        assert_eq!(commands, [TelegramCommand::SwitchAccount { account: 1 }]);
+        assert_eq!(app.settings().proxy, "");
+    }
+
+    #[test]
+    fn invalid_proxy_input_reports_an_error_and_stays_open() {
+        let mut app = App::new();
+        app.screen = Screen::Auth(AuthPhase::Phone);
+        app.handle_action(KeyAction::Character('p'));
+        for character in "https://10.0.0.1:1080".chars() {
+            app.handle_action(KeyAction::Character(character));
+        }
+
+        assert_eq!(app.handle_action(KeyAction::Enter), Vec::new());
+        assert!(app.proxy_edit().is_some());
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Invalid proxy"))
+        );
+        assert_eq!(app.settings().proxy, "");
     }
 }

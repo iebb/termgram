@@ -30,6 +30,37 @@ pub(crate) type Transport = transport::Full;
 
 type InvokeResponse = Vec<u8>;
 
+/// How long to wait for a proxied connection attempt before treating it as
+/// failed and, when fallback is enabled, trying a direct connection.
+#[cfg(feature = "proxy")]
+const PROXY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Build the ordered connection attempts for one datacenter address. With the
+/// `proxy` feature, a configured proxy comes first and a direct attempt is
+/// appended only when [`ConnectionParams::proxy_fallback`] is enabled;
+/// otherwise the address is always contacted directly.
+fn connection_attempts(address: std::net::SocketAddr, params: &ConnectionParams) -> Vec<ServerAddr> {
+    #[cfg(feature = "proxy")]
+    match params.proxy_url.as_deref() {
+        Some(proxy) => {
+            let mut attempts = vec![ServerAddr::Proxied {
+                address,
+                proxy: proxy.to_owned(),
+            }];
+            if params.proxy_fallback {
+                attempts.push(ServerAddr::Tcp { address });
+            }
+            attempts
+        }
+        None => vec![ServerAddr::Tcp { address }],
+    }
+    #[cfg(not(feature = "proxy"))]
+    {
+        let _ = params;
+        vec![ServerAddr::Tcp { address }]
+    }
+}
+
 enum Request {
     Invoke {
         dc_id: i32,
@@ -307,16 +338,7 @@ impl SenderPoolRunner {
             dc_option.ipv4.into()
         };
 
-        #[cfg(feature = "proxy")]
-        let addr = || {
-            if let Some(proxy) = self.connection_params.proxy_url.clone() {
-                ServerAddr::Proxied { address, proxy }
-            } else {
-                ServerAddr::Tcp { address }
-            }
-        };
-        #[cfg(not(feature = "proxy"))]
-        let addr = || ServerAddr::Tcp { address };
+        let attempts = connection_attempts(address, &self.connection_params);
 
         let init_connection = tl::functions::InvokeWithLayer {
             layer: tl::LAYER,
@@ -334,18 +356,12 @@ impl SenderPoolRunner {
             },
         };
 
-        let mut sender = if let Some(auth_key) = dc_option.auth_key {
-            connect_with_auth(transport(), addr(), auth_key)
-                .await
-                .map_err(InvocationError::Io)?
-        } else {
-            connect(transport(), addr()).await?
-        };
+        let mut sender = self.establish_stream(dc_option, transport, &attempts).await?;
 
         let enums::Config::Config(remote_config) = match sender.invoke(&init_connection).await {
             Ok(config) => config,
             Err(InvocationError::Transport(transport::Error::BadStatus { status: 404 })) => {
-                sender = connect(transport(), addr()).await?;
+                sender = self.establish_stream(dc_option, transport, &attempts).await?;
                 sender.invoke(&init_connection).await?
             }
             Err(e) => return Err(e),
@@ -354,6 +370,63 @@ impl SenderPoolRunner {
         self.update_config(remote_config).await?;
 
         Ok(sender)
+    }
+
+    /// Connect to a datacenter by trying each configured attempt in order.
+    ///
+    /// A proxied attempt is bounded by [`PROXY_CONNECT_TIMEOUT`]; when it fails
+    /// with an I/O error or the timeout expires and a direct attempt follows
+    /// (see [`ConnectionParams::proxy_fallback`]), the connection falls back to
+    /// it. Direct attempts are never retried or replaced.
+    async fn establish_stream(
+        &self,
+        dc_option: &DcOption,
+        transport: impl Fn() -> Transport,
+        attempts: &[ServerAddr],
+    ) -> Result<Sender<transport::Full, mtp::Encrypted>, InvocationError> {
+        for (index, addr) in attempts.iter().enumerate() {
+            let attempt = async {
+                if let Some(auth_key) = dc_option.auth_key {
+                    connect_with_auth(transport(), addr.clone(), auth_key)
+                        .await
+                        .map_err(InvocationError::Io)
+                } else {
+                    connect(transport(), addr.clone()).await
+                }
+            };
+
+            #[cfg(feature = "proxy")]
+            let result = if matches!(addr, ServerAddr::Proxied { .. }) {
+                match tokio::time::timeout(PROXY_CONNECT_TIMEOUT, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(InvocationError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "proxy connection timed out",
+                    ))),
+                }
+            } else {
+                attempt.await
+            };
+
+            #[cfg(not(feature = "proxy"))]
+            let result = attempt.await;
+
+            match result {
+                Ok(sender) => return Ok(sender),
+                Err(error) => {
+                    #[cfg(feature = "proxy")]
+                    let fallback = matches!(addr, ServerAddr::Proxied { .. })
+                        && matches!(error, InvocationError::Io(_))
+                        && index + 1 < attempts.len();
+                    #[cfg(not(feature = "proxy"))]
+                    let fallback = false;
+                    if !fallback {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        unreachable!("every datacenter has at least one connection attempt")
     }
 
     async fn update_config(&mut self, config: tl::types::Config) -> Result<(), InvocationError> {
@@ -529,5 +602,34 @@ where
                 .await
                 .map_err(|e| e.into())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(feature = "proxy")]
+    fn proxy_attempts_fall_back_only_when_enabled() {
+        use super::*;
+        let address = std::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443));
+        let params = ConnectionParams::default();
+
+        assert!(matches!(
+            connection_attempts(address, &params).as_slice(),
+            [ServerAddr::Tcp { .. }]
+        ));
+
+        let mut params = ConnectionParams::default();
+        params.proxy_url = Some("socks5://127.0.0.1:9050".to_owned());
+        assert!(matches!(
+            connection_attempts(address, &params).as_slice(),
+            [ServerAddr::Proxied { .. }]
+        ));
+
+        params.proxy_fallback = true;
+        assert!(matches!(
+            connection_attempts(address, &params).as_slice(),
+            [ServerAddr::Proxied { .. }, ServerAddr::Tcp { .. }]
+        ));
     }
 }

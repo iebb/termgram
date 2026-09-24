@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use termgram::app::{AppState, Screen};
-use termgram::config::{Config, ReleaseChannel, Settings};
+use termgram::config::{Config, ReleaseChannel, Settings, resolve_proxy};
 use termgram::event::{AppEvent, ConnectionStatus, NetworkEvent, TelegramCommand};
 use termgram::media::PreviewRenderer;
 use termgram::telegram::{self, TelegramHandle};
@@ -111,16 +111,21 @@ async fn main() -> Result<()> {
     if let Err(error) = app.load_navigation() {
         startup_warning = Some(format!("Could not load navigation preferences: {error:#}"));
     }
+    let proxy = resolve_proxy(&settings);
+    if let Some(warning) = proxy.warning {
+        startup_warning = Some(warning);
+    }
     if let Some(warning) = &startup_warning {
         app.handle_network(NetworkEvent::Error(warning.clone()));
     }
-    let mut update_check = spawn_update_check(settings);
-    let mut update_preferences = settings;
+    let mut update_check = spawn_update_check(&settings);
+    let mut update_preferences = settings.clone();
 
     let mut measurement = None;
     let (mut commands, mut events, mut worker, mut base_config, mut active_chat) =
         match Config::load().map(|mut config| {
             config.measure_latency = app.keymap.statusline.measures_latency();
+            config.proxy = proxy.proxy;
             config
         }) {
             Ok(config) => match config.for_account(settings.active_account) {
@@ -336,7 +341,7 @@ async fn main() -> Result<()> {
                         Err(_) => {}
                     }
                 } else if app.settings().automatic_update_checks {
-                    update_check = spawn_update_check(*app.settings());
+                    update_check = spawn_update_check(app.settings());
                 }
                 Vec::new()
             }
@@ -431,6 +436,7 @@ async fn main() -> Result<()> {
             if let Err(error) = restart_telegram_worker(
                 config,
                 account,
+                resolve_proxy(app.settings()).proxy,
                 &mut commands,
                 &mut events,
                 &mut worker,
@@ -587,7 +593,7 @@ fn load_app_settings() -> (AppState, Settings) {
                 automatic_update_checks: false,
                 ..Settings::default()
             };
-            let mut app = AppState::with_ephemeral_settings(settings);
+            let mut app = AppState::with_ephemeral_settings(settings.clone());
             app.handle_network(NetworkEvent::Error(format!(
                 "Could not locate settings: {error:#}"
             )));
@@ -595,13 +601,13 @@ fn load_app_settings() -> (AppState, Settings) {
         }
     };
     match Settings::load_from(&path) {
-        Ok(settings) => (AppState::with_settings(settings, path), settings),
+        Ok(settings) => (AppState::with_settings(settings.clone(), path), settings),
         Err(error) => {
             let settings = Settings {
                 automatic_update_checks: false,
                 ..Settings::default()
             };
-            let mut app = AppState::with_settings(settings, path);
+            let mut app = AppState::with_settings(settings.clone(), path);
             app.handle_network(NetworkEvent::Error(format!(
                 "Could not load settings: {error:#}"
             )));
@@ -610,21 +616,22 @@ fn load_app_settings() -> (AppState, Settings) {
     }
 }
 
-fn spawn_update_check(settings: Settings) -> Option<UpdateCheck> {
+fn spawn_update_check(settings: &Settings) -> Option<UpdateCheck> {
     if !settings.automatic_update_checks {
         return None;
     }
+    let release_channel = settings.release_channel;
     let (sender, receiver) = oneshot::channel();
     thread::Builder::new()
         .name("termgram-update-check".to_owned())
         .spawn(move || {
-            let result = update::check_if_due(settings.release_channel)
-                .map_err(|error| format!("{error:#}"));
+            let result =
+                update::check_if_due(release_channel).map_err(|error| format!("{error:#}"));
             drop(sender.send(result));
         })
         .ok()?;
     Some(UpdateCheck {
-        channel: settings.release_channel,
+        channel: release_channel,
         receiver,
     })
 }
@@ -634,12 +641,12 @@ fn synchronize_update_preferences(
     previous: &mut Settings,
     update_check: &mut Option<UpdateCheck>,
 ) {
-    let current = *app.settings();
+    let current = app.settings().clone();
     if current.automatic_update_checks != previous.automatic_update_checks
         || current.release_channel != previous.release_channel
     {
         if current.automatic_update_checks && update_check.is_none() {
-            *update_check = spawn_update_check(current);
+            *update_check = spawn_update_check(&current);
         }
         app.clear_available_update();
     }
@@ -743,6 +750,7 @@ fn reject_overflow(app: &mut AppState, command: TelegramCommand) {
 async fn restart_telegram_worker(
     base_config: &Config,
     account: u8,
+    proxy: Option<termgram::config::ProxyRoute>,
     commands: &mut Option<mpsc::Sender<TelegramCommand>>,
     events: &mut Option<mpsc::Receiver<NetworkEvent>>,
     worker: &mut Option<tokio::task::JoinHandle<()>>,
@@ -762,7 +770,8 @@ async fn restart_telegram_worker(
         drop(task.await);
     }
 
-    let selected = base_config.for_account(account)?;
+    let mut selected = base_config.for_account(account)?;
+    selected.proxy = proxy;
     let TelegramHandle {
         measure_latency,
         commands: next_commands,
@@ -848,7 +857,7 @@ mod tests {
             ..Settings::default()
         };
         let mut app = AppState::with_settings(
-            settings,
+            settings.clone(),
             std::env::temp_dir().join("unused-termgram-settings"),
         );
         app.set_available_update("0.1.9");

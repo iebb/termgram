@@ -373,6 +373,7 @@ mod tests {
             measure_latency: false,
             session_path: directory.path().join("unused.session"),
             state_path: path.clone(),
+            proxy: None,
         });
         writer.queue(Snapshot::from([(100, vec![stored(7, 0, "first")])]));
         let final_snapshot = Snapshot::from([

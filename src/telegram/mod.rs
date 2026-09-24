@@ -246,11 +246,16 @@ async fn run(
             .with_context(|| format!("failed to open {}", config.session_path.display()))?,
     );
     config.protect_session_file()?;
+    let mut connection_params = grammers_mtsender::ConnectionParams::default();
+    if let Some(proxy) = &config.proxy {
+        connection_params.proxy_url = Some(proxy.url.clone());
+        connection_params.proxy_fallback = proxy.fallback;
+    }
     let SenderPool {
         runner,
         handle,
         mut updates,
-    } = SenderPool::new(session.clone(), config.api_id);
+    } = SenderPool::with_configuration(session.clone(), config.api_id, connection_params);
     let client = Client::new(handle.clone());
     // JoinSet aborts the sender on account switches and initialization failures,
     // including when the owner itself is aborted during shutdown.

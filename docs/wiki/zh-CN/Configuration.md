@@ -87,6 +87,19 @@ statusline = {
 测量失效，超过 90 秒的样本不再显示，切换账号清空观测。DC 是会话的主数据中心，
 不代表全部媒体传输服务器，也不根据地理位置猜测。
 
+## 代理
+
+配置了 SOCKS5 或 HTTP 代理后，Termgram 会经由代理连接 Telegram。在登录、连接
+中或错误屏按 `p` 打开代理编辑器，之后也可以在同一批界面随时修改。编辑器会校验
+`socks5://host:port` 或 `http://host:port`（凭据可选；HTTP 代理走 CONNECT 隧道）
+并保存到 `settings.conf`。保存后会重启 Telegram 连接；留空表示直连。
+
+保存的代理会优先用于每次连接。若代理不可达，Termgram 会在有限的超时后自动
+回退为直连。
+
+设置 `TERMGRAM_PROXY`（同样的地址格式）可以覆盖已保存的偏好。环境变量是严格
+的：连接绝不会绕过它直连回退；值无效时本次运行禁用代理并给出启动警告。
+
 ## 侧栏
 
 ```lua
@@ -129,6 +142,7 @@ Tab/Shift-Tab 或返回 Chats 也会展开侧栏。终端支持重复事件时�
 | `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` | 源码构建的应用凭据；环境或 `.env` 优先于内置值 |
 | `TERMGRAM_SESSION` | 指定账号 1 会话路径，其他槽位据此派生 |
 | `TERMGRAM_CONFIG` | 指定 Lua 文件，在启动前的 shell 中设置 |
+| `TERMGRAM_PROXY` | SOCKS5 或 HTTP 代理地址，如 `socks5://127.0.0.1:9050`；严格模式，见[代理](#代理) |
 | `TERMGRAM_TMUX_PASSTHROUGH=1` | 启用终端透传设置，见[终端](Terminal.md) |
 
 Lua 在凭据 `.env` 之前加载，因此 `TERMGRAM_CONFIG` 必须已存在于进程环境。

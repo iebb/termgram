@@ -84,7 +84,10 @@ impl DownloadBehavior {
 
 /// Small, non-sensitive preferences stored in Termgram's platform config
 /// directory. Telegram credentials and sessions are deliberately excluded.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The proxy URL may embed a username and password, so [`Debug`]
+/// redacts the value instead of deriving it.
+#[derive(Clone, Eq, PartialEq)]
 pub struct Settings {
     pub automatic_update_checks: bool,
     pub release_channel: ReleaseChannel,
@@ -97,6 +100,41 @@ pub struct Settings {
     pub active_account: u8,
     /// Number of local session slots created by the user.
     pub account_count: u8,
+    /// SOCKS5 or HTTP proxy URL, empty for direct connections. A saved proxy is
+    /// preferred for every connection and falls back to a direct connection
+    /// when unreachable. `TERMGRAM_PROXY` overrides it without fallback.
+    pub proxy: String,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Settings")
+            .field("automatic_update_checks", &self.automatic_update_checks)
+            .field("release_channel", &self.release_channel)
+            .field("download_behavior", &self.download_behavior)
+            .field("show_message_ids", &self.show_message_ids)
+            .field("active_account", &self.active_account)
+            .field("account_count", &self.account_count)
+            .field("proxy", &redact_proxy(&self.proxy))
+            .finish()
+    }
+}
+
+/// Format a proxy URL for diagnostics, hiding embedded credentials.
+fn redact_proxy(proxy: &str) -> String {
+    match url::Url::parse(proxy) {
+        Ok(mut url) => {
+            if !url.username().is_empty() {
+                url.set_username("redacted").ok();
+            }
+            if url.password().is_some() {
+                url.set_password(Some("redacted")).ok();
+            }
+            url.to_string()
+        }
+        Err(_) => "[invalid proxy URL]".to_owned(),
+    }
 }
 
 impl Default for Settings {
@@ -108,6 +146,7 @@ impl Default for Settings {
             show_message_ids: false,
             active_account: 1,
             account_count: 1,
+            proxy: String::new(),
         }
     }
 }
@@ -188,13 +227,14 @@ impl Settings {
 
     fn serialize(self) -> String {
         format!(
-            "version={SETTINGS_FORMAT_VERSION}\nautomatic_update_checks={}\nrelease_channel={}\ndownload_behavior={}\nshow_message_ids={}\nactive_account={}\naccount_count={}\n",
+            "version={SETTINGS_FORMAT_VERSION}\nautomatic_update_checks={}\nrelease_channel={}\ndownload_behavior={}\nshow_message_ids={}\nactive_account={}\naccount_count={}\nproxy={}\n",
             self.automatic_update_checks,
             self.release_channel.persisted(),
             self.download_behavior.persisted(),
             self.show_message_ids,
             self.active_account,
             self.account_count,
+            self.proxy,
         )
     }
 }
@@ -286,6 +326,109 @@ pub(crate) fn write_preferences(path: &Path, contents: &[u8]) -> Result<()> {
     result
 }
 
+/// An ordered proxy route for Telegram connections.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyRoute {
+    /// SOCKS5 or HTTP CONNECT proxy URL, including a required port.
+    pub url: String,
+    /// Whether a failed proxy connection may fall back to a direct one.
+    ///
+    /// Saved proxies prefer the proxy but fall back to direct connections;
+    /// the `TERMGRAM_PROXY` environment variable is strict and never falls
+    /// back.
+    pub fallback: bool,
+}
+
+/// The proxy resolved for this run, plus a warning for ignored invalid input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProxyResolution {
+    pub proxy: Option<ProxyRoute>,
+    pub warning: Option<String>,
+}
+
+/// Validate a SOCKS5 or HTTP CONNECT proxy URL the way the Telegram
+/// connection accepts it.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when the value is not a `socks5://` or
+/// `http://` URL with a host and an explicit port.
+pub fn validate_proxy(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value).map_err(|error| error.to_string())?;
+    if !matches!(url.scheme(), "socks5" | "http") {
+        return Err("the scheme must be socks5 or http".to_owned());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("a host is required".to_owned());
+    }
+    if url.port().is_none() {
+        return Err("an explicit port is required".to_owned());
+    }
+    Ok(())
+}
+
+/// The effective `TERMGRAM_PROXY` value, when set to a non-empty string.
+///
+/// Reads the `.env` file first, matching the credential configuration.
+#[must_use]
+pub fn proxy_env_override() -> Option<String> {
+    dotenvy::dotenv().ok();
+    env::var("TERMGRAM_PROXY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Resolve the proxy used for Telegram connections.
+///
+/// `TERMGRAM_PROXY` overrides the saved preference and is strict: when set,
+/// connections never bypass the proxy with a direct fallback, and an invalid
+/// value disables proxying entirely with a warning. The saved preference
+/// prefers the proxy but falls back to direct connections when unreachable.
+/// An invalid saved value is ignored with a warning.
+#[must_use]
+pub fn resolve_proxy(settings: &Settings) -> ProxyResolution {
+    resolve_proxy_with(proxy_env_override(), settings)
+}
+
+fn resolve_proxy_with(env_override: Option<String>, settings: &Settings) -> ProxyResolution {
+    if let Some(value) = env_override {
+        return match validate_proxy(&value) {
+            Ok(()) => ProxyResolution {
+                proxy: Some(ProxyRoute {
+                    url: value,
+                    fallback: false,
+                }),
+                warning: None,
+            },
+            Err(error) => ProxyResolution {
+                proxy: None,
+                warning: Some(format!("Ignoring invalid TERMGRAM_PROXY: {error}")),
+            },
+        };
+    }
+    let value = settings.proxy.trim();
+    if value.is_empty() {
+        return ProxyResolution {
+            proxy: None,
+            warning: None,
+        };
+    }
+    match validate_proxy(value) {
+        Ok(()) => ProxyResolution {
+            proxy: Some(ProxyRoute {
+                url: value.to_owned(),
+                fallback: true,
+            }),
+            warning: None,
+        },
+        Err(error) => ProxyResolution {
+            proxy: None,
+            warning: Some(format!("Ignoring the invalid saved proxy: {error}")),
+        },
+    }
+}
+
 fn parse_settings(text: &str) -> Result<Settings> {
     let mut settings = Settings::default();
     for (index, line) in text.lines().enumerate() {
@@ -338,6 +481,9 @@ fn parse_settings(text: &str) -> Result<Settings> {
                     .trim()
                     .parse::<u8>()
                     .context("account_count must be a number")?;
+            }
+            "proxy" => {
+                value.trim().clone_into(&mut settings.proxy);
             }
             _ => {}
         }
@@ -422,6 +568,9 @@ pub struct Config {
     pub state_path: PathBuf,
     /// Enable bounded background Ping observations for the Lua statusline.
     pub measure_latency: bool,
+    /// Proxy used for every connection, resolved from the environment
+    /// and saved preferences. `None` connects directly.
+    pub proxy: Option<ProxyRoute>,
 }
 
 impl std::fmt::Debug for Config {
@@ -433,6 +582,10 @@ impl std::fmt::Debug for Config {
             .field("session_path", &self.session_path)
             .field("state_path", &self.state_path)
             .field("measure_latency", &self.measure_latency)
+            .field(
+                "proxy",
+                &self.proxy.as_ref().map(|route| redact_proxy(&route.url)),
+            )
             .finish()
     }
 }
@@ -490,6 +643,7 @@ impl Config {
             state_path: PathBuf::from(state_path),
             session_path,
             measure_latency: false,
+            proxy: None,
         })
     }
 
@@ -527,6 +681,7 @@ impl Config {
             state_path: self.state_path.clone(),
             session_path,
             measure_latency: self.measure_latency,
+            proxy: self.proxy.clone(),
         })
     }
 
@@ -688,7 +843,7 @@ mod tests {
 
     use super::{
         Config, DownloadBehavior, MAX_ACCOUNTS, ReleaseChannel, Settings,
-        choose_default_session_path, credential,
+        choose_default_session_path, credential, resolve_proxy_with, validate_proxy,
     };
 
     fn temporary_settings_path(label: &str) -> PathBuf {
@@ -753,7 +908,7 @@ mod tests {
     fn settings_save_atomically_and_can_be_replaced() {
         let path = temporary_settings_path("replace");
         let first = Settings::default();
-        first.save_to(&path).expect("first save");
+        first.clone().save_to(&path).expect("first save");
         assert_eq!(Settings::load_from(&path).expect("first load"), first);
 
         let second = Settings {
@@ -763,9 +918,11 @@ mod tests {
             show_message_ids: true,
             active_account: 2,
             account_count: 3,
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
         };
-        second.save_to(&path).expect("replacement save");
+        second.clone().save_to(&path).expect("replacement save");
         assert_eq!(Settings::load_from(&path).expect("second load"), second);
+        assert_eq!(second.proxy, "socks5://127.0.0.1:9050");
         let directory = path.parent().expect("settings directory").to_path_buf();
         let leftovers = std::fs::read_dir(&directory)
             .expect("settings directory")
@@ -838,6 +995,7 @@ mod tests {
             api_id: 42,
             api_hash: "super-secret".to_owned(),
             session_path: PathBuf::from("session.db"),
+            proxy: None,
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("[redacted]"));
@@ -852,6 +1010,7 @@ mod tests {
             api_id: 42,
             api_hash: "secret".to_owned(),
             session_path: PathBuf::from("state/custom.session"),
+            proxy: None,
         };
         assert_eq!(
             base.for_account(1).expect("first account").session_path,
@@ -914,6 +1073,7 @@ mod tests {
             api_id: 42,
             api_hash: "secret".to_owned(),
             session_path: session_path.clone(),
+            proxy: None,
         };
 
         config.prepare_session_dir().expect("prepare session");
@@ -962,5 +1122,83 @@ mod tests {
         std::fs::remove_dir(accounts_directory).expect("remove accounts directory");
         std::fs::remove_file(session_path).expect("remove test session");
         std::fs::remove_dir(root).expect("remove test directory");
+    }
+
+    #[test]
+    fn proxy_validation_requires_supported_scheme_host_and_port() {
+        assert!(validate_proxy("socks5://127.0.0.1:9050").is_ok());
+        assert!(validate_proxy("socks5://user:pass@example.com:5678").is_ok());
+        assert!(validate_proxy("http://127.0.0.1:3128").is_ok());
+        assert!(validate_proxy("http://user:pass@example.com:8080").is_ok());
+        assert!(validate_proxy("https://127.0.0.1:3128").is_err());
+        assert!(validate_proxy("socks5://127.0.0.1").is_err());
+        assert!(validate_proxy("not a url").is_err());
+    }
+
+    #[test]
+    fn saved_proxy_prefers_the_proxy_but_falls_back_to_direct() {
+        let settings = Settings {
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let resolved = resolve_proxy_with(None, &settings);
+        let route = resolved.proxy.expect("saved proxy");
+        assert_eq!(route.url, "socks5://127.0.0.1:9050");
+        assert!(route.fallback);
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn empty_preferences_connect_directly() {
+        let resolved = resolve_proxy_with(None, &Settings::default());
+        assert!(resolved.proxy.is_none());
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn environment_proxy_is_strict_and_overrides_the_saved_preference() {
+        let saved = Settings {
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let resolved = resolve_proxy_with(Some("socks5://10.0.0.1:1080".to_owned()), &saved);
+        let route = resolved.proxy.expect("environment proxy");
+        assert_eq!(route.url, "socks5://10.0.0.1:1080");
+        assert!(!route.fallback);
+        assert!(resolved.warning.is_none());
+    }
+
+    #[test]
+    fn invalid_environment_proxy_is_ignored_with_a_warning_and_never_falls_back() {
+        let saved = Settings {
+            proxy: "socks5://127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let resolved = resolve_proxy_with(Some("https://10.0.0.1:1080".to_owned()), &saved);
+        assert!(resolved.proxy.is_none());
+        assert!(resolved.warning.is_some());
+    }
+
+    #[test]
+    fn invalid_saved_proxy_is_ignored_with_a_warning() {
+        let settings = Settings {
+            proxy: "nonsense".to_owned(),
+            ..Settings::default()
+        };
+        let resolved = resolve_proxy_with(None, &settings);
+        assert!(resolved.proxy.is_none());
+        assert!(resolved.warning.is_some());
+    }
+
+    #[test]
+    fn debug_output_redacts_proxy_credentials() {
+        let settings = Settings {
+            proxy: "socks5://user:secret@127.0.0.1:9050".to_owned(),
+            ..Settings::default()
+        };
+        let debug = format!("{settings:?}");
+        assert!(debug.contains("redacted"));
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("socks5://"));
     }
 }

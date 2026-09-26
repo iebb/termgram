@@ -1,28 +1,28 @@
 class Termgram < Formula
   desc "Focused, keyboard-first Telegram client for the terminal"
   homepage "https://github.com/iebb/termgram"
-  version "0.1.34"
+  version "0.1.40"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.34/termgram-0.1.34-macos.tar.gz"
-      sha256 "abf65a33f98d37000c73fe5d403c1b518ec8ee852ce3b1cfde113a29ef45be69"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.40/termgram-0.1.40-macos.tar.gz"
+      sha256 "f296b5ee267a29c3a3d4feec635d8b9bcdf793ff762b28ee42e9cc381389129d"
     end
     on_intel do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.34/termgram-0.1.34-macos-x86_64.tar.gz"
-      sha256 "5eda3862eb54a1514078d3d6214e4ac64278ed626c29d6f3fcaa3832fad4779b"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.40/termgram-0.1.40-macos-x86_64.tar.gz"
+      sha256 "95f26153f487522fbe179ef56ae13b6ce109c1c168c9771f10fa29746263425b"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.34/termgram-0.1.34-linux-aarch64.tar.gz"
-      sha256 "5ad72eb8bce543129456869c5372a368d3d6598a1639a7de6efc08802a516a8a"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.40/termgram-0.1.40-linux-aarch64.tar.gz"
+      sha256 "66ebb4138964f84d64143113cca99a33259c96f627fbc9af6591f63935bf22db"
     end
     on_intel do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.34/termgram-0.1.34-linux.tar.gz"
-      sha256 "d879cc9fcbfe2d02daf66359b96ea7f3fc7f18dcb32da804117580c5db3596c9"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.40/termgram-0.1.40-linux.tar.gz"
+      sha256 "d2d0eaed235c567593e7187d28fc67ff6b8d416ed8e3c73c3c78ad0d7685edd6"
     end
   end
 

@@ -17,7 +17,7 @@ use crate::{
     model::{Chat, ChatId, Delivery, Message},
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_MESSAGES: i64 = 100_000;
 const MAX_CHAT_MESSAGES: i64 = 5_000;
 
@@ -108,6 +108,9 @@ impl Store {
         }
         if version < 6 {
             transaction.execute_batch("CREATE INDEX messages_poll ON messages(json_extract(data,'$.poll.definition.id')); PRAGMA user_version=6;").await?;
+        }
+        if version < 7 {
+            transaction.execute_batch("CREATE TABLE previews (chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL, path TEXT NOT NULL, source_id INTEGER, PRIMARY KEY(chat_id, message_id)); PRAGMA user_version=7;").await?;
         }
         transaction.commit().await?;
         let revision = metadata(&connection, "revision")
@@ -236,6 +239,22 @@ impl Store {
         media_id: Option<i64>,
     ) -> Result<Option<std::path::PathBuf>> {
         let row = self.connection.query("SELECT path FROM attachments WHERE chat_id=?1 AND message_id=?2 AND source_id IS ?3", params![chat_id, message_id, media_id]).await?.next().await?;
+        let path = row
+            .map(|row| row.get::<String>(0).map(std::path::PathBuf::from))
+            .transpose()?;
+        Ok(path.filter(|path| path.is_file()))
+    }
+
+    /// A downloaded inline preview, only while it still matches the cached
+    /// message's media. Missing files and edited media are cache misses.
+    /// # Errors
+    /// Returns database errors. Missing files are treated as cache misses.
+    pub async fn preview(
+        &self,
+        chat_id: ChatId,
+        message_id: i32,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let row = self.connection.query("SELECT path FROM previews WHERE chat_id=?1 AND message_id=?2 AND source_id IS (SELECT json_extract(data,'$.attachment.source_id') FROM messages WHERE chat_id=?1 AND id=?2)", params![chat_id, message_id]).await?.next().await?;
         let path = row
             .map(|row| row.get::<String>(0).map(std::path::PathBuf::from))
             .transpose()?;
@@ -847,6 +866,12 @@ impl Store {
                                     params![message.chat_id, message.id],
                                 )
                                 .await?;
+                            transaction
+                                .execute(
+                                    "DELETE FROM previews WHERE chat_id=?1 AND message_id=?2",
+                                    params![message.chat_id, message.id],
+                                )
+                                .await?;
                         }
                     }
                     let existed = transaction
@@ -1070,6 +1095,32 @@ impl Store {
                         )
                         .await?;
                 }
+                NetworkEvent::PreviewDownloaded {
+                    chat_id,
+                    message_id,
+                    path,
+                    ..
+                } => {
+                    let row = transaction
+                        .query("SELECT json_extract(data,'$.attachment.source_id') FROM messages WHERE chat_id=?1 AND id=?2 AND data IS NOT NULL", params![*chat_id, *message_id])
+                        .await?
+                        .next()
+                        .await?;
+                    if let Some(row) = row {
+                        let source_id = row.get::<Option<i64>>(0)?;
+                        transaction
+                            .execute(
+                                "INSERT OR REPLACE INTO previews VALUES(?1,?2,?3,?4)",
+                                params![
+                                    *chat_id,
+                                    *message_id,
+                                    path.to_string_lossy().as_ref(),
+                                    source_id
+                                ],
+                            )
+                            .await?;
+                    }
+                }
                 NetworkEvent::CacheInvalidated { chat_id } => {
                     self.poll_revisions.clear();
                     self.reaction_revisions.clear();
@@ -1102,6 +1153,7 @@ impl Store {
         }
         transaction.execute("DELETE FROM messages WHERE (chat_id,id) IN (SELECT chat_id,id FROM messages ORDER BY timestamp DESC LIMIT -1 OFFSET ?1)", [MAX_MESSAGES]).await?;
         transaction.execute_batch("DELETE FROM attachments WHERE NOT EXISTS(SELECT 1 FROM messages WHERE messages.chat_id=attachments.chat_id AND messages.id=attachments.message_id AND messages.data IS NOT NULL);
+            DELETE FROM previews WHERE NOT EXISTS(SELECT 1 FROM messages WHERE messages.chat_id=previews.chat_id AND messages.id=previews.message_id AND messages.data IS NOT NULL);
             DELETE FROM history_pages WHERE oldest_id>0 AND NOT EXISTS(SELECT 1 FROM messages WHERE messages.chat_id=history_pages.chat_id AND messages.id=history_pages.oldest_id);").await?;
         transaction.execute("DELETE FROM history_pages WHERE rowid IN (SELECT rowid FROM history_pages ORDER BY rowid DESC LIMIT -1 OFFSET ?1)", [MAX_MESSAGES]).await?;
         let oldest_in_flight = self
@@ -1166,6 +1218,19 @@ async fn write_message(
     connection
         .execute(
             "DELETE FROM attachments WHERE chat_id=?1 AND message_id=?2 AND source_id IS NOT ?3",
+            params![
+                message.chat_id,
+                message.id,
+                message
+                    .attachment
+                    .as_ref()
+                    .and_then(|attachment| attachment.source_id)
+            ],
+        )
+        .await?;
+    connection
+        .execute(
+            "DELETE FROM previews WHERE chat_id=?1 AND message_id=?2 AND source_id IS NOT ?3",
             params![
                 message.chat_id,
                 message.id,
@@ -1353,6 +1418,89 @@ mod tests {
         assert_eq!(store.sticker_overview().await.unwrap(), Some(overview));
         assert_eq!(store.sticker_set(3).await.unwrap(), Some(documents));
         assert_eq!(store.sticker_set(4).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn previews_follow_message_media_and_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite3");
+        let file = directory.path().join("preview.jpg");
+        std::fs::write(&file, "jpeg").unwrap();
+        let mut sticker = message(10, "");
+        sticker.attachment = Some(crate::model::Attachment {
+            source_id: Some(9),
+            kind: crate::model::AttachmentKind::Sticker,
+            file_name: None,
+            mime_type: Some("application/x-tgsticker".to_owned()),
+            size: None,
+            fallback_emoji: Some("😀".to_owned()),
+        });
+        let mut store = Store::open(&path).await.unwrap();
+        store
+            .apply(&[NetworkEvent::NewMessage(sticker.clone())])
+            .await
+            .unwrap();
+        store
+            .apply(&[NetworkEvent::PreviewDownloaded {
+                chat_id: 42,
+                message_id: 10,
+                request_id: 1,
+                path: file.clone(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(store.preview(42, 10).await.unwrap(), Some(file.clone()));
+        // Missing files are cache misses.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(store.preview(42, 10).await.unwrap(), None);
+        std::fs::write(&file, "jpeg").unwrap();
+        // Edited media invalidates the recorded preview.
+        let mut edited = sticker.clone();
+        edited.attachment.as_mut().unwrap().source_id = Some(10);
+        store
+            .apply(&[NetworkEvent::MessageUpdated(edited)])
+            .await
+            .unwrap();
+        assert_eq!(store.preview(42, 10).await.unwrap(), None);
+        // Deleting the message orphans the row.
+        store
+            .apply(&[NetworkEvent::PreviewDownloaded {
+                chat_id: 42,
+                message_id: 10,
+                request_id: 2,
+                path: file.clone(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(store.preview(42, 10).await.unwrap(), Some(file.clone()));
+        store
+            .apply(&[NetworkEvent::MessagesDeleted {
+                channel_id: None,
+                message_ids: vec![10],
+            }])
+            .await
+            .unwrap();
+        assert_eq!(store.preview(42, 10).await.unwrap(), None);
+        // Rows survive restarts while the message and file do.
+        let mut second = sticker.clone();
+        second.id = 11;
+        store
+            .apply(&[NetworkEvent::NewMessage(second)])
+            .await
+            .unwrap();
+        store
+            .apply(&[NetworkEvent::PreviewDownloaded {
+                chat_id: 42,
+                message_id: 11,
+                request_id: 3,
+                path: file.clone(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(store.preview(42, 11).await.unwrap(), Some(file.clone()));
+        drop(store);
+        let store = Store::open(&path).await.unwrap();
+        assert_eq!(store.preview(42, 11).await.unwrap(), Some(file));
     }
 
     #[tokio::test]

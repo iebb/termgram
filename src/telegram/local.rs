@@ -180,6 +180,7 @@ async fn serve_cached(
             | TelegramCommand::LoadStickers { .. }
             | TelegramCommand::LoadStickerSet { .. }
             | TelegramCommand::DownloadAttachment { .. }
+            | TelegramCommand::DownloadPreview { .. }
             | TelegramCommand::SearchCached(_)
     ) {
         store.apply(changes).await?;
@@ -270,6 +271,26 @@ async fn serve_cached(
         TelegramCommand::SearchCached(request) => {
             search.queue(request.clone());
             return Ok(true);
+        }
+        TelegramCommand::DownloadPreview {
+            chat_id,
+            message_id,
+            request_id,
+            ..
+        } => {
+            // Preview files persist in the media cache; a recorded row that
+            // still matches the message's media makes re-rendering instant.
+            if let Some(path) = store.preview(*chat_id, *message_id).await? {
+                events
+                    .send(NetworkEvent::PreviewDownloaded {
+                        chat_id: *chat_id,
+                        message_id: *message_id,
+                        request_id: *request_id,
+                        path,
+                    })
+                    .await?;
+                return Ok(true);
+            }
         }
         TelegramCommand::LoadStickers { request_id, cached } => {
             // The cached overview opens the panel instantly, then the network

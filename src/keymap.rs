@@ -549,6 +549,19 @@ impl Keymap {
         }
     }
 
+    /// Give a missing or empty configuration file the commented defaults, so
+    /// there is something to edit. Existing content is never replaced.
+    ///
+    /// # Errors
+    /// Returns the error from inspecting or writing the file.
+    pub fn seed(path: &Path) -> std::io::Result<()> {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.len() > 0 || !metadata.is_file() => Ok(()),
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => std::fs::write(path, include_str!("../examples/config.lua")),
+        }
+    }
+
     /// # Errors
     /// Reload is strict: missing, unreadable or invalid files preserve the old snapshot.
     pub fn reload(path: &Path) -> Result<Self> {
@@ -588,8 +601,11 @@ impl Keymap {
                 Ok(VmState::Continue)
             },
         )?;
-        let configuration: Configuration =
-            lua.from_value(lua.load(source).set_name("config.lua").eval()?)?;
+        // A file that returns nothing, such as an empty one, changes nothing.
+        let configuration = match lua.load(source).set_name("config.lua").eval()? {
+            mlua::Value::Nil => Configuration::default(),
+            value => lua.from_value(value)?,
+        };
         configuration.statusline.validate()?;
         configuration.sidebar.validate()?;
         configuration.messages.validate()?;
@@ -875,6 +891,20 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("<C-s>") && line.ends_with("Send the current draft"))
         );
+    }
+
+    #[test]
+    fn empty_configuration_and_the_seeded_example_keep_the_defaults() {
+        for source in [
+            "",
+            "-- nothing yet\n",
+            include_str!("../examples/config.lua"),
+        ] {
+            let keymap = Keymap::parse(source).unwrap();
+            assert_eq!(keymap.statusline.left, Keymap::default().statusline.left);
+            assert_eq!(keymap.presence, Keymap::default().presence);
+            assert_eq!(keymap.ghost_text, Keymap::default().ghost_text);
+        }
     }
 
     #[test]

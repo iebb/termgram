@@ -95,6 +95,8 @@ async fn main() -> Result<()> {
         });
     app.configuration.path.clone_from(&lua_path);
     if let Some(path) = lua_path {
+        // Best effort: an unwritable directory still runs on the defaults.
+        drop(termgram::keymap::Keymap::seed(&path));
         match termgram::keymap::Keymap::load(&path) {
             Ok(keymap) => app.keymap = keymap,
             Err(error) => {

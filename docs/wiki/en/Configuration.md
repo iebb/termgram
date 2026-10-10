@@ -8,7 +8,9 @@ Place `config.lua` beside Termgram's `settings.conf`, or set `TERMGRAM_CONFIG` t
 an explicit file path. Use `:config reload` (or `:reload`) to load changes without restarting. Start with [the example](../../../examples/config.lua).
 The file returns a Lua table; tables, strings, mathematics and UTF-8 helpers are
 available. Filesystem, process and plugin APIs are deliberately outside this
-configuration interface. Invalid files use defaults at startup; a failed reload
+configuration interface. When the file is missing or empty, Termgram writes the
+commented example there at startup; a file that returns nothing keeps the
+defaults. Invalid files use defaults at startup; a failed reload
 keeps the settings already in use and reports the error.
 
 ```lua

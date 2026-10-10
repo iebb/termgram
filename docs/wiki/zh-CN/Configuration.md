@@ -7,6 +7,7 @@
 把 `config.lua` 放在 `settings.conf` 旁，或用 `TERMGRAM_CONFIG` 指定路径。
 使用 `:config reload`（或 `:reload`）即可加载修改，无需重启，可以从[配置示例](../../../examples/config.lua)开始。配置返回一个 Lua table，
 支持 table、字符串、数学和 UTF-8 辅助函数，不提供文件系统、进程或插件接口。
+文件不存在或为空时，启动时会写入带注释的示例配置；没有返回值的文件等同于默认配置。
 启动时配置错误会显示提示并使用默认值；运行中重载失败则保留已经生效的设置。
 
 ```lua

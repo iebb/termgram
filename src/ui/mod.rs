@@ -1619,9 +1619,10 @@ mod tests {
         let mut app = populated_app();
         let messages = app.active_messages().to_vec();
         app.handle_action(KeyAction::Enter);
+        app.run_binding("first_unread", 1);
         app.handle_network(NetworkEvent::History {
             chat_id: 7,
-            request_id: 1,
+            request_id: 2,
             messages,
         });
         let text = render_text_mut(&mut app, 80, 24);

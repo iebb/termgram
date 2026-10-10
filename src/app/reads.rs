@@ -350,23 +350,20 @@ impl App {
             self.status_message = Some("No unread messages in this chat".to_owned());
             return Vec::new();
         }
-        self.open_chat_by_id(chat_id)
+        let mut commands = self.open_chat_by_id(chat_id);
+        let boundary = self.prepare_unread_entry(chat_id, true);
+        self.position_unread_entry(chat_id, false);
+        for command in &mut commands {
+            if let TelegramCommand::LoadHistory { after_id, .. } = command {
+                *after_id = boundary;
+            }
+        }
+        commands
     }
 
     pub(super) fn latest_history(&mut self) -> Vec<TelegramCommand> {
-        let Some(chat_id) = self.active_chat_id else {
-            return Vec::new();
-        };
-        let mut commands = self.open_chat_by_id(chat_id);
-        for command in &mut commands {
-            if let TelegramCommand::LoadHistory { after_id, .. } = command {
-                *after_id = None;
-            }
-        }
-        self.prepare_unread_entry(chat_id, false);
-        self.clear_viewport_anchor();
-        self.message_scroll = 0;
-        commands
+        self.active_chat_id
+            .map_or_else(Vec::new, |chat_id| self.open_chat_by_id(chat_id))
     }
 
     /// Continue a confirmed forward page using the same generation and cache

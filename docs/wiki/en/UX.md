@@ -13,11 +13,12 @@ Use `j/k` to select messages, arrows to scroll their rendered rows, and `G` to
 return to the latest page. While you read earlier messages, new arrivals retain
 your reading position and show a count instead of pulling the view down.
 
-Chats with unread messages open at the saved incoming read boundary. A compact
-`Unread messages` separator stays at that entry point while receipts advance.
-Local pages appear provisionally; Telegram verifies the position before automatic
-receipts start. Use `g u` or `:unread` to locate the current first unread message
-again. Continue with `j`, Down or PageDown at the end of a page to load newer
+A chat always opens on its latest messages, with the whole history above them.
+To read a backlog in order instead, press `g u` or use `:unread` before the
+messages are marked read: the view moves to the saved incoming read boundary and a
+compact `Unread messages` separator stays there while receipts advance. Local
+pages appear provisionally; Telegram verifies the position before automatic
+receipts start. Continue with `j`, Down or PageDown at the end of a page to load newer
 history without skipping the intervening messages. The footer shows `continue`
 and `latest` hints while more history remains. `G` explicitly returns to the
 latest page. A failed position lookup keeps the cache visible; retry with `g u`

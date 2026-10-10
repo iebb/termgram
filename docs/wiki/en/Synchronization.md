@@ -3,8 +3,8 @@
 [简体中文](../zh-CN/Synchronization.md) · [Guide](Home.md)
 
 Termgram displays cached conversations before connecting to Telegram. Opening a
-cached conversation reads a local page at its unread boundary, or its most recent
-page when already read, while a network request refreshes it. Messages remain visible during synchronization. Sending and server
+cached conversation reads its most recent local page while a network request
+refreshes it. Messages remain visible during synchronization. Sending and server
 operations wait for sign-in to finish.
 
 Updates continue while history, dialog and other requests run in the background.

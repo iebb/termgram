@@ -736,7 +736,7 @@ impl App {
     }
 
     #[cfg(test)]
-    fn run_binding(&mut self, run: &str, count: usize) -> Vec<TelegramCommand> {
+    pub(crate) fn run_binding(&mut self, run: &str, count: usize) -> Vec<TelegramCommand> {
         self.run_action(&Action::parse(run).expect("known test action"), count)
     }
 
@@ -4037,12 +4037,11 @@ impl App {
         self.history_changes.clear();
         self.history_read_max = 0;
         self.history_target_message = None;
-        let after_id = self.prepare_unread_entry(chat_id, true);
-        self.position_unread_entry(chat_id, false);
+        self.prepare_unread_entry(chat_id, false);
         vec![TelegramCommand::LoadHistory {
             chat_id,
             request_id,
-            after_id,
+            after_id: None,
         }]
     }
 
@@ -6006,24 +6005,33 @@ mod tests {
         app.chats[0].read_inbox_max_id = Some(10);
         app.chats[0].last_message_id = Some(200);
         app.chats[0].unread = 190;
+        // Opening a chat shows its latest history; resuming is explicit.
         assert_eq!(
             app.handle_action(KeyAction::Enter),
             vec![TelegramCommand::LoadHistory {
                 chat_id: 1,
                 request_id: 1,
+                after_id: None,
+            }]
+        );
+        assert_eq!(
+            app.run_binding("first_unread", 1),
+            vec![TelegramCommand::LoadHistory {
+                chat_id: 1,
+                request_id: 2,
                 after_id: Some(10),
             }]
         );
         app.handle_network(NetworkEvent::CachedHistory {
             chat_id: 1,
-            request_id: 1,
+            request_id: 2,
             messages: vec![message(150, 1, "cached gap", false)],
         });
         app.set_visible_read_boundary(1, Some(150));
         assert!(app.request_visible_read().is_empty());
         app.handle_network(NetworkEvent::History {
             chat_id: 1,
-            request_id: 1,
+            request_id: 2,
             messages: (11..=90).map(|id| message(id, 1, "page", false)).collect(),
         });
         assert_eq!(app.unread_separator(), Some(11));
@@ -7604,7 +7612,7 @@ mod tests {
             vec![TelegramCommand::LoadHistory {
                 chat_id: 2,
                 request_id: 1,
-                after_id: Some(0),
+                after_id: None,
             },]
         );
         assert_eq!(app.focus, Focus::Conversation);

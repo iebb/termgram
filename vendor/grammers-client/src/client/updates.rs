@@ -79,6 +79,35 @@ async fn prepare_channel_difference(
     }
 }
 
+/// Recovery work the stream performs before it returns to live updates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncProgress {
+    /// The account-wide difference is being fetched.
+    pub account: bool,
+    /// Channels still waiting for their difference.
+    pub channels: usize,
+    /// Messages recovered since this recovery began.
+    pub messages: usize,
+}
+
+impl SyncProgress {
+    pub fn is_idle(&self) -> bool {
+        !self.account && self.channels == 0
+    }
+}
+
+fn recovered_messages(updates: &[(tl::enums::Update, State)]) -> usize {
+    updates
+        .iter()
+        .filter(|(update, _)| {
+            matches!(
+                update,
+                tl::enums::Update::NewMessage(_) | tl::enums::Update::NewChannelMessage(_)
+            )
+        })
+        .count()
+}
+
 /// Iterator returned by [`Client::stream_updates`].
 pub struct UpdateStream {
     client: Client,
@@ -92,6 +121,7 @@ pub struct UpdateStream {
     should_get_state: bool,
     active_channel: watch::Sender<Option<(i64, i32)>>,
     active_changes: watch::Receiver<Option<(i64, i32)>>,
+    progress: watch::Sender<SyncProgress>,
 }
 
 impl UpdateStream {
@@ -99,6 +129,26 @@ impl UpdateStream {
     /// Changing this handle does not cancel an in-flight update receive.
     pub fn active_channel(&self) -> watch::Sender<Option<(i64, i32)>> {
         self.active_channel.clone()
+    }
+
+    /// Observe difference recovery without a second update consumer. The value
+    /// returns to idle, with a zero message count, once live updates resume.
+    pub fn progress(&self) -> watch::Receiver<SyncProgress> {
+        self.progress.subscribe()
+    }
+
+    fn publish_progress(&self, recovered: usize) {
+        let (account, channels) = self.message_box.recovery();
+        self.progress.send_if_modified(|current| {
+            let next = if !account && channels == 0 {
+                SyncProgress::default()
+            } else {
+                SyncProgress { account, channels, messages: current.messages + recovered }
+            };
+            let changed = *current != next;
+            *current = next;
+            changed
+        });
     }
 
     /// Return one complete application batch and the cursor it covers.
@@ -175,8 +225,10 @@ impl UpdateStream {
                 if let Some(update) = self.buffer.pop_front() {
                     return Ok(update);
                 }
+                let deadline = self.message_box.check_deadlines(); // first, as it might trigger differences
+                self.publish_progress(0);
                 (
-                    self.message_box.check_deadlines(), // first, as it might trigger differences
+                    deadline,
                     self.message_box.get_difference(),
                     match self.message_box.get_channel_difference() {
                         Some(gd) => {
@@ -202,6 +254,7 @@ impl UpdateStream {
                         date: state.date, seq: state.seq, message_box: None,
                     }));
                 }
+                self.publish_progress(recovered_messages(&updates));
                 let peers = self.client.build_peer_map(users, chats).await;
                 self.extend_update_queue(updates, peers);
                 continue;
@@ -269,6 +322,7 @@ impl UpdateStream {
                     }));
                 }
 
+                self.publish_progress(recovered_messages(&updates));
                 let peers = self.client.build_peer_map(users, chats).await;
                 self.extend_update_queue(updates, peers);
                 continue;
@@ -385,6 +439,7 @@ impl Client {
 
         let (active_channel, active_changes) = watch::channel(None);
         Ok(UpdateStream {
+            progress: watch::channel(SyncProgress::default()).0,
             active_channel,
             active_changes,
             client: self.clone(),

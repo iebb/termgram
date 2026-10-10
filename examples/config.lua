@@ -12,8 +12,8 @@ return {
   -- messages.images = "placeholder" renders a label instead of inline media; `o` still opens it
   statusline = {
     enabled = true,
-    left = { "mode", "app", "account", "message", "context" },
-    right = { "notifications", "connection", "latency", "dc", "position" },
+    left = { "mode", "app", "account", "activity", "message", "context" },
+    right = { "notifications", "unread", "connection", "latency", "dc", "position" },
   },
   keymap = {
     -- { context = "conversation", on = { "<C-u>" }, run = "message_up", count = 20 },

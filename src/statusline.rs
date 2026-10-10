@@ -15,6 +15,8 @@ pub enum Item {
     Position,
     Message,
     Notifications,
+    Unread,
+    Activity,
     Context,
 }
 
@@ -34,11 +36,13 @@ impl Default for Configuration {
                 Item::Mode,
                 Item::App,
                 Item::Account,
+                Item::Activity,
                 Item::Message,
                 Item::Context,
             ],
             right: vec![
                 Item::Notifications,
+                Item::Unread,
                 Item::Connection,
                 Item::Latency,
                 Item::Dc,

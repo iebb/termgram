@@ -57,6 +57,25 @@ pub enum ConnectionStatus {
     Offline,
 }
 
+/// Update recovery the worker performs before live updates resume, mirroring
+/// the official clients' "Updating…" state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SyncProgress {
+    /// The account-wide difference is being fetched.
+    pub account: bool,
+    /// Channels and supergroups still waiting for their difference.
+    pub channels: usize,
+    /// Messages recovered since this recovery began.
+    pub messages: usize,
+}
+
+impl SyncProgress {
+    #[must_use]
+    pub const fn is_idle(self) -> bool {
+        !self.account && self.channels == 0
+    }
+}
+
 /// Commands sent from the application to the Telegram worker.
 #[derive(Clone, Eq, PartialEq)]
 pub enum TelegramCommand {
@@ -1627,6 +1646,15 @@ pub enum NetworkEvent {
         error: String,
     },
     Status(ConnectionStatus),
+    Sync(SyncProgress),
+    /// Someone else's transient action; `None` cancels it. The name is absent
+    /// when the sender has not been seen in this session.
+    ChatAction {
+        chat_id: ChatId,
+        sender_id: i64,
+        sender: Option<String>,
+        action: Option<crate::activity::Action>,
+    },
     Error(String),
     Fatal(String),
 }

@@ -157,3 +157,39 @@ fn active_group_uses_server_timeout_and_stops_when_closed() {
     );
     assert!(boxes.get_channel_difference().is_none());
 }
+
+#[test]
+fn viewed_channel_recovers_first_and_is_not_reported_as_backlog() {
+    let too_long = |channel_id| -> tl::enums::Update {
+        tl::types::UpdateChannelTooLong {
+            channel_id,
+            pts: Some(30),
+        }
+        .into()
+    };
+    let mut boxes = MessageBoxes::new();
+    for id in [7, 42] {
+        boxes.try_set_channel_state(id, 20);
+    }
+    assert_eq!(boxes.recovery(), (false, 0));
+    boxes
+        .process_updates(UpdatesLike::Updates(
+            tl::types::Updates {
+                updates: vec![too_long(7), too_long(42)],
+                users: Vec::new(),
+                chats: Vec::new(),
+                date: 123,
+                seq: 0,
+            }
+            .into(),
+        ))
+        .unwrap();
+    assert_eq!(boxes.recovery(), (false, 2));
+    boxes.set_active_channel(Some((42, 20)));
+    assert_eq!(boxes.recovery(), (false, 1));
+    let tl::enums::InputChannel::Channel(first) = boxes.get_channel_difference().unwrap().channel
+    else {
+        panic!("expected a channel request");
+    };
+    assert_eq!(first.channel_id, 42);
+}

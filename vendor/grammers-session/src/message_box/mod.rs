@@ -771,12 +771,36 @@ impl MessageBoxes {
 
 /// Getting and applying channel difference.
 impl MessageBoxes {
-    /// The first channel currently getting its difference, as `(key, channel_id)`, if any.
+    /// The channel currently getting its difference, as `(key, channel_id)`, if any.
+    /// The actively viewed channel goes first, so a backlog of other channels
+    /// cannot delay the conversation on screen.
     fn channel_in_diff(&self) -> Option<(Key, i64)> {
+        if let Some(id) = self.active_channel {
+            let key = Key::Channel(id);
+            if self.getting_diff_for.contains(&key) {
+                return Some((key, id));
+            }
+        }
         self.getting_diff_for.iter().find_map(|&key| match key {
             Key::Channel(id) => Some((key, id)),
             _ => None,
         })
+    }
+
+    /// Recovery in progress: whether the account difference is being fetched,
+    /// and how many channels still await theirs. Routine short polling of the
+    /// actively viewed channel is not recovery and is excluded.
+    pub fn recovery(&self) -> (bool, usize) {
+        let mut account = false;
+        let mut channels = 0;
+        for key in &self.getting_diff_for {
+            match *key {
+                Key::Common | Key::Secondary => account = true,
+                Key::Channel(id) if self.active_channel == Some(id) => {}
+                Key::Channel(_) => channels += 1,
+            }
+        }
+        (account, channels)
     }
 
     /// Return the request that needs to be made to get a channel's difference, if any.

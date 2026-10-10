@@ -58,8 +58,8 @@ return {
 ```lua
 statusline = {
   enabled = true,
-  left = { "mode", "app", "account", "message", "context" },
-  right = { "notifications", "connection", "latency", "dc", "position" },
+  left = { "mode", "app", "account", "activity", "message", "context" },
+  right = { "notifications", "unread", "connection", "latency", "dc", "position" },
 },
 ```
 
@@ -71,7 +71,9 @@ statusline = {
 | `message` | 选中或最后可见消息的时间、送达、置顶和媒体状态 |
 | `context` | 当前选择/帮助的实际快捷键，或可用更新 |
 | `notifications` | 当前焦点聊天已确认的静音状态和本地截止时间（[说明](Notifications.md)） |
-| `connection` | 正在连接、在线、重连或离线 |
+| `activity` | 当前焦点聊天中他人的正在输入、录制、上传等状态 |
+| `unread` | 归档之外的未读消息数及其所在聊天数 |
+| `connection` | 正在连接、在线、同步中（updating）、重连或离线 |
 | `latency` | 主连接最近一次成功 Ping 的毫秒数 |
 | `dc` | 已认证会话的主数据中心 ID |
 | `position` | 最新位置、距底部的显示行数，或阅读历史时的新消息数 |
@@ -79,6 +81,13 @@ statusline = {
 每个组件在左右两侧合计只能出现一次，未知或重复组件会导致配置报错。空列表可以清空
 一侧。窄窗口先隐藏次要组件，优先保留模式与当前操作；每侧的剩余组件维持原有顺序。
 `enabled = false` 隐藏底栏，错误仍会在上方可读地显示。
+
+在线时，如果 Termgram 正在补拉错过的更新而不是接收实时更新（例如重连或出现缺口之后），
+`connection` 会像官方客户端一样显示 `updating`：`updating · 3 chats · 128 msgs`
+表示还有 3 个频道/超级群在排队，本轮已补回 128 条消息；`updating chats` 表示正在刷新
+聊天列表。当前打开的会话优先于队列中的其他聊天同步。`activity` 遵循 Telegram 的时效：
+对方 6 秒内没有重复该状态（游戏为 10 秒）、主动取消或消息送达后即消失。自定义了
+`left`/`right` 的配置需要显式加入 `activity` 和 `unread` 才会显示。
 
 延迟是可选诊断：在现有 Telegram 连接上每 60 秒最多发起一次 Ping，超时为 5 秒。
 五秒未完成即显示不可用；旧探测结束前不追加探测，避免断网时积累请求。

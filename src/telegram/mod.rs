@@ -1,3 +1,4 @@
+mod activity;
 mod chat_info;
 mod deletion;
 mod editing;
@@ -348,6 +349,7 @@ async fn run(
             channels: cursor.channels.into_iter().map(|(id, pts)| grammers_session::types::ChannelState { id, pts }).collect(),
         });
         let active_channel = updates.active_channel();
+        let mut sync = updates.progress();
         cache.active_chat = *active_chat.borrow();
         cache.message_pins.dirty = true;
         signal_active_channel(&cache, *active_chat.borrow_and_update(), &active_channel);
@@ -372,6 +374,15 @@ async fn run(
                         cache.active_chat = *active_chat.borrow();
                         cache.message_pins.dirty = true;
                         signal_active_channel(&cache, *active_chat.borrow_and_update(), &active_channel);
+                    }
+                    changed = sync.changed() => {
+                        if changed.is_err() { break 'worker; }
+                        let progress = *sync.borrow_and_update();
+                        events.send(NetworkEvent::Sync(crate::event::SyncProgress {
+                            account: progress.account,
+                            channels: progress.channels,
+                            messages: progress.messages,
+                        })).await.ok();
                     }
                     command = commands.recv(), if requests.len() < requests::MAX_REQUESTS => {
                         let Some(command) = command else { break 'worker; };
@@ -730,6 +741,13 @@ async fn process_update(
                                 .unwrap_or_default(),
                         })
                         .await?;
+                }
+                tl::enums::Update::UserTyping(_)
+                | tl::enums::Update::ChatUserTyping(_)
+                | tl::enums::Update::ChannelUserTyping(_) => {
+                    if let Some(event) = activity::event(&update.raw, cache) {
+                        events.send(event).await.ok();
+                    }
                 }
                 tl::enums::Update::PtsChanged => {
                     cache.dialogs.dirty = true;

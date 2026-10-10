@@ -99,6 +99,22 @@ existing update receive without cancellation or a second update consumer.
 The deadline helper also accounts for deadlines moved earlier than the current
 minimum. `tests/update_recovery.rs` covers activation, timeout and deactivation.
 
+`MessageBoxes::recovery` reports whether the account difference is in flight
+and how many channels still await theirs; `UpdateStream::progress` publishes
+that, plus the messages recovered so far, on a watch channel as `SyncProgress`.
+It is an observation of the existing engine, not a second update consumer.
+Short polling of the viewed channel is excluded, and that channel is taken
+first when several await a difference, so a backlog cannot delay the
+conversation on screen. `tests/update_recovery.rs` covers both.
+
+Chat actions (`src/activity.rs`, `src/telegram/activity.rs`) map the unordered
+`updateUserTyping`, `updateChatUserTyping` and `updateChannelUserTyping`
+updates from the same stream. Six-second lifetimes (ten for games), explicit
+cancellation, clearing on the author's message and the one/two/many forms
+follow Desktop `history/view/history_view_send_action.cpp` on its `dev`
+branch as read on 2026-10-10; this is an original adapter with its own
+wording, not copied source.
+
 `libsql/` vendors the published libSQL 0.9.30 Rust crate from
 https://github.com/tursodatabase/libsql at
 `0653c5788d77ef16a97c56ff3e9fdc11717a72d9` (`libsql/`), with the upstream

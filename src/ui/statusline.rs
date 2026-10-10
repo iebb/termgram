@@ -131,15 +131,9 @@ fn segment(item: Item, right: bool, app: &AppState, narrow: bool) -> Option<Segm
             Color::Reset,
             60,
         ),
-        Item::Connection => {
-            let (label, color) = match app.connection {
-                ConnectionStatus::Connecting => ("connecting", WARNING),
-                ConnectionStatus::Online => ("online", SUCCESS),
-                ConnectionStatus::Reconnecting => ("reconnecting", WARNING),
-                ConnectionStatus::Offline => ("offline", DANGER),
-            };
-            (label.to_owned(), color, 80)
-        }
+        Item::Connection => connection(app),
+        Item::Unread => (unread(app), WARNING, 45),
+        Item::Activity => (app.focused_activity_label()?, ACCENT, 85),
         Item::Latency => (
             app.metrics
                 .latency
@@ -196,6 +190,50 @@ fn segment(item: Item, right: bool, app: &AppState, narrow: bool) -> Option<Segm
         priority,
         right,
     })
+}
+
+fn counted(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+fn connection(app: &AppState) -> (String, Color, u8) {
+    let (label, color) = match app.connection {
+        ConnectionStatus::Connecting => ("connecting".to_owned(), WARNING),
+        ConnectionStatus::Online => match sync_label(app) {
+            Some(label) => (label, WARNING),
+            None => ("online".to_owned(), SUCCESS),
+        },
+        ConnectionStatus::Reconnecting => ("reconnecting".to_owned(), WARNING),
+        ConnectionStatus::Offline => ("offline".to_owned(), DANGER),
+    };
+    (label, color, 80)
+}
+
+fn unread(app: &AppState) -> String {
+    match app.unread_totals() {
+        (_, 0) => String::new(),
+        (0, chats) => format!("{} unread", counted(chats, "chat")),
+        (messages, chats) => format!("{messages} unread · {}", counted(chats, "chat")),
+    }
+}
+
+/// "updating" while the worker recovers missed updates, as official clients
+/// show; the counts are the channels still queued and messages recovered.
+fn sync_label(app: &AppState) -> Option<String> {
+    let sync = app.sync;
+    if sync.is_idle() {
+        return app
+            .refreshing_dialogs()
+            .then(|| "updating chats".to_owned());
+    }
+    let mut parts = vec!["updating".to_owned()];
+    if sync.channels > 0 {
+        parts.push(counted(sync.channels, "chat"));
+    }
+    if sync.messages > 0 {
+        parts.push(counted(sync.messages, "msg"));
+    }
+    Some(parts.join(" · "))
 }
 
 fn selected_context(app: &AppState) -> Option<String> {

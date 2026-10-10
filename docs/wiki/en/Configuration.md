@@ -68,8 +68,8 @@ segments; omitted fields keep these defaults:
 ```lua
 statusline = {
   enabled = true,
-  left = { "mode", "app", "account", "message", "context" },
-  right = { "notifications", "connection", "latency", "dc", "position" },
+  left = { "mode", "app", "account", "activity", "message", "context" },
+  right = { "notifications", "unread", "connection", "latency", "dc", "position" },
 },
 ```
 
@@ -81,7 +81,9 @@ statusline = {
 | `message` | Selected/last-visible message time, delivery, pin and media state |
 | `context` | Effective selection/help keys or an available update |
 | `notifications` | Focused chat’s confirmed mute state and local deadline ([details](Notifications.md)) |
-| `connection` | Connecting, online, reconnecting or offline |
+| `activity` | Typing, recording, uploading and similar actions by others in the focused chat |
+| `unread` | Unread messages and the chats holding them, outside the archive |
+| `connection` | Connecting, online, updating, reconnecting or offline |
 | `latency` | Latest completed primary-connection Ping in milliseconds |
 | `dc` | The authenticated session's home data center ID |
 | `position` | Live edge, rows from the bottom or new arrivals while reading history |
@@ -90,6 +92,16 @@ Each item can appear once across both sides. Unknown or duplicate items reject
 the configuration. Empty lists remove a side. At narrow widths, optional items
 are removed before mode and contextual actions; their order within each side is
 preserved. `enabled = false` hides the bar. Errors remain readable above it.
+
+While online, `connection` reads `updating` whenever Termgram is recovering
+missed updates instead of receiving live ones, as the official clients do
+after a reconnect or a gap: `updating · 3 chats · 128 msgs` means three
+channels or supergroups are still queued and 128 messages were recovered so
+far. `updating chats` is a refresh of the chat list. The open conversation is
+recovered before the rest of the queue. `activity` follows Telegram's own
+lifetime: an action disappears after six seconds without a repeat (ten for
+games), when it is cancelled, or when its author's message arrives. Custom
+`left`/`right` lists must name `activity` and `unread` to show them.
 
 Latency is an optional diagnostic: at most one Ping runs every 60 seconds, with
 a five-second display deadline, on the existing Telegram connection. A late

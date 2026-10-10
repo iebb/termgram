@@ -235,6 +235,8 @@ pub struct App {
     pub mode: Mode,
     pub focus: Focus,
     pub connection: ConnectionStatus,
+    pub sync: crate::event::SyncProgress,
+    pub activity: crate::activity::State,
     pub metrics: crate::statusline::Metrics,
     pub notifications: notifications::State,
     alerts: alerts::State,
@@ -377,6 +379,8 @@ impl Default for App {
             mode: Mode::Navigate,
             focus: Focus::Chats,
             connection: ConnectionStatus::Connecting,
+            sync: crate::event::SyncProgress::default(),
+            activity: crate::activity::State::default(),
             metrics: crate::statusline::Metrics::default(),
             notifications: notifications::State::default(),
             alerts: alerts::State::default(),
@@ -583,6 +587,7 @@ impl App {
                 }
             }
             AppEvent::Tick => {
+                self.activity.expire(std::time::Instant::now());
                 if self
                     .metrics
                     .latency
@@ -2094,10 +2099,40 @@ impl App {
                 self.connection = status;
                 if status != ConnectionStatus::Online {
                     self.metrics = crate::statusline::Metrics::default();
+                    self.sync = crate::event::SyncProgress::default();
+                    self.activity = crate::activity::State::default();
                 }
                 if status == ConnectionStatus::Online {
                     self.status_message = None;
                 }
+                Vec::new()
+            }
+            NetworkEvent::Sync(progress) => {
+                self.sync = progress;
+                Vec::new()
+            }
+            NetworkEvent::ChatAction {
+                chat_id,
+                sender_id,
+                sender,
+                action,
+            } => {
+                // A private chat is named after the only other participant.
+                let name = sender
+                    .or_else(|| {
+                        self.chats
+                            .iter()
+                            .find(|chat| {
+                                chat.id == chat_id && chat.kind == crate::model::ChatKind::Direct
+                            })
+                            .map(|chat| chat.title.clone())
+                    })
+                    .map_or_else(
+                        || "Someone".to_owned(),
+                        |name| sanitize_terminal_line(&name),
+                    );
+                self.activity
+                    .apply(chat_id, sender_id, name, action, std::time::Instant::now());
                 Vec::new()
             }
             NetworkEvent::Error(message) => {
@@ -2212,6 +2247,35 @@ impl App {
     pub fn selected_chat_entry(&self) -> Option<&Chat> {
         let index = *self.filtered_chat_indices().get(self.selected_chat)?;
         self.chats.get(index)
+    }
+
+    /// Typing and similar actions in the chat the cursor is on.
+    #[must_use]
+    pub fn focused_activity_label(&self) -> Option<String> {
+        let chat_id = if self.focus == Focus::Chats {
+            self.selected_chat_entry().map(|chat| chat.id)
+        } else {
+            self.active_chat_id
+        }?;
+        self.activity.label(chat_id)
+    }
+
+    /// Unread messages and the chats holding them, outside the archive. A chat
+    /// only marked unread counts as a chat without adding messages.
+    #[must_use]
+    pub fn unread_totals(&self) -> (u64, usize) {
+        self.chats
+            .iter()
+            .filter(|chat| !chat.membership.archived)
+            .filter(|chat| chat.unread > 0 || chat.membership.unread_mark)
+            .fold((0, 0), |(messages, chats), chat| {
+                (messages + u64::from(chat.unread), chats + 1)
+            })
+    }
+
+    #[must_use]
+    pub fn refreshing_dialogs(&self) -> bool {
+        self.refresh_dialogs_pending
     }
 
     #[must_use]
@@ -2384,7 +2448,8 @@ impl App {
         {
             return true;
         }
-        if self.keymap.pending() {
+        // Chat actions lapse on their own; keep ticking until the last one does.
+        if self.keymap.pending() || !self.activity.is_empty() {
             return true;
         }
         match self.screen {
@@ -4166,6 +4231,9 @@ impl App {
         sanitize_message(&mut message);
         let chat_id = message.chat_id;
         let outgoing = message.outgoing;
+        if !outgoing {
+            self.activity.message_arrived(chat_id, &message.sender);
+        }
         let preview = message.preview_text();
         let text = message.text.clone();
         let reply_to = message.reply_to.as_ref().map(|reply| reply.message_id);

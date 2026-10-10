@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod activity;
 pub mod app;
 pub mod appearance;
 pub mod cache;

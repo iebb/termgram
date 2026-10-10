@@ -237,6 +237,7 @@ pub struct App {
     pub connection: ConnectionStatus,
     pub sync: crate::event::SyncProgress,
     pub activity: crate::activity::State,
+    presence: crate::presence::State,
     pub metrics: crate::statusline::Metrics,
     pub notifications: notifications::State,
     alerts: alerts::State,
@@ -381,6 +382,7 @@ impl Default for App {
             connection: ConnectionStatus::Connecting,
             sync: crate::event::SyncProgress::default(),
             activity: crate::activity::State::default(),
+            presence: crate::presence::State::new(std::time::Instant::now()),
             metrics: crate::statusline::Metrics::default(),
             notifications: notifications::State::default(),
             alerts: alerts::State::default(),
@@ -574,11 +576,21 @@ impl App {
 
     pub fn update(&mut self, event: AppEvent) -> Vec<TelegramCommand> {
         match event {
-            AppEvent::Key(key) => self.handle_key(&key),
-            AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
+            AppEvent::Key(key) => {
+                self.presence.input(std::time::Instant::now());
+                self.handle_key(&key)
+            }
+            AppEvent::Mouse(mouse) => {
+                self.presence.input(std::time::Instant::now());
+                self.handle_mouse(mouse)
+            }
             AppEvent::Network(event) => self.handle_network(event),
-            AppEvent::Paste(text) => self.handle_paste(&text),
+            AppEvent::Paste(text) => {
+                self.presence.input(std::time::Instant::now());
+                self.handle_paste(&text)
+            }
             AppEvent::TerminalFocus(focused) => {
+                self.presence.focus(focused, std::time::Instant::now());
                 self.terminal_focused = focused;
                 if focused && self.focus == Focus::Conversation && self.message_scroll == 0 {
                     self.reach_bottom()
@@ -1807,6 +1819,7 @@ impl App {
                 self.screen = Screen::Main;
                 self.connection = ConnectionStatus::Online;
                 self.status_message = None;
+                self.presence.worker_ready(true);
                 Vec::new()
             }
             NetworkEvent::DialogsLoading => {
@@ -2247,6 +2260,21 @@ impl App {
     pub fn selected_chat_entry(&self) -> Option<&Chat> {
         let index = *self.filtered_chat_indices().get(self.selected_chat)?;
         self.chats.get(index)
+    }
+
+    /// The online status to report, when it changed; see `crate::presence`.
+    pub fn request_presence(&mut self) -> Vec<TelegramCommand> {
+        self.presence
+            .change(self.keymap.presence.online, std::time::Instant::now())
+            .map(TelegramCommand::SetOnline)
+            .into_iter()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn next_presence_deadline(&self) -> Option<std::time::Instant> {
+        self.presence
+            .deadline(self.keymap.presence.online, std::time::Instant::now())
     }
 
     /// Typing and similar actions in the chat the cursor is on.

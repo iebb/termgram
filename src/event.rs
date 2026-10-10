@@ -301,6 +301,8 @@ pub enum TelegramCommand {
         request_id: u64,
     },
     RefreshDialogs,
+    /// Report the account online or offline; see `crate::presence`.
+    SetOnline(bool),
     ResolveAlertSettings {
         key: crate::notifications::SettingsKey,
         request_id: u64,
@@ -741,6 +743,7 @@ impl TelegramCommand {
             }
             TelegramCommand::RefreshDialogs => NetworkEvent::DialogsFailed(error),
             TelegramCommand::CancelSearch
+            | TelegramCommand::SetOnline(_)
             | TelegramCommand::SwitchAccount { .. }
             | TelegramCommand::Shutdown => return None,
             TelegramCommand::StartQrAuth
@@ -1152,6 +1155,7 @@ impl fmt::Debug for TelegramCommand {
             Self::CancelSearch => formatter.write_str("CancelSearch"),
             Self::RefreshFolders => formatter.write_str("RefreshFolders"),
             Self::RefreshDialogs => formatter.write_str("RefreshDialogs"),
+            Self::SetOnline(online) => formatter.debug_tuple("SetOnline").field(online).finish(),
             Self::RefreshDialogPins => formatter.write_str("RefreshDialogPins"),
             Self::LoadPinnedMessages {
                 chat_id,

@@ -13,6 +13,7 @@ mod message_actions;
 mod notifications;
 mod pins;
 mod polls;
+mod presence;
 mod reactions;
 mod reads;
 mod requests;
@@ -88,6 +89,7 @@ struct WorkerCache {
     notification_peer_order: VecDeque<ChatId>,
     transfer_slots: Option<Arc<tokio::sync::Semaphore>>,
     upload_order: HashMap<ChatId, tokio::sync::oneshot::Receiver<()>>,
+    presence: presence::Handle,
     dialogs: MetadataRefresh,
     folders: MetadataRefresh,
     dialog_pins: MetadataRefresh,
@@ -262,6 +264,7 @@ async fn run(
     // including when the owner itself is aborted during shutdown.
     let mut pool_tasks = JoinSet::new();
     let mut observations = JoinSet::new();
+    let mut presence = None;
     pool_tasks.spawn(runner.run());
 
     let result: Result<()> = Box::pin(async {
@@ -323,6 +326,8 @@ async fn run(
                 }
             }
         }
+        presence = Some(cache.presence.clone());
+        observations.spawn(presence::report(client.clone(), cache.presence.clone()));
         let cursor = bootstrap.cursor;
         for &(id, pts) in &cursor.channels {
             cache.channel_pts.insert(PeerId::channel_unchecked(id).bot_api_dialog_id_unchecked(), pts);
@@ -441,6 +446,9 @@ async fn run(
     })
     .await;
     observations.shutdown().await;
+    if let Some(presence) = presence {
+        presence.finish(&client).await;
+    }
     handle.quit();
     let _ = pool_tasks.join_next().await;
     result
@@ -748,6 +756,9 @@ async fn process_update(
                     if let Some(event) = activity::event(&update.raw, cache) {
                         events.send(event).await.ok();
                     }
+                }
+                tl::enums::Update::UserStatus(update) if update.user_id == cache.self_id => {
+                    cache.presence.own_status(&update.status);
                 }
                 tl::enums::Update::PtsChanged => {
                     cache.dialogs.dirty = true;
@@ -1935,6 +1946,9 @@ async fn handle_command(
             requests::refresh_dialogs(client, cache, events, requests).await?;
         }
         TelegramCommand::RefreshDialogPins => cache.dialog_pins.dirty = true,
+        TelegramCommand::SetOnline(online) => {
+            cache.presence.wanted.send_replace(online);
+        }
         TelegramCommand::Shutdown => return Ok(true),
         TelegramCommand::StartQrAuth
         | TelegramCommand::SubmitPhone(_)

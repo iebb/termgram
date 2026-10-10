@@ -275,6 +275,21 @@ Desktop alert policy uses the Lua `notifications` table; see [Notifications](Not
 for backends, previews, quiet delivery and grouping. This is separate from the
 `notifications` statusline item.
 
+## Online status
+
+Like the official clients, Termgram reports the account online while you are
+using it: after the terminal has had focus for a second, until five seconds
+after it loses focus or thirty seconds pass without a key, mouse or paste event.
+Telegram delivers updates more promptly to sessions that are online. Contacts
+see the status according to your Telegram privacy settings. To never report it:
+
+```lua
+presence = { online = false }
+```
+
+Terminals that do not report focus are treated as focused, so only the idle
+timeout applies there.
+
 Poll panel keys use the `poll` context; see [Polls](Polls.md).
 
 Reaction picker keys use the `reactions` context; see [Reactions](Reactions.md).

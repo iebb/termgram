@@ -15,6 +15,7 @@ return {
     left = { "mode", "app", "account", "activity", "message", "context" },
     right = { "notifications", "unread", "connection", "latency", "dc", "position" },
   },
+  presence = { online = true }, -- false never reports the account online
   keymap = {
     -- { context = "conversation", on = { "<C-u>" }, run = "message_up", count = 20 },
     -- { context = "conversation", on = { "g", "w" }, run = "jump work" },

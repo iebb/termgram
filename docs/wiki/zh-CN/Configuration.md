@@ -236,6 +236,18 @@ Lua 源码限制 64 KiB、VM 内存 8 MiB、约一百万条指令。未知字段
 桌面提醒使用 Lua 的 `notifications` 表，后端、预览、无声投递和合并方式见
 [通知设置](Notifications.md)。它与底栏名为 `notifications` 的组件分别配置。
 
+## 在线状态
+
+与官方客户端一致，Termgram 会在你使用时把账号标记为在线：终端获得焦点满 1 秒后上线，
+失去焦点 5 秒后或 30 秒内没有键盘、鼠标、粘贴输入时下线。Telegram 会更及时地向在线会话
+推送更新。联系人能否看到取决于你的 Telegram 隐私设置。若完全不想上报：
+
+```lua
+presence = { online = false }
+```
+
+不上报焦点事件的终端视为始终聚焦，此时只有空闲超时生效。
+
 投票面板快捷键使用 `poll` 上下文，见[投票与测验](Polls.md)。
 
 回应选择器使用 `reactions` 上下文，见[消息回应](Reactions.md)。

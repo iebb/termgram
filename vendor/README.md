@@ -132,6 +132,14 @@ Still differing from Desktop: `new_session_created` does not trigger an account
 difference (handled inside the unvendored `grammers-mtproto`); a dropped home
 connection does.
 
+Online status (`src/presence.rs`, `src/telegram/presence.rs`) follows
+`Api::Updates::updateOnline` and the defaults in
+`Telegram/SourceFiles/mtproto/mtproto_config.h` from the same reading: online
+after one second of focus, offline five seconds after blur or after thirty
+seconds without input, `account.updateStatus` only on a change, every
+`online_update_period_ms` (120 s default) while online, again when another
+session's offline status hides this one, and offline on shutdown.
+
 Chat actions (`src/activity.rs`, `src/telegram/activity.rs`) map the unordered
 `updateUserTyping`, `updateChatUserTyping` and `updateChannelUserTyping`
 updates from the same stream. Six-second lifetimes (ten for games), explicit

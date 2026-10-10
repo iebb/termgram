@@ -1,9 +1,9 @@
 cask "termgram@pre" do
   arch arm: "macos", intel: "macos-x86_64"
 
-  version "0.1.39"
-  sha256 arm:   "b17a7f818a37d31b894d61291e0382ff311bb4fdf6df85826310b19d9f86f15d",
-         intel: "eb53f368cc73580dfe69eb14d01a7e173669c929a6beda8a9757abf6174ceb94"
+  version "0.1.44"
+  sha256 arm:   "be680a79aa791200fe6bea70153afd444bb0a911f2204d058925c2f6d4247cfb",
+         intel: "4fa7e6e48ff2214d04ec7076cb31ee7348bdf014bb70f772dfd9a097ee559982"
 
   url "https://github.com/iebb/termgram/releases/download/v#{version}/termgram-#{version}-#{arch}.tar.gz"
   name "Termgram"

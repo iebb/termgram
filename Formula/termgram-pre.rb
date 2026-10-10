@@ -1,30 +1,30 @@
 class TermgramPre < Formula
   desc "Focused, keyboard-first Telegram client for the terminal"
   homepage "https://github.com/iebb/termgram"
-  version "0.1.44"
+  version "0.1.47"
   license "MIT"
 
   conflicts_with "termgram", because: "both install the tg binary"
 
   on_macos do
     on_arm do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.44/termgram-0.1.44-macos.tar.gz"
-      sha256 "be680a79aa791200fe6bea70153afd444bb0a911f2204d058925c2f6d4247cfb"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.47/termgram-0.1.47-macos.tar.gz"
+      sha256 "2a14a06f49b303d80fe92cc1a59c3356b5c6d35c9d28593b730c578fa70e4869"
     end
     on_intel do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.44/termgram-0.1.44-macos-x86_64.tar.gz"
-      sha256 "4fa7e6e48ff2214d04ec7076cb31ee7348bdf014bb70f772dfd9a097ee559982"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.47/termgram-0.1.47-macos-x86_64.tar.gz"
+      sha256 "bcf492dcfed8364482c164d0b6db9d9f3df6ed55b97a752d7dad9a58353f9a7b"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.44/termgram-0.1.44-linux-aarch64.tar.gz"
-      sha256 "36b5b1a969912f6393f0318f5d79842a3d2101d08d496be23a32178ad7106349"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.47/termgram-0.1.47-linux-aarch64.tar.gz"
+      sha256 "0827ddb7403e94c783f83b05256f5bccd9dc7298d2ea99f7d965725de904f80e"
     end
     on_intel do
-      url "https://github.com/iebb/termgram/releases/download/v0.1.44/termgram-0.1.44-linux.tar.gz"
-      sha256 "24cf039a2ca74afae1567f7151a0d71875e70c18a31e6b94b57698fe339a2263"
+      url "https://github.com/iebb/termgram/releases/download/v0.1.47/termgram-0.1.47-linux.tar.gz"
+      sha256 "70dcbe88a4edc72998fdd24ad0bae28b2369f235c2ec0cdf753dea51c67beece"
     end
   end
 

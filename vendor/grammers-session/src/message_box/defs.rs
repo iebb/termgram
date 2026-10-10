@@ -48,6 +48,11 @@ pub(super) const POSSIBLE_GAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// (<https://core.telegram.org/api/updates>).
 pub(super) const NO_UPDATES_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// Channels have no periodic recovery of their own. Telegram Desktop requests
+/// a channel difference only for a reported gap or the channel on screen;
+/// sweeping every quiet channel is hundreds of requests for nothing.
+pub(super) const CHANNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 /// A sortable [`MessageBox`] entry key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Key {
@@ -70,6 +75,10 @@ pub(super) struct LiveEntry {
 
     /// If the entry has a gap and may soon trigger the need to get difference.
     pub(super) possible_gap: Option<PossibleGap>,
+
+    /// Socket updates received while this entry's difference is in flight.
+    /// They are replayed, in order, once the difference ends.
+    pub(super) postponed: Vec<tl::enums::Update>,
 }
 
 /// Contains all live message boxes and is able to process incoming updates for each of them.

@@ -107,6 +107,31 @@ Short polling of the viewed channel is excluded, and that channel is taken
 first when several await a difference, so a backlog cannot delay the
 conversation on screen. `tests/update_recovery.rs` covers both.
 
+Recovery no longer blocks the update socket, following Telegram Desktop's
+`Api::Updates` (`Telegram/SourceFiles/api/api_updates.cpp`, `dev` branch read
+2026-10-10; behaviour only, no source copied):
+
+- `UpdateStream` spawns the account difference and up to four channel
+  differences (`MAX_CHANNEL_DIFFERENCES`) on a `JoinSet` and keeps receiving
+  socket updates meanwhile. `MessageBoxes::get_channel_difference_except`,
+  `apply_channel_difference_for` and `end_channel_difference_for` address a
+  channel explicitly so responses may arrive in any order.
+- A socket update for a box whose difference is in flight is postponed in
+  `LiveEntry::postponed` and replayed in order once that difference ends,
+  instead of being force-applied ahead of older content.
+- `other_updates` of a channel difference are applied against the cursor the
+  difference started from; upstream discarded them as already seen.
+- Quiet channels are no longer swept after `NO_UPDATES_TIMEOUT`
+  (`CHANNEL_IDLE_TIMEOUT`); as in Desktop, a channel difference follows a gap,
+  `updateChannelTooLong`, or the viewed channel. The account boxes keep the
+  timeout, and `check_deadlines` keeps honouring it during a recovery.
+
+The upstream `message_box` unit tests are adjusted to these rules, and
+`tests/update_recovery.rs` covers concurrent recovery with ordered replay.
+Still differing from Desktop: `new_session_created` does not trigger an account
+difference (handled inside the unvendored `grammers-mtproto`); a dropped home
+connection does.
+
 Chat actions (`src/activity.rs`, `src/telegram/activity.rs`) map the unordered
 `updateUserTyping`, `updateChatUserTyping` and `updateChannelUserTyping`
 updates from the same stream. Six-second lifetimes (ten for games), explicit

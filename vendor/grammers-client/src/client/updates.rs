@@ -18,6 +18,7 @@ use grammers_session::updates::{MessageBoxes, PrematureEndReason, State, Updates
 use grammers_tl_types as tl;
 use log::{trace, warn};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio::time::timeout_at;
 
 use super::{Client, UpdatesConfiguration};
@@ -31,24 +32,34 @@ const UPDATE_LIMIT_EXCEEDED_LOG_COOLDOWN: Duration = Duration::from_secs(300);
 const BOT_CHANNEL_DIFF_LIMIT: i32 = 100000;
 const USER_CHANNEL_DIFF_LIMIT: i32 = 100;
 
+/// Channel differences requested at once. Telegram Desktop requests one per
+/// channel without a limit; a small bound keeps a large backlog from flooding
+/// the connection that also carries the user's own requests.
+const MAX_CHANNEL_DIFFERENCES: usize = 4;
+
+/// A finished difference request, applied by the stream that owns the state.
+enum Recovered {
+    Account(Result<tl::enums::updates::Difference, InvocationError>),
+    Channel(
+        i64,
+        Result<tl::enums::updates::ChannelDifference, InvocationError>,
+    ),
+}
+
 async fn prepare_channel_difference(
     mut request: tl::functions::updates::GetChannelDifference,
+    channel_id: i64,
     session: &ErasedSession,
     message_box: &mut MessageBoxes,
 ) -> Result<
     Option<tl::functions::updates::GetChannelDifference>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let id = match &request.channel {
-        tl::enums::InputChannel::Channel(channel) => PeerId::channel_unchecked(channel.channel_id),
-        _ => unreachable!(),
-    };
-
     if let Some(PeerInfo::Channel {
         id,
         auth: Some(auth),
         ..
-    }) = session.peer(id).await?
+    }) = session.peer(PeerId::channel_unchecked(channel_id)).await?
     {
         request.channel = tl::enums::InputChannel::Channel(tl::types::InputChannel {
             channel_id: id,
@@ -72,9 +83,9 @@ async fn prepare_channel_difference(
     } else {
         warn!(
             "cannot getChannelDifference for {:?} as we're missing its hash",
-            id
+            channel_id
         );
-        message_box.end_channel_difference(PrematureEndReason::Banned);
+        message_box.end_channel_difference_for(channel_id, PrematureEndReason::Banned);
         Ok(None)
     }
 }
@@ -122,6 +133,10 @@ pub struct UpdateStream {
     active_channel: watch::Sender<Option<(i64, i32)>>,
     active_changes: watch::Receiver<Option<(i64, i32)>>,
     progress: watch::Sender<SyncProgress>,
+    /// Difference requests in flight. Live updates keep flowing meanwhile.
+    recovering: JoinSet<Recovered>,
+    account_requested: bool,
+    channels_requested: Vec<i64>,
 }
 
 impl UpdateStream {
@@ -221,31 +236,79 @@ impl UpdateStream {
         }
 
         loop {
-            let (deadline, get_diff, get_channel_diff) = {
-                if let Some(update) = self.buffer.pop_front() {
-                    return Ok(update);
-                }
-                let deadline = self.message_box.check_deadlines(); // first, as it might trigger differences
-                self.publish_progress(0);
-                (
-                    deadline,
-                    self.message_box.get_difference(),
-                    match self.message_box.get_channel_difference() {
-                        Some(gd) => {
-                            prepare_channel_difference(
-                                gd,
-                                self.client.0.session.as_ref(),
-                                &mut self.message_box,
-                            )
-                            .await?
-                        }
-                        None => None,
-                    },
-                )
-            };
+            if let Some(update) = self.buffer.pop_front() {
+                return Ok(update);
+            }
+            let deadline = self.message_box.check_deadlines(); // first, as it might trigger differences
+            self.publish_progress(0);
+            self.request_differences().await?;
 
-            if let Some(request) = get_diff {
-                let response = self.client.invoke(&request).await?;
+            tokio::select! {
+                _ = self.active_changes.changed() => {
+                    let active = *self.active_changes.borrow_and_update();
+                    self.message_box.set_active_channel(active);
+                }
+                Some(recovered) = self.recovering.join_next(), if !self.recovering.is_empty() => {
+                    // A request task only ends early by panicking.
+                    let recovered = recovered.map_err(|_| InvocationError::Dropped)?;
+                    self.apply_recovered(recovered).await?;
+                }
+                result = timeout_at(deadline.into(), self.updates.recv()) => match result {
+                    Ok(Some(updates)) => self.process_socket_updates(updates).await?,
+                    Ok(None) => break Err(InvocationError::Dropped),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    /// Start every difference the message box asks for that is not already in
+    /// flight. As in Telegram Desktop, the account difference and each
+    /// channel's are independent requests, and none of them stops the socket.
+    async fn request_differences(&mut self) -> Result<(), InvocationError> {
+        if !self.account_requested {
+            if let Some(request) = self.message_box.get_difference() {
+                let client = self.client.clone();
+                self.account_requested = true;
+                self.recovering
+                    .spawn(async move { Recovered::Account(client.invoke(&request).await) });
+            }
+        }
+        while self.channels_requested.len() < MAX_CHANNEL_DIFFERENCES {
+            let Some(request) = self
+                .message_box
+                .get_channel_difference_except(&self.channels_requested)
+            else {
+                break;
+            };
+            let channel_id = match &request.channel {
+                tl::enums::InputChannel::Channel(channel) => channel.channel_id,
+                _ => unreachable!(),
+            };
+            let Some(request) = prepare_channel_difference(
+                request,
+                channel_id,
+                self.client.0.session.as_ref(),
+                &mut self.message_box,
+            )
+            .await?
+            else {
+                continue;
+            };
+            let client = self.client.clone();
+            self.channels_requested.push(channel_id);
+            self.recovering.spawn(async move {
+                Recovered::Channel(channel_id, client.invoke(&request).await)
+            });
+        }
+        Ok(())
+    }
+
+    async fn apply_recovered(&mut self, recovered: Recovered) -> Result<(), InvocationError> {
+        match recovered {
+            Recovered::Account(response) => {
+                self.account_requested = false;
+                let response = response?;
                 let invalidated = matches!(&response, tl::enums::updates::Difference::TooLong(_));
                 let (mut updates, users, chats) = self.message_box.apply_difference(response);
                 if invalidated {
@@ -257,89 +320,61 @@ impl UpdateStream {
                 self.publish_progress(recovered_messages(&updates));
                 let peers = self.client.build_peer_map(users, chats).await;
                 self.extend_update_queue(updates, peers);
-                continue;
             }
-
-            if let Some(request) = get_channel_diff {
-                let maybe_response = self.client.invoke(&request).await;
-
-                let response = match maybe_response {
+            Recovered::Channel(channel_id, response) => {
+                self.channels_requested.retain(|id| *id != channel_id);
+                let response = match response {
                     Ok(r) => r,
                     Err(e) if e.is("PERSISTENT_TIMESTAMP_OUTDATED") => {
                         // According to Telegram's docs:
                         // "Channel internal replication issues, try again later (treat this like an RPC_CALL_FAIL)."
                         // We can treat this as "empty difference" and not update the local pts.
-                        // Then this same call will be retried when another gap is detected or timeout expires.
-                        //
-                        // Another option would be to literally treat this like an RPC_CALL_FAIL and retry after a few
-                        // seconds, but if Telegram is having issues it's probably best to wait for it to send another
-                        // update (hinting it may be okay now) and retry then.
-                        //
-                        // This is a bit hacky because MessageBox doesn't really have a way to "not update" the pts.
-                        // Instead we manually extract the previously-known pts and use that.
+                        // Then this same call will be retried when another gap is detected.
                         log::warn!(
                             "Getting difference for channel updates caused PersistentTimestampOutdated; ending getting difference prematurely until server issues are resolved"
                         );
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-                        }
-                        continue;
+                        self.message_box.end_channel_difference_for(
+                            channel_id,
+                            PrematureEndReason::TemporaryServerIssues,
+                        );
+                        return Ok(());
                     }
                     Err(e) if e.is("CHANNEL_PRIVATE") => {
                         log::info!(
-                            "Account is now banned so we can no longer fetch updates with request: {:?}",
-                            request
+                            "Account is now banned so we can no longer fetch updates for channel {}",
+                            channel_id
                         );
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::Banned);
-                        }
-                        continue;
+                        self.message_box
+                            .end_channel_difference_for(channel_id, PrematureEndReason::Banned);
+                        return Ok(());
                     }
                     Err(InvocationError::Rpc(rpc_error)) if rpc_error.code == 500 => {
                         log::warn!("Telegram is having internal issues: {:#?}", rpc_error);
-                        {
-                            self.message_box
-                                .end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-                        }
-                        continue;
+                        self.message_box.end_channel_difference_for(
+                            channel_id,
+                            PrematureEndReason::TemporaryServerIssues,
+                        );
+                        return Ok(());
                     }
                     Err(e) => return Err(e),
                 };
 
-                let invalidated_channel = if matches!(&response, tl::enums::updates::ChannelDifference::TooLong(_)) {
-                    match &request.channel {
-                        tl::enums::InputChannel::Channel(channel) => Some(channel.channel_id),
-                        _ => None,
-                    }
-                } else { None };
-                let (mut updates, users, chats) = self.message_box.apply_channel_difference(response);
-                if let Some(channel_id) = invalidated_channel {
+                let invalidated = matches!(&response, tl::enums::updates::ChannelDifference::TooLong(_));
+                let (mut updates, users, chats) = self
+                    .message_box
+                    .apply_channel_difference_for(channel_id, response);
+                if invalidated {
                     let state = self.message_box.session_state();
                     updates.insert(0, (tl::types::UpdateChannelTooLong { channel_id, pts: None }.into(), State {
                         date: state.date, seq: state.seq, message_box: None,
                     }));
                 }
-
                 self.publish_progress(recovered_messages(&updates));
                 let peers = self.client.build_peer_map(users, chats).await;
                 self.extend_update_queue(updates, peers);
-                continue;
-            }
-
-            tokio::select! {
-                _ = self.active_changes.changed() => {
-                    let active = *self.active_changes.borrow_and_update();
-                    self.message_box.set_active_channel(active);
-                }
-                result = timeout_at(deadline.into(), self.updates.recv()) => match result {
-                    Ok(Some(updates)) => self.process_socket_updates(updates).await?,
-                    Ok(None) => break Err(InvocationError::Dropped),
-                    Err(_) => {}
-                }
             }
         }
+        Ok(())
     }
 
     pub(crate) async fn process_socket_updates(
@@ -440,6 +475,9 @@ impl Client {
         let (active_channel, active_changes) = watch::channel(None);
         Ok(UpdateStream {
             progress: watch::channel(SyncProgress::default()).0,
+            recovering: JoinSet::new(),
+            account_requested: false,
+            channels_requested: Vec::new(),
             active_channel,
             active_changes,
             client: self.clone(),

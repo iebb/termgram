@@ -193,3 +193,64 @@ fn viewed_channel_recovers_first_and_is_not_reported_as_backlog() {
     };
     assert_eq!(first.channel_id, 42);
 }
+
+#[test]
+fn live_updates_keep_flowing_and_replay_after_their_channel_difference() {
+    let deleted = |channel_id, pts| -> tl::enums::Update {
+        tl::types::UpdateDeleteChannelMessages {
+            channel_id,
+            messages: vec![pts],
+            pts,
+            pts_count: 1,
+        }
+        .into()
+    };
+    let socket = |update| UpdatesLike::Updates(tl::types::UpdateShort { update, date: 123 }.into());
+    let pts = |updates: Vec<(tl::enums::Update, _)>| -> Vec<i32> {
+        updates
+            .into_iter()
+            .map(|(update, _)| match update {
+                tl::enums::Update::DeleteChannelMessages(update) => update.pts,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    };
+    let mut boxes = MessageBoxes::new();
+    for id in [7, 42] {
+        boxes.try_set_channel_state(id, 20);
+    }
+    boxes
+        .process_updates(socket(
+            tl::types::UpdateChannelTooLong {
+                channel_id: 42,
+                pts: Some(22),
+            }
+            .into(),
+        ))
+        .unwrap();
+
+    // Another channel is not held back by the recovery in flight.
+    let (live, _, _) = boxes.process_updates(socket(deleted(7, 21))).unwrap();
+    assert_eq!(pts(live), [21]);
+    // The recovering channel's own live update waits for the older content.
+    let (early, _, _) = boxes.process_updates(socket(deleted(42, 23))).unwrap();
+    assert!(early.is_empty());
+
+    let (recovered, _, _) = boxes.apply_channel_difference_for(
+        42,
+        tl::types::updates::ChannelDifference {
+            r#final: true,
+            pts: 22,
+            timeout: None,
+            new_messages: Vec::new(),
+            other_updates: vec![deleted(42, 21), deleted(42, 22)],
+            chats: Vec::new(),
+            users: Vec::new(),
+        }
+        .into(),
+    );
+    assert_eq!(pts(recovered), [21, 22, 23]);
+    assert!(boxes.get_channel_difference().is_none());
+    let state = boxes.session_state();
+    assert_eq!(state.channels.iter().find(|c| c.id == 42).unwrap().pts, 23);
+}

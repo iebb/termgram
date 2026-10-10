@@ -56,6 +56,14 @@ fn next_updates_deadline() -> Instant {
     Instant::now() + defs::NO_UPDATES_TIMEOUT
 }
 
+/// Only the account-wide boxes are recovered after a quiet period.
+fn idle_deadline(key: Key) -> Instant {
+    match key {
+        Key::Common | Key::Secondary => next_updates_deadline(),
+        Key::Channel(_) => Instant::now() + defs::CHANNEL_IDLE_TIMEOUT,
+    }
+}
+
 fn update_sort_key(update: &tl::enums::Update) -> i32 {
     match PtsInfo::from_update(update) {
         Some(info) => info.pts - info.count,
@@ -124,6 +132,7 @@ impl MessageBoxes {
                 pts: state.pts,
                 deadline,
                 possible_gap: None,
+                postponed: Vec::new(),
             });
         }
         if state.qts != NO_PTS {
@@ -132,13 +141,15 @@ impl MessageBoxes {
                 pts: state.qts,
                 deadline,
                 possible_gap: None,
+                postponed: Vec::new(),
             });
         }
         entries.extend(state.channels.iter().map(|c| LiveEntry {
             key: Key::Channel(c.id),
             pts: c.pts,
-            deadline,
+            deadline: idle_deadline(Key::Channel(c.id)),
             possible_gap: None,
+            postponed: Vec::new(),
         }));
         entries.sort_by_key(|entry| entry.key);
 
@@ -206,8 +217,9 @@ impl MessageBoxes {
             self.set_entry(LiveEntry {
                 key: key,
                 pts: pts,
-                deadline: next_updates_deadline(),
+                deadline: idle_deadline(key),
                 possible_gap: None,
+                postponed: Vec::new(),
             });
         }
     }
@@ -247,36 +259,33 @@ impl MessageBoxes {
     /// Return the next deadline when receiving updates should timeout.
     ///
     /// If a deadline expired, the corresponding entries will be marked as needing to get its difference.
-    /// While there are entries pending of getting their difference, this method returns the current instant.
+    /// Differences are fetched concurrently with live updates, so the returned
+    /// deadline only covers entries that are not already getting theirs.
     pub fn check_deadlines(&mut self) -> Instant {
         let now = Instant::now();
 
-        if !self.getting_diff_for.is_empty() {
-            return self.next_deadline;
-        }
-
         if now >= self.next_deadline {
-            self.getting_diff_for
-                .extend(self.entries.iter().filter_map(|entry| {
-                    if now >= entry.effective_deadline() {
-                        debug!("deadline for forcibly fetching updates met for {:?}", entry);
-                        Some(entry.key)
-                    } else {
-                        None
-                    }
-                }));
-
-            // When extending `getting_diff_for`, it's important to have the moral equivalent of
-            // `begin_get_diff` (that is, clear possible gaps if we're now getting difference).
-            for i in 0..self.getting_diff_for.len() {
-                self.update_entry(self.getting_diff_for[i], |entry| entry.possible_gap = None);
+            let met = self.next_deadline;
+            let waiting = self.getting_diff_for.len();
+            let mut next = next_updates_deadline();
+            for entry in self.entries.iter_mut() {
+                if self.getting_diff_for.contains(&entry.key) {
+                    continue;
+                }
+                if now >= entry.effective_deadline() {
+                    debug!("deadline for forcibly fetching updates met for {:?}", entry);
+                    // The moral equivalent of `try_begin_get_diff`.
+                    entry.possible_gap = None;
+                    self.getting_diff_for.push(entry.key);
+                } else {
+                    next = next.min(entry.effective_deadline());
+                }
             }
-
-            // To avoid hogging up all CPU by sleeping for no duration,
-            // if the deadline was met but there's no state to fetch,
-            // advance the deadline.
-            if self.getting_diff_for.is_empty() {
-                self.next_deadline = next_updates_deadline();
+            self.next_deadline = next;
+            // Report the deadline that was just met, so the caller comes
+            // straight back to request the differences it triggered.
+            if self.getting_diff_for.len() > waiting {
+                return met;
             }
         }
 
@@ -327,12 +336,14 @@ impl MessageBoxes {
             pts: state.pts,
             deadline,
             possible_gap: None,
+            postponed: Vec::new(),
         });
         self.set_entry(LiveEntry {
             key: Key::Secondary,
             pts: state.qts,
             deadline,
             possible_gap: None,
+            postponed: Vec::new(),
         });
         self.date = state.date;
         self.seq = state.seq;
@@ -348,8 +359,9 @@ impl MessageBoxes {
             self.set_entry(LiveEntry {
                 key: Key::Channel(id),
                 pts: pts,
-                deadline: next_updates_deadline(),
+                deadline: idle_deadline(Key::Channel(id)),
                 possible_gap: None,
+                postponed: Vec::new(),
             });
         }
     }
@@ -360,7 +372,8 @@ impl MessageBoxes {
         let next = channel.map(|(id, _)| id);
         if self.active_channel == next { return; }
         if let Some(previous) = self.active_channel {
-            self.reset_deadline(Key::Channel(previous), next_updates_deadline());
+            let key = Key::Channel(previous);
+            self.reset_deadline(key, idle_deadline(key));
         }
         self.active_channel = next;
         if let Some((id, pts)) = channel {
@@ -391,7 +404,7 @@ impl MessageBoxes {
             None => return,
         };
         self.getting_diff_for.remove(i);
-        self.reset_deadline(key, next_updates_deadline());
+        self.reset_deadline(key, idle_deadline(key));
 
         debug_assert!(
             self.entry(key)
@@ -416,8 +429,20 @@ impl MessageBoxes {
     ///
     /// [updates' documentation]: https://core.telegram.org/api/updates
     pub fn process_updates(&mut self, updates: UpdatesLike) -> Result<defs::UpdateAndPeers, Gap> {
+        self.process(updates, &[])
+    }
+
+    /// `recovered` names the entries whose difference produced `updates`;
+    /// those always apply. Socket updates for an entry whose difference is in
+    /// flight are postponed instead, as Telegram's documentation requires:
+    /// applying them early would deliver newer messages before the older ones
+    /// the difference is about to return.
+    fn process(
+        &mut self,
+        updates: UpdatesLike,
+        recovered: &[Key],
+    ) -> Result<defs::UpdateAndPeers, Gap> {
         trace!("processing updates: {:?}", updates);
-        let deadline = next_updates_deadline();
 
         // Top level, when handling received `updates` and `updatesCombined`.
         // `updatesCombined` groups all the fields we care about, which is why we use it.
@@ -509,17 +534,26 @@ impl MessageBoxes {
                 }
             };
 
-            if self.getting_diff_for.contains(&info.key) {
+            if recovered.contains(&info.key) {
                 debug!(
-                    "forcing update to apply {:?} (getting difference, count {:?}, remote {:?})",
+                    "forcing update to apply {:?} (from difference, count {:?}, remote {:?})",
                     info.key, info.count, info.pts
                 );
                 // Order does not need to be checked. These always must be applied.
-                self.reset_deadline(info.key, next_updates_deadline());
                 result.push((update, mk_state(Some(info.into()))));
                 continue;
             }
 
+            if self.getting_diff_for.contains(&info.key) {
+                debug!(
+                    "postponing update for {:?} (getting difference, count {:?}, remote {:?})",
+                    info.key, info.count, info.pts
+                );
+                self.update_entry(info.key, |entry| entry.postponed.push(update));
+                continue;
+            }
+
+            let deadline = idle_deadline(info.key);
             let mut gap_deadline = None;
             self.force_update_entry(
                 LiveEntry {
@@ -527,6 +561,7 @@ impl MessageBoxes {
                     pts: info.pts - info.count,
                     deadline,
                     possible_gap: None,
+                    postponed: Vec::new(),
                 },
                 |entry| {
                     match (entry.pts + info.count).cmp(&info.pts) {
@@ -602,6 +637,26 @@ impl MessageBoxes {
 
         Ok((result, users, chats))
     }
+
+    /// Run the updates postponed during `key`'s difference through the normal
+    /// ordering checks: covered ones are dropped, later ones apply or open a gap.
+    fn replay_postponed(&mut self, key: Key, result: &mut Vec<(tl::enums::Update, State)>) {
+        let mut updates = Vec::new();
+        self.update_entry(key, |entry| updates = std::mem::take(&mut entry.postponed));
+        if updates.is_empty() {
+            return;
+        }
+        let us = UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
+            updates,
+            users: Vec::new(),
+            chats: Vec::new(),
+            date: NO_DATE,
+            seq: NO_SEQ,
+        }));
+        if let Ok((updates, _, _)) = self.process(us, &[]) {
+            result.extend(updates);
+        }
+    }
 }
 
 /// Getting and applying account difference.
@@ -644,7 +699,7 @@ impl MessageBoxes {
                 || self.getting_diff_for.contains(&Key::Secondary)
         );
         let finish: bool;
-        let result = match difference {
+        let mut result = match difference {
             tl::enums::updates::Difference::Empty(diff) => {
                 debug!(
                     "handling empty difference (date = {}, seq = {}); no longer getting diff",
@@ -697,6 +752,8 @@ impl MessageBoxes {
         if finish {
             self.try_end_get_diff(Key::Common);
             self.try_end_get_diff(Key::Secondary);
+            self.replay_postponed(Key::Common, &mut result.0);
+            self.replay_postponed(Key::Secondary, &mut result.0);
         }
 
         result
@@ -736,7 +793,7 @@ impl MessageBoxes {
         // It is possible that the result from `GetDifference` includes users with `min = true`.
         // TODO in that case, we will have to resort to getUsers.
         let (mut result_updates, users, chats) = self
-            .process_updates(us)
+            .process(us, &[Key::Common, Key::Secondary])
             .expect("gap is detected while applying difference");
 
         result_updates.extend(
@@ -808,7 +865,27 @@ impl MessageBoxes {
     /// Note that this only returns the skeleton of a request.
     /// Both the channel hash and limit will be their default value.
     pub fn get_channel_difference(&self) -> Option<tl::functions::updates::GetChannelDifference> {
-        let (key, channel_id) = self.channel_in_diff()?;
+        self.get_channel_difference_except(&[])
+    }
+
+    /// Like [`MessageBoxes::get_channel_difference`], skipping channels whose
+    /// request is already in flight so several can be recovered concurrently.
+    pub fn get_channel_difference_except(
+        &self,
+        requested: &[i64],
+    ) -> Option<tl::functions::updates::GetChannelDifference> {
+        let waiting = |id: &i64| !requested.contains(id);
+        let channel_id = self
+            .active_channel
+            .filter(|id| self.getting_diff_for.contains(&Key::Channel(*id)))
+            .filter(waiting)
+            .or_else(|| {
+                self.getting_diff_for.iter().find_map(|&key| match key {
+                    Key::Channel(id) if waiting(&id) => Some(id),
+                    _ => None,
+                })
+            })?;
+        let key = Key::Channel(channel_id);
 
         if let Some(pts) = self.entry(key).map(|entry| entry.pts) {
             let gd = tl::functions::updates::GetChannelDifference {
@@ -834,9 +911,19 @@ impl MessageBoxes {
         &mut self,
         difference: tl::enums::updates::ChannelDifference,
     ) -> defs::UpdateAndPeers {
-        let (key, channel_id) = self
+        let (_, channel_id) = self
             .channel_in_diff()
             .expect("applying channel difference to have a channel in getting_diff_for");
+        self.apply_channel_difference_for(channel_id, difference)
+    }
+
+    /// Apply the difference requested for `channel_id`.
+    pub fn apply_channel_difference_for(
+        &mut self,
+        channel_id: i64,
+        difference: tl::enums::updates::ChannelDifference,
+    ) -> defs::UpdateAndPeers {
+        let key = Key::Channel(channel_id);
 
         trace!(
             "applying channel difference for {}: {:?}",
@@ -855,16 +942,6 @@ impl MessageBoxes {
             users,
         } = adaptor::adapt_channel_difference(difference);
 
-        if r#final {
-            debug!(
-                "handling channel {} difference; no longer getting diff",
-                channel_id
-            );
-            self.try_end_get_diff(key);
-        } else {
-            debug!("handling channel {} difference", channel_id);
-        }
-
         self.set_pts(key, pts);
         let us = UpdatesLike::Updates(tl::enums::Updates::Updates(tl::types::Updates {
             updates,
@@ -873,8 +950,10 @@ impl MessageBoxes {
             date: NO_DATE,
             seq: NO_SEQ,
         }));
+        // The difference's own updates apply regardless of the cursor it just
+        // set; comparing them against it would discard every edit and deletion.
         let (mut result_updates, users, chats) = self
-            .process_updates(us)
+            .process(us, &[key])
             .expect("gap is detected while applying channel difference");
 
         result_updates.extend(new_messages.into_iter().map(|message| {
@@ -893,32 +972,49 @@ impl MessageBoxes {
             )
         }));
 
-        self.reset_timeout(key, if self.active_channel == Some(channel_id) {
-            Some(timeout.unwrap_or(1).max(1))
-        } else { None });
+        if r#final {
+            debug!(
+                "handling channel {} difference; no longer getting diff",
+                channel_id
+            );
+            self.try_end_get_diff(key);
+        } else {
+            debug!("handling channel {} difference", channel_id);
+        }
+
+        if self.active_channel == Some(channel_id) {
+            self.reset_timeout(key, Some(timeout.unwrap_or(1).max(1)));
+        }
+        if r#final {
+            self.replay_postponed(key, &mut result_updates);
+        }
 
         (result_updates, users, chats)
     }
 
     pub fn end_channel_difference(&mut self, reason: PrematureEndReason) {
-        let (key, channel_id) = self
+        let (_, channel_id) = self
             .channel_in_diff()
             .expect("ending channel difference to have a channel in getting_diff_for");
+        self.end_channel_difference_for(channel_id, reason);
+    }
+
+    /// End the difference requested for `channel_id` without a result. Updates
+    /// postponed meanwhile are dropped; the next one reveals the gap again.
+    pub fn end_channel_difference_for(&mut self, channel_id: i64, reason: PrematureEndReason) {
+        let key = Key::Channel(channel_id);
 
         trace!(
             "ending channel difference for {} because {:?}",
             channel_id, reason
         );
-        match reason {
-            PrematureEndReason::TemporaryServerIssues => {
-                self.update_entry(key, |entry| entry.possible_gap = None);
-                self.try_end_get_diff(key);
-            }
-            PrematureEndReason::Banned => {
-                self.update_entry(key, |entry| entry.possible_gap = None);
-                self.try_end_get_diff(key);
-                self.pop_entry(key);
-            }
+        self.update_entry(key, |entry| {
+            entry.possible_gap = None;
+            entry.postponed.clear();
+        });
+        self.try_end_get_diff(key);
+        if matches!(reason, PrematureEndReason::Banned) {
+            self.pop_entry(key);
         }
     }
 }

@@ -294,38 +294,15 @@ fn test_next_raw_update_flow_common_timeout() {
 }
 
 #[test]
-fn test_next_raw_update_flow_channel_timeout() {
+fn test_next_raw_update_flow_quiet_channel_is_not_swept() {
     reset_time();
     let mut message_boxes = MessageBoxes::new();
     message_boxes.try_set_channel_state(12, 34);
 
     advance_time_by(NO_UPDATES_TIMEOUT);
 
-    assert_eq!(message_boxes.get_channel_difference(), None);
-    assert_eq!(message_boxes.check_deadlines(), Instant::now());
-    assert_eq!(
-        message_boxes.get_channel_difference(),
-        Some(get_channel_difference(12, 34))
-    );
-
-    message_boxes.apply_channel_difference(
-        tl::types::updates::ChannelDifferenceEmpty {
-            r#final: true,
-            pts: 56,
-            timeout: None,
-        }
-        .into(),
-    );
-
-    assert_eq!(message_boxes.get_difference(), None);
     assert_eq!(message_boxes.check_deadlines(), next_updates_deadline());
-    assert_eq!(
-        message_boxes.session_state(),
-        UpdatesState {
-            channels: vec![ChannelState { id: 12, pts: 56 }.into()],
-            ..message_boxes.session_state()
-        }
-    );
+    assert_eq!(message_boxes.get_channel_difference(), None);
 }
 
 #[test]
@@ -334,8 +311,7 @@ fn test_next_raw_update_flow_channel_issues() {
     let mut message_boxes = MessageBoxes::new();
     message_boxes.try_set_channel_state(12, 34);
 
-    advance_time_by(NO_UPDATES_TIMEOUT);
-    assert_eq!(message_boxes.check_deadlines(), Instant::now());
+    message_boxes.try_begin_get_diff(super::Key::Channel(12));
     assert!(message_boxes.get_channel_difference().is_some());
 
     message_boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues);
@@ -355,8 +331,7 @@ fn test_next_raw_update_flow_channel_ban() {
     let mut message_boxes = MessageBoxes::new();
     message_boxes.try_set_channel_state(12, 34);
 
-    advance_time_by(NO_UPDATES_TIMEOUT);
-    assert_eq!(message_boxes.check_deadlines(), Instant::now());
+    message_boxes.try_begin_get_diff(super::Key::Channel(12));
     assert!(message_boxes.get_channel_difference().is_some());
 
     message_boxes.end_channel_difference(PrematureEndReason::Banned);
@@ -371,45 +346,40 @@ fn test_next_raw_update_flow_channel_ban() {
 }
 
 #[test]
-fn test_next_raw_update_flow_no_new_get_diff_if_already_fetching() {
+fn test_next_raw_update_flow_deadlines_are_met_while_fetching() {
     reset_time();
     let mut message_boxes = MessageBoxes::new();
-
-    // t(0) = first channel registers timeout at t(3)
+    message_boxes.set_state(state(56, 78, 12, 34));
+    let common_deadline = next_updates_deadline();
     message_boxes.try_set_channel_state(11, 12);
-    let expected_first_deadline = next_updates_deadline();
-
-    // t(2) = second and third channel register timeout at t(5)
-    advance_time_by(2 * (NO_UPDATES_TIMEOUT / 3));
     message_boxes.try_set_channel_state(21, 22);
-    message_boxes.try_set_channel_state(31, 32);
-    let expected_second_deadline = next_updates_deadline();
 
-    // t(4) = first channel times out
-    advance_time_by(2 * (NO_UPDATES_TIMEOUT / 3));
-    assert_eq!(message_boxes.check_deadlines(), expected_first_deadline);
+    // Two channel differences are in flight at once.
+    message_boxes.try_begin_get_diff(super::Key::Channel(11));
+    message_boxes.try_begin_get_diff(super::Key::Channel(21));
+    assert_eq!(
+        message_boxes.get_channel_difference_except(&[11]),
+        Some(get_channel_difference(21, 22))
+    );
+    assert_eq!(message_boxes.get_channel_difference_except(&[11, 21]), None);
+
+    // The account deadline is still honoured meanwhile, exactly once.
+    advance_time_by(NO_UPDATES_TIMEOUT);
+    assert_eq!(message_boxes.get_difference(), None);
+    assert_eq!(message_boxes.check_deadlines(), common_deadline);
+    assert_eq!(
+        message_boxes.get_difference(),
+        Some(get_difference(56, 12, 34))
+    );
+    assert_eq!(message_boxes.check_deadlines(), next_updates_deadline());
+
+    // Responses are applied by channel, in whichever order they arrive.
+    message_boxes.end_channel_difference_for(21, PrematureEndReason::TemporaryServerIssues);
     assert_eq!(
         message_boxes.get_channel_difference(),
         Some(get_channel_difference(11, 12))
     );
-
-    // t(6) = second and third channel should have timed out by now, but didn't yet
-    advance_time_by(2 * (NO_UPDATES_TIMEOUT / 3));
-    message_boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-    assert_eq!(message_boxes.get_channel_difference(), None);
-
-    // t(6) = checking deadlines now triggers difference for second and third
-    assert_eq!(message_boxes.check_deadlines(), expected_second_deadline);
-    assert_eq!(
-        message_boxes.get_channel_difference(),
-        Some(get_channel_difference(21, 22))
-    );
-    message_boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues);
-    assert_eq!(
-        message_boxes.get_channel_difference(),
-        Some(get_channel_difference(31, 32))
-    );
-    message_boxes.end_channel_difference(PrematureEndReason::TemporaryServerIssues);
+    message_boxes.end_channel_difference_for(11, PrematureEndReason::TemporaryServerIssues);
     assert_eq!(message_boxes.get_channel_difference(), None);
 }
 
@@ -469,10 +439,14 @@ fn test_process_socket_updates_flow_common_difference_ok() {
         message_boxes.get_difference(),
         Some(get_difference(12, 56, 78))
     );
+    // Postponed while the difference is in flight, replayed once it ends.
     assert_eq!(
         message_boxes.process_updates(updates(NO_DATE, NO_SEQ, 57)),
-        updates_ok(12, 34, 57)
+        Ok((Vec::new(), Vec::new(), Vec::new()))
     );
+    let (replayed, _, _) = message_boxes
+        .apply_difference(tl::types::updates::DifferenceEmpty { date: 12, seq: 34 }.into());
+    assert_eq!(Ok((replayed, Vec::new(), Vec::new())), updates_ok(12, 34, 57));
 }
 
 #[test]
